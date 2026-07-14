@@ -3515,9 +3515,25 @@ private:
         return true;
     }
 
+    // whether the memory state is valid only at its exact final position (hybrid/recurrent),
+    // as opposed to a range of positions (SWA)
+    bool ctx_tgt_state_exact() const {
+        return ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+               ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS;
+    }
+
     // n_tokens_cur: the number of tokens added to the batch for the current slot
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         const int id_task = slot.task->id;
+
+        // an equivalent checkpoint already exists (e.g. it was just restored)
+        if (!slot.prompt.checkpoints.empty() &&
+                slot.prompt.checkpoints.back()->n_tokens == slot.prompt.n_tokens() - n_tokens_cur &&
+                slot.prompt.checkpoints.back()->pos_max == pos_max) {
+            // adopt the checkpoint so the min-step eviction below does not erase it
+            slot.prompt.checkpoints.back()->id_task = id_task;
+            return;
+        }
 
         // evict checkpoints within min-step of a previous checkpoint, unless they were
         // created by the current task
@@ -3568,8 +3584,13 @@ private:
         cur.id_task = id_task;
 
         // [TAG_CHECKPOINTS_FIX_POS_MIN]
-        // TODO: here we incorrectly deterimne that the saved checkpoint data covers the [pos_min, pos_max] range
-        //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
+        // the state of hybrid/recurrent memory is valid only at its exact final position
+        // TODO: for SWA models the saved range can still claim more than it actually covers:
+        //       https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
+        if (ctx_tgt_state_exact()) {
+            pos_min = pos_max;
+        }
+
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
         cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
@@ -5103,9 +5124,6 @@ private:
 
                             llama_pos pos_next = slot.prompt.tokens.pos_next(n_past);
 
-                            // number of cached tokens shared with the new prompt, before any checkpoint is restored
-                            const int n_prefix = n_past;
-
                             // ref: https://github.com/ggml-org/llama.cpp/pull/24110
                             const bool has_new_tokens = (n_past < slot.task->n_tokens());
 
@@ -5159,7 +5177,7 @@ private:
                                     SLT_WRN(slot, "%s\n", st1.str().c_str());
                                 }
 
-                                auto reuse = slot.prompt.get_reuse(n_past, has_new_tokens, n_swa, pos_min);
+                                auto reuse = slot.prompt.get_reuse(n_past, has_new_tokens, n_swa, pos_min, ctx_tgt_state_exact());
 
                                 if (reuse.ckpt) {
                                     const auto & cur = *reuse.ckpt;
@@ -5213,11 +5231,19 @@ private:
                             }
 
                             {
-                                // erase any checkpoints with pos_max > pos_next, or that cover tokens not shared with the new prompt
+                                // erase any checkpoints that cover diverged content - once the new
+                                // tokens are decoded, their staleness would become undetectable
+                                const llama_pos pos_stale = std::min(pos_next, slot.task->tokens.pos_next());
+
+                                // an exact checkpoint at the divergence position irreversibly contains
+                                // the diverged token, while a range (SWA) checkpoint gets that entry
+                                // overwritten when decoding resumes from it
+                                const llama_pos pos_stale_min = ctx_tgt_state_exact() ? pos_stale : pos_stale + 1;
+
                                 for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end();) {
                                     const auto & cur = **it;
-                                    if (cur.pos_max > pos_next || cur.n_tokens > n_prefix) {
-                                        SLT_TRC(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_swa = %d, pos_next = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_swa, pos_next, (float) cur.size() / 1024 / 1024);
+                                    if (cur.pos_max > pos_next || cur.pos_max >= pos_stale_min) {
+                                        SLT_INF(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_swa = %d, pos_next = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_swa, pos_next, (float) cur.size() / 1024 / 1024);
                                         it = slot.prompt.checkpoints.erase(it);
                                     } else {
                                         ++it;
