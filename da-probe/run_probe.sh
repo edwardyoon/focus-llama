@@ -5,7 +5,8 @@
 #   da-probe/run_probe.sh <model.gguf> [max_tokens] [--ctx N]
 #
 # What it does:
-#   1. build da_probe against the repo's libllama (cmake Release if build/ is missing)
+#   1. build da_probe against the repo's libllama (auto CUDA on NVIDIA;
+#      rebuilds libllama if missing, CPU-only, or stale vs. source)
 #   2. run diagnostics: --render (model's own chat template), --thinkscan (thinking tags)
 #   3. run the full probe: baseline / masked-A / masked-C / keep-A vs rm-A
 #   4. write a consolidated report to da-probe/reports/report_<ts>.txt
@@ -61,20 +62,85 @@ if [ -z "${CXX:-}" ]; then
 fi
 [ -n "${CXX:-}" ] || { echo "FATAL: no C++ compiler found (c++/g++/clang++)"; exit 2; }
 echo "[build] compiler: $CXX"
+NPROC="$(nproc 2>/dev/null || sysctl -n hw.ncpu)"
+
+# GPU: build with CUDA when a NVIDIA GPU is present, so the probe does not
+# silently fall back to a CPU-only libllama (a 27B model prefills at ~8 tok/s
+# on CPU vs. hundreds on GPU).
+#
+# Pick a *working* nvcc and pin both the compiler and the toolkit root. On
+# multi-toolkit hosts /usr/bin/nvcc is often an `alternatives` symlink into a
+# different (or incomplete) install; invoked through that path nvcc resolves
+# its own root from the symlink dir and fails ("cicc: not found"). Pinning an
+# explicit, consistent compiler/toolkit pair avoids that mismatch.
+CUDA_ARGS=()
+NVCC=""
+if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
+    CC="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '.\n')"
+    for c in "${CUDA_HOME:+$CUDA_HOME/bin/nvcc}" "$(command -v nvcc 2>/dev/null)" \
+             /usr/local/cuda/bin/nvcc /usr/local/cuda-12.8/bin/nvcc \
+             /usr/local/cuda-12/bin/nvcc /usr/local/cuda-13.3/bin/nvcc \
+             /usr/local/cuda-13.2/bin/nvcc /usr/local/cuda-13/bin/nvcc; do
+        [ -n "$c" ] && [ -x "$c" ] || continue
+        root="$(cd "$(dirname "$(readlink -f "$c")")/.." 2>/dev/null && pwd)"
+        # a complete toolkit ships cicc; its absence means the install is broken
+        if [ -n "$root" ] && { [ -e "$root/nvvm/bin/cicc" ] || [ -e "$root/bin/cicc" ]; }; then
+            NVCC="$c"
+            break
+        fi
+    done
+    if [ -n "$NVCC" ]; then
+        CUDA_ROOT="$(cd "$(dirname "$(readlink -f "$NVCC")")/.." && pwd)"
+        CUDA_ARGS=(-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="${CC:-120}" \
+                   -DCMAKE_CUDA_COMPILER="$NVCC" -DCUDAToolkit_ROOT="$CUDA_ROOT")
+        echo "[build] CUDA compiler: $NVCC (toolkit: $CUDA_ROOT, sm_$CC)"
+    else
+        echo "[build] WARNING: NVIDIA GPU present but no working CUDA toolkit found; building CPU-only"
+    fi
+fi
+
 LIB=""
 for c in "$REPO/build/bin/libllama.so" "$REPO/build/bin/libllama.dylib"; do
     [ -f "$c" ] && { LIB="$c"; break; }
 done
+
+need_build=""
 if [ -z "$LIB" ]; then
-    echo "[build] libllama not found — cmake configure + build (Release)..."
-    cmake -S "$REPO" -B "$REPO/build" -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF || exit 2
-    cmake --build "$REPO/build" --target llama -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)" || exit 2
+    need_build="libllama not found"
+elif [ "${#CUDA_ARGS[@]}" -gt 0 ] && ! grep -q '^GGML_CUDA:BOOL=ON' "$REPO/build/CMakeCache.txt" 2>/dev/null; then
+    need_build="existing build is CPU-only but a NVIDIA GPU is present"
+elif [ -n "$(find "$REPO/src" "$REPO/ggml" "$REPO/include" "$REPO/common" "$REPO/CMakeLists.txt" \
+        \( -name '*.c' -o -name '*.cpp' -o -name '*.cu' -o -name '*.h' -o -name '*.hpp' -o -name 'CMakeLists.txt' \) \
+        -newer "$LIB" -print -quit 2>/dev/null)" ]; then
+    need_build="source newer than libllama"
+fi
+
+if [ -n "$need_build" ]; then
+    # CMake cannot switch CMAKE_CUDA_COMPILER in place; if the cache holds a
+    # different one (e.g. a broken /usr/bin/nvcc from an earlier configure),
+    # wipe the build dir so the new compiler/toolkit pair configures cleanly.
+    CACHED_CUDA_CC="$(grep -m1 '^CMAKE_CUDA_COMPILER:' "$REPO/build/CMakeCache.txt" 2>/dev/null | cut -d= -f2-)"
+    if [ -n "$NVCC" ] && [ -n "$CACHED_CUDA_CC" ] && [ "$CACHED_CUDA_CC" != "$NVCC" ]; then
+        echo "[build] cached CUDA compiler ($CACHED_CUDA_CC) != selected ($NVCC); wiping build dir for a clean CUDA configure..."
+        rm -rf "$REPO/build"
+    fi
+    if [ "${#CUDA_ARGS[@]}" -gt 0 ]; then
+        echo "[build] rebuilding libllama ($need_build) — CUDA ON; first build compiles ggml-cuda (nvcc, ~10-20 min)..."
+    else
+        echo "[build] rebuilding libllama ($need_build)..."
+    fi
+    cmake -S "$REPO" -B "$REPO/build" -DCMAKE_BUILD_TYPE=Release -DLLAMA_CURL=OFF ${CUDA_ARGS[@]+"${CUDA_ARGS[@]}"} || exit 2
+    cmake --build "$REPO/build" --target llama -j"$NPROC" || exit 2
     for c in "$REPO/build/bin/libllama.so" "$REPO/build/bin/libllama.dylib"; do
         [ -f "$c" ] && { LIB="$c"; break; }
     done
 fi
 [ -n "$LIB" ] || { echo "FATAL: libllama build failed"; exit 2; }
-echo "[build] libllama: $LIB"
+if grep -q '^GGML_CUDA:BOOL=ON' "$REPO/build/CMakeCache.txt" 2>/dev/null; then
+    echo "[build] libllama: $LIB (CUDA)"
+else
+    echo "[build] libllama: $LIB (CPU-only — probe will run on CPU)"
+fi
 
 echo "[build] compiling da_probe..."
 "$CXX" -O2 -std=c++17 "$SCRIPT_DIR/da_probe.cpp" -o "$SCRIPT_DIR/da_probe" \
