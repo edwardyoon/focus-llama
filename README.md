@@ -182,6 +182,24 @@ removal boundary is the current decode position, so in B mode the already-genera
 the kept set. `da_chunks` supersedes a static `da_rm` in the same request. A model that never emits a
 complete tag simply runs with full attention - no removal is applied.
 
+The mechanism is **per-request opt-in**: a request without `da_*` fields runs exactly as before and
+produces no `da_*` log lines. To use it, the client must build the prompt, tokenize it (e.g. with
+`/tokenize`), and attach the resulting layout to the `/v1/completions` body:
+
+```json
+{
+  "prompt": "<scaffold>\n[Chunk 1] ...\n[Chunk 2] ...\n...\n[Chunk 5] ...\n<filler>\n<instruction>",
+  "da_chunks": [[8, 96], [96, 184], [184, 272], [272, 360], [360, 448]],
+  "da_filler": [448, 520],
+  "da_b": true,
+  "max_tokens": 64
+}
+```
+
+`da_chunks[i]` is the `[lo, hi)` prompt token range of chunk `i+1` (1-based, matching the tag's
+`magic_chunks` number). Only the client that assembled the prompt knows these ranges - the server
+cannot derive them from the text.
+
 ```bash
 ./build/bin/llama-server -m <model>.gguf --kv-unified --parallel 2 -v
 python3 da-probe/da_tag_smoke.py http://127.0.0.1:8080 [--hybrid]
@@ -222,7 +240,9 @@ speed-up. Measuring real speed is still open.
 
 ## Relationship to FocusMemory
 
-[FocusMemory](https://github.com/edwardyoon/FocusMemory) chunks and indexes long-term context. `focus-llama` is the inference-side counterpart: it lets the model read a compact index in `global` mode and then commit attention to specific chunks. The two are independent and can be used separately.
+[FocusMemory](https://github.com/edwardyoon/FocusMemory) chunks and indexes long-term context. `focus-llama` is the inference-side counterpart: it lets the model read a compact index in `global` mode and then commit attention to specific chunks.
+
+The two fit together because FocusMemory **assembles the prompt from its own chunks** - so its backend already knows the token range of every chunk it inserted, which is exactly what `da_chunks` asks for (section 3). The integration is a client-side change only: the FocusMemory backend tokenizes the assembled prompt (e.g. via `/tokenize`), maps each chunk to its `[lo, hi)` range (plus the filler, if any), and attaches `da_chunks` / `da_filler` (and `da_b`) to the `/v1/completions` request. From then on the model's own `<focus magic_chunks="N">` tag decides which chunk the next tokens attend to, and the server enforces it. Until that wiring exists, requests from a FocusMemory backend carry no `da_*` fields and run with full attention - the two projects remain independently usable.
 
 ## Status and limits
 
