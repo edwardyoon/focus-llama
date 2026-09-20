@@ -11,12 +11,13 @@
 #   4. write a consolidated report to da-probe/reports/report_<ts>.txt
 #
 # da_probe exit codes:
-#   0 = OVERALL PASS (pure-attention model, removal works, all checks green)
+#   0 = OVERALL PASS — isolation verified (pure-attention) or paper semantics
+#       (hybrid: attention KV restricted, recurrent state intact). The probe
+#       prints the architecture and the exact verdict.
 #   1 = FAIL (a behavioral/logits check failed)
 #   2 = usage/build error
 #   3 = SEQ_RM REJECTED — the memory backend does not support middle-range
-#       removal (expected on hybrid/SSM models such as qwen35). This is a
-#       valid architecture-gate result, not a crash.
+#       removal. A valid architecture-gate result, not a crash.
 #
 # Works on macOS (Metal, libllama.dylib) and Linux (libllama.so).
 
@@ -105,9 +106,9 @@ REPORT="$SCRIPT_DIR/reports/report_${TS}.txt"
     echo
     echo "exit code : $RC"
     case $RC in
-        0) echo "VERDICT   : OVERALL PASS" ;;
+        0) echo "VERDICT   : OVERALL PASS (see the probe's OVERALL line: isolation or paper semantics, per architecture)" ;;
         1) echo "VERDICT   : FAIL — see log above" ;;
-        3) echo "VERDICT   : SEQ_RM REJECTED (hybrid/SSM gate: middle-range removal unsupported -> KQ mask-injection path required)" ;;
+        3) echo "VERDICT   : SEQ_RM REJECTED (memory backend does not support middle-range removal)" ;;
         *) echo "VERDICT   : ERROR (exit $RC) — see log above" ;;
     esac
 } > "$REPORT" 2>&1

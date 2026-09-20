@@ -294,6 +294,9 @@ struct server_slot {
     // state
     slot_state state = SLOT_STATE_IDLE;
 
+    // Declarative Attention: da_rm ranges not yet applied to the KV cache
+    bool da_rm_pending = false;
+
     server_prompt prompt;
 
     bool prompt_save(server_prompt_cache & prompt_cache) const {
@@ -3144,6 +3147,8 @@ private:
 
                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
 
+                        slot.da_rm_pending = !slot.task->params.da_rm.empty();
+
                         SLT_TRC(slot, "new prompt, n_ctx_slot = %d, n_keep = %d, task.n_tokens = %d\n",
                                 slot.n_ctx, slot.task->params.n_keep, slot.task->n_tokens());
 
@@ -3472,6 +3477,20 @@ private:
                             ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS ||
                             n_swa > 0);
 
+                    // Declarative Attention: apply the pending removals once prompt
+                    // prefill has crossed da_rm_at. The KV for [0, da_rm_at) is
+                    // complete at this point (tokens pushed in earlier rounds have
+                    // been decoded), so the remaining prompt is prefilled without
+                    // the removed ranges. Mid-prefill application is skipped for
+                    // multimodal prompts (the boundary must not fall inside an
+                    // mtmd chunk); those fall through to the post-prefill path.
+                    if (slot.da_rm_pending && slot.task->params.da_rm_at >= 0 &&
+                            !slot.task->tokens.has_mtmd &&
+                            slot.prompt.n_tokens() >= slot.task->params.da_rm_at) {
+                        apply_da_rm(slot, "at da_rm_at");
+                        slot.da_rm_pending = false;
+                    }
+
                     bool has_mtmd = false;
 
                     // check if we should process the mtmd chunk
@@ -3545,6 +3564,15 @@ private:
                             /* output    = */ slot.need_embd(),
                             /* is_prompt = */ true);
                         slot.prompt.tokens.push_back(cur_tok);
+
+                        // Declarative Attention: stop filling at the removal boundary
+                        // so the removals can run before the remaining prompt
+                        // (e.g. the question) is prefilled
+                        if (slot.da_rm_pending && slot.task->params.da_rm_at >= 0 &&
+                                !slot.task->tokens.has_mtmd &&
+                                slot.prompt.n_tokens() >= slot.task->params.da_rm_at) {
+                            break;
+                        }
 
                         // break at the last user message, or at user messages at least min step past the last checkpoint
                         if (do_checkpoint && spans.is_user_start(slot.prompt.n_tokens())) {
@@ -3781,6 +3809,64 @@ private:
         return true;
     }
 
+    // Declarative Attention: remove the requested prompt token ranges from the KV
+    // cache of the target context (and the draft context, when speculative
+    // decoding is active). The removal is a no-op for positions whose KV does not
+    // exist yet, so callers must invoke it once the covered positions are fully
+    // prefilled. Ranges are clamped to the removal boundary (da_rm_at, or the
+    // prompt end when da_rm_at < 0).
+    void apply_da_rm(server_slot & slot, const char * when) {
+        if (slot.task->params.da_rm.empty()) {
+            return;
+        }
+
+        const int32_t n_prompt = slot.task->n_tokens();
+        const int32_t bound    = slot.task->params.da_rm_at >= 0
+                                ? std::min(slot.task->params.da_rm_at, n_prompt)
+                                : n_prompt;
+
+        for (const auto & range : slot.task->params.da_rm) {
+            int32_t lo = range.first;
+            int32_t hi = range.second;
+
+            if (lo >= bound) {
+                SLT_WRN(slot, "da_rm: range [%d, %d) starts at/after the removal boundary %d - skipping\n", lo, hi, bound);
+                continue;
+            }
+
+            // The next token (the prompt continuation, or the first generated
+            // token) is placed at position `bound`. The attention KV cache
+            // requires position contiguity, so the last position of the
+            // prefilled prefix (bound - 1) must remain in the cache. Clamp the
+            // range end to leave it intact; a range that reaches the boundary
+            // would otherwise drop seq_pos_max and make the continuation
+            // non-contiguous (llama_decode returns "Invalid input batch").
+            if (hi > bound - 1) {
+                SLT_WRN(slot, "da_rm: range [%d, %d) reaches the removal boundary %d - clamping end to %d (position %d must stay for contiguity)\n",
+                        lo, hi, bound, bound - 1, bound - 1);
+                hi = bound - 1;
+            }
+
+            if (hi <= lo) {
+                SLT_WRN(slot, "da_rm: range [%d, %d) is empty after clamping - skipping\n", lo, hi);
+                continue;
+            }
+
+            bool ok = true;
+            auto * mem_tgt = llama_get_memory(ctx_tgt);
+            if (mem_tgt) {
+                ok = llama_memory_seq_rm(mem_tgt, slot.id, lo, hi) && ok;
+            }
+            if (ctx_dft) {
+                auto * mem_dft = llama_get_memory(ctx_dft);
+                if (mem_dft) {
+                    ok = llama_memory_seq_rm(mem_dft, slot.id, lo, hi) && ok;
+                }
+            }
+            SLT_DBG(slot, "da_rm: [%d, %d) %s (%s)\n", lo, hi, ok ? "removed" : "rejected", when);
+        }
+    }
+
     void post_decode(int32_t n_batch_tokens, int32_t off, llama_batch & batch_view) {
         // for checking if a given batch index is inside batch_view
         auto is_inside_view = [&](int32_t idx) {
@@ -3835,6 +3921,16 @@ private:
 
                 // prompt evaluated for next-token prediction
                 slot.state = SLOT_STATE_GENERATING;
+
+                // Declarative Attention: apply the removals that were not applied
+                // mid-prefill (da_rm_at < 0, multimodal prompts, or the boundary
+                // coincides with the end of the prompt). The first generated token
+                // is sampled from the already-computed prompt logits; subsequent
+                // decode steps see the reduced KV.
+                if (slot.da_rm_pending) {
+                    apply_da_rm(slot, "after prefill");
+                    slot.da_rm_pending = false;
+                }
 
                 if (slot.can_speculate()) {
                     common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());

@@ -68,6 +68,28 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
         ->set_hard_limits(0, INT32_MAX)
         ->set_desc("Min chunk size to attempt reusing from the cache via KV shifting. See --cache-reuse arg"));
 
+    add((new field_json("da_rm"))
+        ->set_desc("Declarative attention: array of [start, end) prompt token position ranges to remove from the KV cache (llama_memory_seq_rm). Decode steps can no longer read the removed tokens' attention KV. On hybrid models the recurrent/linear-attention state is not reset, so removed content may still be reachable there")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            ctx.params.da_rm.clear();
+            const auto & da_rm = data.at("da_rm");
+            if (!da_rm.is_array()) {
+                return;
+            }
+            for (const auto & el : da_rm) {
+                if (!el.is_array() || el.size() != 2) continue;
+                if (!el[0].is_number_integer() || !el[1].is_number_integer()) continue;
+                const int32_t lo = el[0].get<int32_t>();
+                const int32_t hi = el[1].get<int32_t>();
+                if (lo < 0 || hi <= lo) continue;
+                ctx.params.da_rm.emplace_back(lo, hi);
+            }
+        }));
+
+    add((new field_num("da_rm_at", params.da_rm_at))
+        ->set_hard_limits(-1, INT32_MAX)
+        ->set_desc("Token position at which the da_rm ranges are applied: once prompt prefill reaches this position, the removals run and the remaining prompt (e.g. the question) is prefilled without the removed ranges. -1 (default) applies the removals after the full prompt is prefilled"));
+
     // TODO: implement t_max_prompt_ms
     // add((new field_num("t_max_prompt_ms", params.t_max_prompt_ms))
 

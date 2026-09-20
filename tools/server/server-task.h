@@ -7,6 +7,7 @@
 #include <unordered_set>
 #include <list>
 #include <map>
+#include <utility>
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
@@ -63,6 +64,13 @@ struct task_params {
     int32_t n_cmpl    =  1; // number of completions to generate from this prompt
 
     int32_t n_cache_reuse = 0; // min chunk size to attempt reusing from the cache via KV shifting (0 = disabled)
+
+    // Declarative Attention (DA): prompt token ranges [lo, hi) to remove from the
+    // KV cache via llama_memory_seq_rm. Applied once prefill crosses da_rm_at
+    // (>= 0, the remaining prompt is then prefilled without the removed ranges),
+    // or after the full prompt is prefilled (da_rm_at < 0)
+    std::vector<std::pair<int32_t, int32_t>> da_rm;
+    int32_t da_rm_at = -1;
 
     int64_t t_max_prompt_ms  = -1; // TODO: implement
     int64_t t_max_predict_ms = -1; // if positive, limit the generation phase to this time limit
