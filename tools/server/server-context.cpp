@@ -308,6 +308,22 @@ struct server_slot {
     // batch-fill loop runs per token.
     bool da_rm_text_only = false;
 
+    // Declarative Attention 2-stream (B): >= 0 once the slot's decode has been
+    // switched to a second sequence (the keep ranges were copied there via
+    // seq_cp, see apply_da_b). All KV operations and batch tokens of the slot
+    // then use kv_seq() instead of `id`; the original sequence `id` is left
+    // intact. Reset in reset() and its KV cleared in prompt_clear().
+    llama_seq_id da_seq = -1;
+    // set by apply_da_b: the removal boundary position and the number of
+    // prefix tokens copied into da_seq (the logical read set of the second
+    // stream - the attended tokens, not the physical KV scan). Used by the
+    // read-reduction logs (per-step DBG, final INF in release()).
+    int32_t da_bound = -1;
+    size_t  da_keep_count = 0;
+    llama_seq_id kv_seq() const {
+        return da_seq >= 0 ? da_seq : (llama_seq_id) id;
+    }
+
     server_prompt prompt;
 
     bool prompt_save(server_prompt_cache & prompt_cache) const {
@@ -349,6 +365,12 @@ struct server_slot {
         SLT_INF(*this, "clearing prompt with %zu tokens (seq %d)\n", prompt.tokens.size(), id);
 
         mem.seq_rm(id, -1, -1);
+        // a 2-stream (B) slot also holds the keep ranges on its second
+        // sequence; without this the cells would leak into the unified pool
+        // and the next request could pick up the same seq id with stale KV
+        if (da_seq >= 0) {
+            mem.seq_rm(da_seq, -1, -1);
+        }
 
         prompt.clear();
     }
@@ -410,6 +432,11 @@ struct server_slot {
         n_accepted_per_pos.clear();
 
         n_predict_max = -1;
+
+        // 2-stream (B) switch is request-scoped
+        da_seq        = -1;
+        da_bound      = -1;
+        da_keep_count = 0;
 
         llama_set_sampler(ctx_tgt, id, nullptr);
 
@@ -523,9 +550,9 @@ struct server_slot {
             i_batch = batch.size();
 
             if (!inp_embd.empty()) {
-                add_ok &= batch.add(id, inp_embd, prompt.tokens.pos_next(), true, false);
+                add_ok &= batch.add(kv_seq(), inp_embd, prompt.tokens.pos_next(), true, false);
             } else {
-                add_ok &= batch.add(id, sampled, prompt.tokens.pos_next(), true, false);
+                add_ok &= batch.add(kv_seq(), sampled, prompt.tokens.pos_next(), true, false);
             }
 
             SLT_DBG(*this, "slot decode token, id=%d, n_ctx = %d, n_tokens = %d, truncated = %d\n",
@@ -543,9 +570,9 @@ struct server_slot {
 
             auto pos0 = prompt.tokens.pos_next();
 
-            add_ok &= batch.add(id, sampled, pos0++, true, false);
+            add_ok &= batch.add(kv_seq(), sampled, pos0++, true, false);
             for (auto token : spec_draft) {
-                add_ok &= batch.add(this->id, token, pos0++, true, false);
+                add_ok &= batch.add(this->kv_seq(), token, pos0++, true, false);
             }
         }
 
@@ -553,6 +580,18 @@ struct server_slot {
 
         prompt.tokens.push_back(sampled);
         prompt.tokens.insert(spec_draft);
+
+        // 2-stream (B) read-reduction log: the logical read set (attended
+        // tokens) is the kept prefix plus the tokens added after the boundary
+        // ("read 30 of 100"). In the unified KV pool the physical KV scan is
+        // unchanged - the removed cells stay in place, masked with -inf - so
+        // this number is logical, not a measured read count.
+        if (da_seq >= 0) {
+            const int32_t n_full = (int32_t) prompt.n_tokens();
+            const int32_t n_read = (int32_t) da_keep_count + (n_full - da_bound);
+            SLT_DBG(*this, "da_b: decode #%d: logical read set %d of %d token(s) on seq %d (%zu kept + %d after boundary %d; seq %d holds all %d)\n",
+                    n_full - 1, n_read, n_full, da_seq, da_keep_count, n_full - da_bound, da_bound, id, n_full);
+        }
     }
 
     void release() {
@@ -560,6 +599,15 @@ struct server_slot {
             GGML_ASSERT(task);
 
             SLT_INF(*this, "stop processing: n_tokens = %d, truncated = %d\n", prompt.n_tokens(), truncated);
+
+            // 2-stream (B) final read-reduction summary (logical read set, see
+            // handle_last_sampled_token)
+            if (da_seq >= 0) {
+                const int32_t n_full = (int32_t) prompt.n_tokens();
+                const int32_t n_read = (int32_t) da_keep_count + (n_full - da_bound);
+                SLT_INF(*this, "da_b: finished on seq %d - final logical read set %d of %d token(s) (%zu kept prefix + %d after boundary %d); seq %d kept intact\n",
+                        da_seq, n_read, n_full, da_keep_count, n_full - da_bound, da_bound, id);
+            }
 
             t_last_used = ggml_time_us();
 
@@ -1117,7 +1165,21 @@ private:
             params_base.load_progress_callback_user_data = &load_progress_text;
         }
 
+        // 2-stream (B) reserves one sequence id beyond the slot ids (da_seq is
+        // always >= n_slots, so it can never collide with a slot's own sequence
+        // or an idle slot's cached prompt). In --kv-unified mode n_ctx_seq is
+        // the full pool regardless of n_seq_max, so the extra id costs only
+        // sequence metadata, not KV capacity. n_parallel is the sole driver of
+        // cparams.n_seq_max (common.cpp), so bump it only around context
+        // creation and restore it before the slot loop reads it.
+        const int n_da_b_slots = params_base.n_parallel;
+        if (params_base.kv_unified) {
+            params_base.n_parallel = n_da_b_slots + 1;
+        }
+
         llama_init = common_init_from_params(params_base);
+
+        params_base.n_parallel = n_da_b_slots;
 
         model_tgt = llama_init->model();
         ctx_tgt   = llama_init->context();
@@ -1145,6 +1207,15 @@ private:
 
             {
                 common_params params_dft = common_base_params_to_speculative(params_base);
+
+                // the draft context must accept the same da_seq id as the target
+                // context: common_memory::seq_cp operates on both, and a B slot
+                // reserves id n_da_b_slots. (n_outputs_max was already fixed to
+                // the original slot count by common_base_params_to_speculative,
+                // so this only widens the draft context's n_seq_max.)
+                if (params_base.kv_unified) {
+                    params_dft.n_parallel = n_da_b_slots + 1;
+                }
 
                 // progress callback
                 params_dft.load_progress_callback           = load_progress_callback;
@@ -2990,8 +3061,11 @@ private:
 
                 SLT_WRN(slot, "slot context shift, n_keep = %d, n_left = %d, n_discard = %d\n", n_keep, n_left, n_discard);
 
-                slot.mem.seq_rm (slot.id, n_keep            , n_keep + n_discard);
-                slot.mem.seq_add(slot.id, n_keep + n_discard, slot.prompt.tokens.pos_next(), -n_discard);
+                // kv_seq(): for a 2-stream (B) slot the live KV is on the
+                // second sequence; shifting the original one would leave the
+                // live sequence overflowing
+                slot.mem.seq_rm (slot.kv_seq(), n_keep            , n_keep + n_discard);
+                slot.mem.seq_add(slot.kv_seq(), n_keep + n_discard, slot.prompt.tokens.pos_next(), -n_discard);
 
                 // add generated tokens to cache
                 // ref: https://github.com/ggml-org/llama.cpp/pull/16818#discussion_r2473269481
@@ -3201,8 +3275,9 @@ private:
                             const size_t n_total = slot.task->tokens.size();
                             const size_t n_text  = slot.task->tokens.get_text_tokens().size();
                             slot.da_rm_text_only = (n_text == n_total);
-                            SLT_INF(slot, "da_rm: request start - %zu range(s), da_rm_at=%d, n_tokens=%zu, has_mtmd=%d, n_text=%zu, n_media=%zu\n",
+                            SLT_INF(slot, "da_rm: request start - %zu range(s), da_rm_at=%d, da_b=%d, n_tokens=%zu, has_mtmd=%d, n_text=%zu, n_media=%zu\n",
                                     slot.task->params.da_rm.size(), slot.task->params.da_rm_at,
+                                    (int) slot.task->params.da_b,
                                     n_total, (int) slot.task->tokens.has_mtmd, n_text, n_total - n_text);
                             for (const auto & range : slot.task->params.da_rm) {
                                 SLT_INF(slot, "da_rm:   range [%d, %d)\n", range.first, range.second);
@@ -3530,7 +3605,7 @@ private:
 
                     SLT_TRC(slot, "cached n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
 
-                    slot.mem.seq_rm(slot.id, p0, -1);
+                    slot.mem.seq_rm(slot.kv_seq(), p0, -1);
 
                     // If using an alora, there may be uncached tokens that come
                     // before the invocation sequence. When this happens, the
@@ -3575,7 +3650,11 @@ private:
                     if (slot.da_rm_pending && slot.task->params.da_rm_at >= 0 &&
                             slot.prompt.n_tokens() >= slot.task->params.da_rm_at) {
                         if (slot.da_rm_text_only) {
-                            apply_da_rm(slot, "at da_rm_at");
+                            if (slot.task->params.da_b) {
+                                apply_da_b(slot, "at da_rm_at");
+                            } else {
+                                apply_da_rm(slot, "at da_rm_at");
+                            }
                             slot.da_rm_pending = false;
                         } else if (!slot.da_rm_gate_diag_done) {
                             slot.da_rm_gate_diag_done = true;
@@ -3654,7 +3733,10 @@ private:
                         // embedding requires all tokens in the batch to be output;
                         // MTP also wants logits at every prompt position so the
                         // streaming hook can mirror t_h_nextn into ctx_dft.
-                        add_ok &= batch.add(slot.id,
+                        // kv_seq(): after a 2-stream (B) switch the remaining
+                        // prompt (e.g. the question) is prefilled on the new
+                        // sequence.
+                        add_ok &= batch.add(slot.kv_seq(),
                             cur_tok,
                             /* pos       = */ slot.prompt.tokens.pos_next(),
                             /* output    = */ slot.need_embd(),
@@ -3975,6 +4057,189 @@ private:
         }
     }
 
+    // Declarative Attention 2-stream (B): instead of removing the da_rm ranges
+    // from the slot's own sequence, copy the KEEP ranges (the complement of
+    // da_rm in [0, bound)) to a second sequence via llama_memory_seq_cp and
+    // switch the slot's decode to that sequence. The original sequence is left
+    // intact - B's unique value over the logical removal (A): a global return
+    // (attending the full prompt again) can reuse the original sequence
+    // without a re-prefill (the return function is not implemented yet).
+    //
+    // Read-reduction semantics: in the unified KV pool, seq_cp only retags
+    // cell metadata - the cells are not moved and the attention scan is not
+    // shortened. The decode's LOGICAL read set (the tokens it attends to)
+    // shrinks to the kept prefix plus the tokens added after the boundary;
+    // the removed cells stay in place, masked with -inf. The physical KV read
+    // volume is unchanged unless the FA kernel skips masked tiles/chunks
+    // (backend C; the CUDA FA skip is inactive for 1-token decode).
+    //
+    // Preconditions (checked here; on violation, fall back to the logical
+    // removal apply_da_rm):
+    //   - the KV must be unified (--kv-unified): a partial-range seq_cp across
+    //     KV streams aborts (llama_kv_cache::seq_cp), while within one stream
+    //     it only retags cell metadata.
+    //   - a sequence id beyond the slot ids must be available: the server
+    //     reserves one extra id at context creation (n_seq_max = n_slots + 1
+    //     in --kv-unified mode). Ids below n_slots are never used - they may
+    //     hold idle slots' cached prompts, which prompt_clear() would destroy.
+    //   - the prefilled prompt must not exceed the removal boundary: the keep
+    //     ranges only cover [0, bound), so tokens in [bound, n_prompt) would
+    //     be missing from the new sequence (the media-blocked after-prefill
+    //     path).
+    //
+    // Read-reduction logs: INF at the switch (keep ranges, logical read set
+    // "N of M"), DBG per decode step (handle_last_sampled_token), INF summary
+    // in release().
+    void apply_da_b(server_slot & slot, const char * when) {
+        if (slot.task->params.da_rm.empty()) {
+            return;
+        }
+
+        const int32_t n_prompt = slot.task->n_tokens();
+        const int32_t bound    = slot.task->params.da_rm_at >= 0
+                                ? std::min(slot.task->params.da_rm_at, n_prompt)
+                                : n_prompt;
+
+        if (bound <= 0) {
+            SLT_WRN(slot, "da_b: removal boundary is empty (bound=%d) - falling back to logical removal (%s)\n", bound, when);
+            apply_da_rm(slot, when);
+            return;
+        }
+
+        // the keep ranges only cover [0, bound); if the prefilled prompt is
+        // longer than the boundary (the mid-prefill gate was blocked, e.g. by
+        // media, and the removals are applied after prefill), the tokens in
+        // [bound, n_prompt) would be missing from the new sequence
+        if (slot.prompt.n_tokens() > bound) {
+            SLT_WRN(slot, "da_b: prefilled prompt (%d tokens) exceeds the removal boundary %d - falling back to logical removal (%s)\n",
+                    slot.prompt.n_tokens(), bound, when);
+            apply_da_rm(slot, when);
+            return;
+        }
+
+        // partial-range seq_cp across KV streams aborts; only the unified pool
+        // (one stream for all sequences) supports it via metadata retagging
+        if (!llama_kv_unified(ctx_tgt) || (ctx_dft && !llama_kv_unified(ctx_dft))) {
+            SLT_WRN(slot, "da_b: requires --kv-unified (partial-range seq_cp across KV streams is unsupported) - falling back to logical removal (%s)\n", when);
+            apply_da_rm(slot, when);
+            return;
+        }
+
+        // pick a sequence id beyond the slot ids: ids below n_slots may hold
+        // idle slots' cached prompts, which this slot's prompt_clear() would
+        // destroy. The server reserves one extra id at context creation
+        // (n_seq_max = n_slots + 1 in --kv-unified mode).
+        const int n_seq_max = (int) llama_n_seq_max(ctx_tgt);
+        const int n_slots   = (int) slots.size();
+        llama_seq_id da_seq = -1;
+        for (int i = n_slots; i < n_seq_max; ++i) {
+            bool taken = false;
+            for (auto & other : slots) {
+                // only a processing slot can hold live KV on the id: an idle
+                // slot's da_seq KV was already cleared by prompt_clear() in
+                // release() (and da_seq reset there too), so reusing the id
+                // under it is safe. Counting idle slots would burn the single
+                // reserved id on the first finished request.
+                if (other.is_processing() && other.da_seq == i) {
+                    taken = true;
+                    break;
+                }
+            }
+            if (!taken) {
+                da_seq = (llama_seq_id) i;
+                break;
+            }
+        }
+        if (da_seq < 0) {
+            SLT_WRN(slot, "da_b: no sequence id beyond the slot ids (n_seq_max=%d, n_slots=%d) - falling back to logical removal (%s)\n", n_seq_max, n_slots, when);
+            apply_da_rm(slot, when);
+            return;
+        }
+
+        // build the keep ranges: the complement of the da_rm ranges in
+        // [0, bound). The clamping mirrors apply_da_rm: a range reaching the
+        // boundary is cut at bound - 1 so the last position of the prefilled
+        // prefix stays in the new sequence (position contiguity for the
+        // continuation).
+        //
+        // The da_rm ranges are user-supplied and may be unsorted or
+        // overlapping (e.g. [[100,120],[10,20]]). Clamping, sorting by lo and
+        // merging overlaps BEFORE taking the complement - a forward-only sweep
+        // over the raw ranges would let an out-of-order range corrupt the keep
+        // set.
+        std::vector<std::pair<int32_t, int32_t>> rm;
+        for (const auto & range : slot.task->params.da_rm) {
+            int32_t lo = range.first;
+            int32_t hi = range.second;
+
+            if (lo >= bound) {
+                SLT_WRN(slot, "da_b: range [%d, %d) starts at/after the removal boundary %d - ignoring for the copy\n", lo, hi, bound);
+                continue;
+            }
+            if (hi > bound - 1) {
+                SLT_WRN(slot, "da_b: range [%d, %d) reaches the removal boundary %d - clamping end to %d (position %d must stay for contiguity)\n",
+                        lo, hi, bound, bound - 1, bound - 1);
+                hi = bound - 1;
+            }
+            lo = std::max(lo, 0);
+            if (hi <= lo) {
+                continue;
+            }
+            rm.emplace_back(lo, hi);
+        }
+        std::sort(rm.begin(), rm.end());
+        std::vector<std::pair<int32_t, int32_t>> rm_merged;
+        for (const auto & r : rm) {
+            if (!rm_merged.empty() && r.first <= rm_merged.back().second) {
+                rm_merged.back().second = std::max(rm_merged.back().second, r.second);
+            } else {
+                rm_merged.emplace_back(r);
+            }
+        }
+
+        std::vector<std::pair<int32_t, int32_t>> keep;
+        {
+            int32_t cur = 0;
+            for (const auto & r : rm_merged) {
+                if (r.first > cur) {
+                    keep.emplace_back(cur, std::min(r.first, bound));
+                }
+                cur = std::max(cur, r.second);
+            }
+            if (cur < bound) {
+                keep.emplace_back(cur, bound);
+            }
+        }
+
+        size_t n_keep = 0;
+        for (const auto & r : keep) {
+            n_keep += (size_t) (r.second - r.first);
+        }
+        const size_t n_remove = (size_t) bound - n_keep;
+
+        if (n_remove == 0) {
+            SLT_WRN(slot, "da_b: da_rm ranges cover nothing in [0, %d) after clamping - nothing to remove, staying on seq %d (%s)\n", bound, slot.id, when);
+            return;
+        }
+
+        // copy each keep range into the fresh sequence (target + draft memory)
+        for (const auto & r : keep) {
+            slot.mem.seq_cp(slot.id, da_seq, r.first, r.second);
+        }
+
+        // switch the slot to the new sequence
+        slot.da_seq        = da_seq;
+        slot.da_bound      = bound;
+        slot.da_keep_count = n_keep;
+
+        SLT_INF(slot, "da_b: switched decode to seq %d (%s) - logical read set now %zu of %d prefix token(s) (%zu removed, -%.1f%%)\n",
+                da_seq, when, n_keep, bound, n_remove, 100.0 * (double) n_remove / (double) bound);
+        for (const auto & r : keep) {
+            SLT_INF(slot, "da_b:   keep [%d, %d) %zu token(s)\n", r.first, r.second, (size_t) (r.second - r.first));
+        }
+        SLT_INF(slot, "da_b: original seq %d untouched (%d token(s)) - rollback/reference\n", slot.id, bound);
+    }
+
     void post_decode(int32_t n_batch_tokens, int32_t off, llama_batch & batch_view) {
         // for checking if a given batch index is inside batch_view
         auto is_inside_view = [&](int32_t idx) {
@@ -4043,11 +4308,18 @@ private:
                                 slot.task->params.da_rm_at, (int) slot.task->tokens.has_mtmd, (int) slot.prompt.n_tokens(),
                                 n_text, n_total - n_text);
                     }
-                    apply_da_rm(slot, "after prefill");
+                    if (slot.task->params.da_b) {
+                        apply_da_b(slot, "after prefill");
+                    } else {
+                        apply_da_rm(slot, "after prefill");
+                    }
                     slot.da_rm_pending = false;
                 }
 
-                if (slot.can_speculate()) {
+                // speculative decoding drafts on the slot's own sequence; a
+                // 2-stream (B) slot decodes on its second sequence, so spec is
+                // disabled there (draft tokens would land on the wrong seq)
+                if (slot.can_speculate() && slot.da_seq < 0) {
                     common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
                 }
             } else if (slot.state != SLOT_STATE_GENERATING) {

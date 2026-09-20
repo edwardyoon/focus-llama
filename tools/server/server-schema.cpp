@@ -90,6 +90,9 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
         ->set_hard_limits(-1, INT32_MAX)
         ->set_desc("Token position at which the da_rm ranges are applied: once prompt prefill reaches this position, the removals run and the remaining prompt (e.g. the question) is prefilled without the removed ranges. -1 (default) applies the removals after the full prompt is prefilled"));
 
+    add((new field_bool("da_b", params.da_b))
+        ->set_desc("Declarative attention 2-stream mode: instead of removing the da_rm ranges from this slot's sequence (logical removal), copy the keep ranges (complement of da_rm in [0, da_rm_at)) to a fresh sequence via llama_memory_seq_cp and switch the slot's decode to it. The original sequence is left intact. Requires the server to run with --kv-unified; speculative decoding is disabled for the request"));
+
     // TODO: implement t_max_prompt_ms
     // add((new field_num("t_max_prompt_ms", params.t_max_prompt_ms))
 

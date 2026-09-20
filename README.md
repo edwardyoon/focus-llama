@@ -39,7 +39,7 @@ Stock `llama.cpp` cannot do this out of the box:
 │ chunker      │   │ llama_decode(batch)               │   │ backend A: seq_rm        │
 │  ~2K-token   │──▶│ sample token                      │──▶│   (logical mask, exact)  │
 │  magic chunks│   │ DA state machine                  │   │ backend B: two streams   │
-│ tool-use     │   │   parse tag on closing '>'        │   │   (physical compaction)  │
+│ tool-use     │   │   parse tag on closing '>'        │   │   (logical read-set)     │
 │ transcript   │   │   emit mode transition            │   │ backend C: kernel-level  │
 └──────────────┘   │ apply mode -> KV control          │   │   block/tile skipping    │
                    │ log attended tokens per step      │   └──────────────────────────┘
@@ -57,31 +57,10 @@ Key points:
 | Backend | Mechanism | Speed-up | Cost |
 |---------|-----------|----------|------|
 | **A. `seq_rm`** | Remove non-focus ranges, restore by re-prefill | None guaranteed (semantic equivalence only) | Re-prefill on every focus → global switch |
-| **B. Two streams** | Stream 0 holds the full context permanently; stream 1 holds scaffold + focus chunks + response; new tokens are copied across with `seq_cp` | Real reduction in KV read (attended region is physically small) | ~2x KV memory, small copy per switch |
+| **B. Two streams** | Stream 0 holds the full context permanently; stream 1 holds the kept (scaffold + focus) chunks + response, copied with `seq_cp` (a cell retag in the unified pool, no data copy) | Logical read-set reduction only - the attended tokens shrink, but the physical KV scan is unchanged (removed cells stay in place, masked with `-inf`); a physical reduction needs the FA kernel to skip masked tiles (C). B's unique value: the original stream is preserved, so a global return needs no re-prefill | ~2x KV metadata (unified pool) |
 | **C. Kernel skipping** | Skip fully-masked tiles/blocks in the flash-attention kernels | Potentially in-place, no extra memory | Kernel work per backend (CUDA / Metal) |
 
 Backend A is for validating protocol adherence and accuracy. Backend B is the first candidate for measuring real speed-ups. C is only worth building if B's numbers justify it.
-
-## Roadmap
-
-- [ ] **P0. Prompt + parser, no masking (DA-nm).** Chunker, tool-use transcript prompt, DA state machine, attended-token logger. Measures protocol adherence and the accuracy of the prompt format alone.
-- [ ] **P1. Backend A (`seq_rm`).** Exact-mask accuracy; compare Vanilla / DA-nm / DA on short-context tasks first.
-- [ ] **P2. Backend B (two streams).** Verify that decoding a stream while the other stays idle works with the public API; measure per-step KV read and wall-clock.
-- [ ] **P3. Model coverage.** Check behaviour on pure-attention vs. hybrid (recurrent) architectures.
-- [ ] **P4. Backend C.** Only if P2 shows a clear win.
-- [ ] **P5. FocusMemory integration.** Use chunk indexes/summaries as the global-mode view.
-
-## Expectations and known limits
-
-Numbers below are from the DA paper (zero-shot, vLLM, batched serving), **not** measurements of this fork.
-
-- Attended KV tokens per response dropped **52.0%** (Gemma-4-31B) and **31.1%** (Qwen-3.6-27B), with accuracy drops of 1.27pp and 2.75pp on 15 long-context tasks.
-- Per-step savings are large only in `focus`/`local` steps (76-99% fewer attended tokens). `global` steps save nothing and account for most of the remaining attended tokens, more so at longer contexts.
-- DA generates **15-35% more decode steps** than vanilla. Whether that nets out depends on how much of decode time is spent on global-attention KV reads. The paper's wall-clock figures (0.71x / 0.77x) are roofline estimates for large-batch serving, not measurements. **Single-stream local inference is a different regime and may see little or no gain.**
-- The mask only applies to global-attention layers; sliding-window and recurrent (e.g. Gated DeltaNet) layers are untouched. On hybrid models `seq_rm` reproduces the paper's semantics — the attention KV of the removed range is freed, but the recurrent/linear-attention state is not reset. A masked-all control (the whole document's KV removed, recurrent state left intact) still cannot answer a removed fact, so the recurrent state does **not** retain specific facts: a removed fact stays answerable (masked-A) only because it seeped into the *surviving* full-attention KV of later tokens during the full-attention prefill. **Isolation** (a removed fact becomes unanswerable) therefore needs the whole document's attention KV gone — a property of pure-attention models, not what DA promises on hybrids. Hybrids also save less per token (attention KV is a fraction of the layers), so the speed-up factor is smaller.
-- Thinking mode must be disabled; models did not follow the protocol inside thinking traces.
-- Zero-shot protocol adherence needs a capable model. Small models (around 4B) fail often to emit valid `focus` calls.
-- Prefill cost and resident KV memory are unchanged.
 
 ## Build
 
@@ -90,30 +69,61 @@ Same as upstream `llama.cpp`:
 ```bash
 git clone https://github.com/edwardyoon/focus-llama.git
 cd focus-llama
-cmake -B build -DGGML_CUDA=ON     # or omit for CPU, or use Metal on macOS
-cmake --build build --config Release -j
+cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES="120" -DGGML_CUDA_FA_ALL_QUANTS=ON -DCMAKE_BUILD_TYPE=Release
+     # or omit for CPU, or use Metal on macOS
+cmake --build build --config Release -j --clean-first --target llama-cli llama-mtmd-cli llama-server llama-bench
 ```
 
-## Usage (planned, not yet implemented)
-
-A dedicated tool is planned rather than changes to `llama-server`:
+Once done, you can smoke test like below:
 
 ```bash
-# sketch only: flags and binary name are not final
-./build/bin/llama-da \
-  -m model.gguf \
-  --da-context ./doc.txt \
-  --da-chunk-tokens 2048 \
-  --da-backend seq_rm \
-  --da-log attended.jsonl \
-  -p "Question about the document"
+$ python3 ~/focus-llama/da-probe/da_server_smoke.py http://127.0.0.1:8080 --hybrid
+base   : http://127.0.0.1:8080  (hybrid expectations)
+prompt tokens            : 175
+document start           : 8
+fact range (S2)          : [69, 106)
+other range (S3)         : [116, 145)
+question start (da_rm_at): 146
+------------------------------------------------------------------------
+baseline: 'ZEBRA-42'  (ZEBRA-42: True)
+          prompt_tokens=175 completion_tokens=7
+          first_token='Z' lp=-0.1332 top=[('Z', -0.1332), ('The', -3.1368), ('**', -3.648)]
+strict    (fact, at Q): 'The user is asking for the "emergency shutdown codeword for the facility" based on the provided technical document.'  (ZEBRA-42: False)
+          prompt_tokens=175 completion_tokens=24
+          first_token='The' lp=-1.0588 top=[('The', -1.0588), ('There', -2.0083), ('Answer', -2.0664)]
+paper     (fact, end): 'Z'  (ZEBRA-42: False)
+          prompt_tokens=175 completion_tokens=2
+          first_token='Z' lp=-0.1332 top=[('Z', -0.1332), ('The', -3.1368), ('**', -3.648)]
+masked-all (doc, at Q): 'The document does not contain an emergency shutdown codeword.'  (ZEBRA-42: False)
+          prompt_tokens=175 completion_tokens=13
+          first_token='The' lp=-0.7549 top=[('The', -0.7549), ('<think>', -2.0124), ('**', -2.1791)]
+control   (S3, at Q)  : 'ZEBRA-42'  (ZEBRA-42: True)
+          prompt_tokens=175 completion_tokens=7
+          first_token='Z' lp=-0.1385 top=[('Z', -0.1385), ('The', -3.2115), ('**', -3.6142)]
+------------------------------------------------------------------------
+baseline         : PASS (exact 'ZEBRA-42')
+mechanism (Δlp)  : baseline vs masked-all first-token Δlp=0.6217 — different prefill computation (mid-prefill removal ran)
+mechanism (text) : clean (informational on hybrid — with a Δlp divergence above, a leading 'Z' means the fact survives via the recurrent state, not the full-attention KV; confirm with the codeword-swap control QUOKKA-17)
+selectivity      : PASS (exact 'ZEBRA-42')
+strict leak      : clean (informational on hybrid — paper semantics, surviving-KV leak; see da_probe masked-A)
+path divergence  : strict vs paper first-token Δlp=0.9256 — different prefill paths
+OVERALL          : PASS
+paper run is informational on both architectures (decode-time restriction).
+also check the server terminal for a WARN 'clamping end' line from the masked-all run.
 ```
-
-Each run is intended to log, per step: mode, attended token count, and total decode steps, so results can be compared against the paper's metrics.
 
 ## Relationship to FocusMemory
 
-FocusMemory chunks and indexes long-term context. `focus-llama` is the inference-side counterpart: it lets the model read a compact index in `global` mode and then commit attention to specific chunks. The two are independent and can be used separately.
+[FocusMemory](https://github.com/edwardyoon/FocusMemory) chunks and indexes long-term context. `focus-llama` is the inference-side counterpart: it lets the model read a compact index in `global` mode and then commit attention to specific chunks. The two are independent and can be used separately.
+
+## Status and limits
+
+Early work in progress.
+
+- **Works:** `llama-server` accepts `da_rm` / `da_rm_at` to drop KV token ranges either mid-prefill or after prefill. Checked via first-token logprobs on a small smoke test.
+- **Probe only:** parsing `<focus magic_chunks="N">` during generation and removing ranges at that point (`da-probe/`). Not in the server yet.
+- **Hybrid models** (e.g. Gated DeltaNet): only the attention layers are affected, as in the paper.
+- **Evidence so far is small:** one-prompt smoke tests and a 5-prompt tag-adherence check. For the paper's numbers and caveats, see arXiv:2609.02737.
 
 ## Reference
 

@@ -72,6 +72,15 @@ struct task_params {
     std::vector<std::pair<int32_t, int32_t>> da_rm;
     int32_t da_rm_at = -1;
 
+    // Declarative Attention 2-stream (B): with da_rm non-empty, apply the
+    // removals by copying the KEEP ranges (the complement of da_rm in
+    // [0, bound)) to a fresh sequence via llama_memory_seq_cp and switching
+    // the slot's decode to that sequence, instead of seq_rm on the slot's own
+    // sequence. The original sequence stays intact (rollback/reference).
+    // Requires a unified KV pool (partial-range seq_cp aborts otherwise) and
+    // speculative decoding is disabled for the slot.
+    bool da_b = false;
+
     int64_t t_max_prompt_ms  = -1; // TODO: implement
     int64_t t_max_predict_ms = -1; // if positive, limit the generation phase to this time limit
 
