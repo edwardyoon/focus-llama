@@ -8,7 +8,9 @@ Usage:
   --hybrid    model has recurrent/linear-attention layers (e.g. qwen35):
               the strict (fact-only) run is expected to LEAK (paper semantics —
               the fact survives via the surviving full-attention KV), so it is
-              informational. The mechanism proof is the masked-all run.
+              informational. The mechanism proof is the first-token Δlp vs
+              baseline; the masked-all TEXT result is informational on a
+              hybrid (a 'Z' start there is a recurrent-state leak candidate).
 
 Runs 5 completions against BASE/v1/completions. All requests use
 stop=["\n"], max_tokens=24 and n_probs=5, and the verdict is EXACT match, so a
@@ -17,7 +19,8 @@ containing ZEBRA-42 somewhere in the text:
   a. baseline   - no da_rm                          -> expect exactly ZEBRA-42
   b. strict     - da_rm=fact range, da_rm_at=Q      -> clean (pure attn) / informational (hybrid)
   c. paper      - da_rm=fact range, no boundary     -> decode-time restriction (informational)
-  d. masked-all - da_rm=whole document, da_rm_at=Q  -> expect clean (MECHANISM PROOF)
+  d. masked-all - da_rm=whole document, da_rm_at=Q  -> mechanism proof is the
+              first-token Δlp vs baseline; on pure attention also expect clean
   e. control    - da_rm=other section, da_rm_at=Q   -> expect exactly ZEBRA-42 (selectivity)
 
 Leak classification for removal runs (b/d):
@@ -26,18 +29,25 @@ Leak classification for removal runs (b/d):
                   token was sampled from pre-removal prefill logits (the
                   post-prefill path ran) or from surviving state. On a
                   hybrid, once the mid-prefill path is confirmed working
-                  (path divergence PASS), a 'Z' start can only be
+                  (mechanism Δlp PASS), a 'Z' start can only be
                   surviving/recurrent-state leak - whether it really is the
                   recurrent state is a separate observation, confirmed by
                   the codeword-swap control (da_probe QUOKKA-17).
   FULL-LEAK     - exactly ZEBRA-42
 
-Why masked-all is the mechanism proof: on a hybrid the strict run leaks
-(surviving-KV), which is behaviorally identical to an old server binary that
-silently ignores the unknown da_rm field. Removing the WHOLE document up to
-the question is different: da_probe's masked-all control proved that on
-qwen35 this breaks the answer (the recurrent state does not retain the fact),
-so "masked-all answers no ZEBRA-42" can only happen if seq_rm actually ran.
+Why the first-token Δlp is the mechanism proof: the first generated token is
+sampled from the logits at the last prompt position. masked-all removes the
+WHOLE document before the question is prefilled, so if the mid-prefill path
+ran its prefill computation differs from the baseline's and the first-token
+logprob differs (|Δlp| > 1e-6); identical logprobs mean the removal only ran
+after prefill. This works on both architectures and is immune to the
+hybrid's surviving-KV leak, which makes the strict run behaviorally
+identical to an old server binary that silently ignores the da_rm field.
+On a pure-attention model the masked-all run must also answer cleanly
+(end-to-end check, still a PASS/FAIL criterion); on a hybrid the text check
+is informational — the recurrent state was updated while the document was
+still visible, so a 'Z' start despite a Δlp divergence is a recurrent-state
+leak (a real finding, confirmed by the codeword-swap control QUOKKA-17).
 The masked-all range reaches the da_rm_at boundary, so apply_da_rm clamps its
 end to bound-1 and emits a WARN line in the server log (visible at default
 verbosity) — a second piece of evidence.
@@ -50,11 +60,12 @@ libllama-server-impl.dylib, not the thin server binary):
 
 After the run, grep the server journal for the da_rm diagnostic chain:
   request start -> batch fill stopped at boundary -> applying (at da_rm_at)
-  or: request start -> boundary reached but skipped (has_mtmd) ->
+  or: request start -> boundary reached but skipped (media present) ->
       mid-prefill boundary never applied -> applying (after prefill)
-n_text == n_tokens (n_media=0) with has_mtmd=1 means the server has an
-mmproj loaded and the text-only prompt is mis-gated — restart without
---mmproj, or relax the gate to a media-presence check.
+The mid-prefill guards test a media-presence check (da_rm_text_only: text
+tokens == all tokens), not has_mtmd — has_mtmd is true whenever an mmproj is
+loaded, even for text-only prompts, which silently pushed every text-only
+da_rm request to the post-prefill path.
 
 Note: chat_template_kwargs (e.g. enable_thinking:false) only applies to
 /v1/chat/completions, not to /v1/completions. Thinking is neutralized
@@ -248,14 +259,45 @@ def main():
         ok = exact(L_BASE)
         checks.append(ok)
         print("baseline         : %s (exact %r)" % ("PASS" if ok else "FAIL", ANSWER))
+
+    # mechanism proof (both architectures): masked-all removes the whole
+    # document before the question is prefilled, so the first generated token
+    # (sampled from the last prompt position's logits) must come from a
+    # different prefill computation than the baseline. Identical logprobs mean
+    # the removal never reached the prefill (post-prefill path only).
+    if "baseline" in lps and "masked-all" in lps:
+        b_tok, b_lp, _ = lps["baseline"]
+        m_tok, m_lp, _ = lps["masked-all"]
+        if b_lp is None or m_lp is None:
+            checks.append(False)
+            print("mechanism (Δlp)  : FAIL (no logprobs: baseline=%s masked-all=%s) - "
+                  "check the first_token=... lines above; if this server does not "
+                  "return n_probs on /v1/completions, switch to native /completion "
+                  "with completion_probabilities"
+                  % (b_lp is not None, m_lp is not None))
+        else:
+            d = round(abs(b_lp - m_lp), 6)
+            ok = d > 1e-6
+            checks.append(ok)
+            print("mechanism (Δlp)  : baseline vs masked-all first-token Δlp=%s — %s"
+                  % (d, "different prefill computation (mid-prefill removal ran)"
+                     if ok else
+                     "IDENTICAL - the removal did not reach the prefill (mid-prefill "
+                     "path did not run; journal: expect 'batch fill stopped at "
+                     "boundary', look for 'skipped'/'never applied' instead)"))
+
     if L_MASKED in results:
         st = leak_state(L_MASKED)
-        ok = st == "clean"
-        checks.append(ok)
-        print("mechanism        : %s (masked-all must be clean; %s — a leading 'Z' "
-              "means the first token was sampled from pre-removal prefill logits, "
-              "i.e. the post-prefill path ran, or surviving-state leak)"
-              % ("PASS" if ok else "FAIL", st))
+        if HYBRID:
+            print("mechanism (text) : %s (informational on hybrid — with a Δlp "
+                  "divergence above, a leading 'Z' means the fact survives via the "
+                  "recurrent state, not the full-attention KV; confirm with the "
+                  "codeword-swap control QUOKKA-17)" % st)
+        else:
+            ok = st == "clean"
+            checks.append(ok)
+            print("mechanism (text) : %s (masked-all must be clean; %s)"
+                  % ("PASS" if ok else "FAIL", st))
     if L_CTRL in results:
         ok = exact(L_CTRL)
         checks.append(ok)
