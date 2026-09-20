@@ -342,6 +342,10 @@ struct server_slot {
     // Declarative Attention: da_rm ranges not yet applied to the KV cache
     bool da_rm_pending = false;
 
+    // one-shot diagnostic emitted when the da_rm_at boundary is crossed
+    // without applying the removals (e.g. has_mtmd)
+    bool da_rm_gate_diag_done = false;
+
     server_prompt prompt;
 
     bool prompt_save(server_prompt_cache & prompt_cache) const {
@@ -3959,6 +3963,7 @@ private:
                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
 
                         slot.da_rm_pending = !slot.task->params.da_rm.empty();
+                        slot.da_rm_gate_diag_done = false;
 
                         SLT_TRC(slot, "new prompt, n_ctx_slot = %d, n_keep = %d, task.n_tokens = %d\n",
                                 slot.n_ctx, slot.task->params.n_keep, slot.task->n_tokens());
@@ -4340,10 +4345,15 @@ private:
                     // multimodal prompts (the boundary must not fall inside an
                     // mtmd chunk); those fall through to the post-prefill path.
                     if (slot.da_rm_pending && slot.task->params.da_rm_at >= 0 &&
-                            !slot.task->tokens.has_mtmd &&
                             slot.prompt.n_tokens() >= slot.task->params.da_rm_at) {
-                        apply_da_rm(slot, "at da_rm_at");
-                        slot.da_rm_pending = false;
+                        if (!slot.task->tokens.has_mtmd) {
+                            apply_da_rm(slot, "at da_rm_at");
+                            slot.da_rm_pending = false;
+                        } else if (!slot.da_rm_gate_diag_done) {
+                            slot.da_rm_gate_diag_done = true;
+                            SLT_INF(slot, "da_rm: mid-prefill boundary reached but skipped (has_mtmd) - da_rm_at=%d has_mtmd=%d n_tokens=%d; applying after prefill instead\n",
+                                    slot.task->params.da_rm_at, (int) slot.task->tokens.has_mtmd, (int) slot.prompt.n_tokens());
+                        }
                     }
 
                     bool has_mtmd = false;
@@ -4865,6 +4875,10 @@ private:
                 // is sampled from the already-computed prompt logits; subsequent
                 // decode steps see the reduced KV.
                 if (slot.da_rm_pending) {
+                    if (slot.task->params.da_rm_at >= 0) {
+                        SLT_INF(slot, "da_rm: mid-prefill boundary never applied (da_rm_at=%d has_mtmd=%d n_tokens=%d) - applying after prefill\n",
+                                slot.task->params.da_rm_at, (int) slot.task->tokens.has_mtmd, (int) slot.prompt.n_tokens());
+                    }
                     apply_da_rm(slot, "after prefill");
                     slot.da_rm_pending = false;
                 }
