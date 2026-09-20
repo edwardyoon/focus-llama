@@ -320,6 +320,10 @@ struct server_slot {
     // read-reduction logs (per-step DBG, final INF in release()).
     int32_t da_bound = -1;
     size_t  da_keep_count = 0;
+    // DA tag parser: true once the first complete <focus magic_chunks> tag has
+    // been parsed from the generated text and the restriction applied (the
+    // removals run exactly once, mid-decode; see apply_da_tag).
+    bool da_tag_applied = false;
     llama_seq_id kv_seq() const {
         return da_seq >= 0 ? da_seq : (llama_seq_id) id;
     }
@@ -437,6 +441,7 @@ struct server_slot {
         da_seq        = -1;
         da_bound      = -1;
         da_keep_count = 0;
+        da_tag_applied = false;
 
         llama_set_sampler(ctx_tgt, id, nullptr);
 
@@ -1936,6 +1941,13 @@ private:
         slot.sampled = result.tok;
 
         slot.generated_text += token_str;
+
+        // DA tag parser: the model's own <focus magic_chunks="N"> tag drives the
+        // attention restriction. Scan the accumulated text for the first
+        // complete tag; on tag close the removals run exactly once, mid-decode
+        // (no-op unless the client sent da_chunks, and after it has applied).
+        apply_da_tag(slot);
+
         if (slot.task->params.return_tokens) {
             slot.generated_tokens.push_back(result.tok);
         }
@@ -3268,7 +3280,9 @@ private:
 
                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
 
-                        slot.da_rm_pending = !slot.task->params.da_rm.empty();
+                        // the tag path (da_chunks) supersedes the static da_rm
+                        // removals: the model's own tag decides the ranges
+                        slot.da_rm_pending = !slot.task->params.da_rm.empty() && slot.task->params.da_chunks.empty();
                         slot.da_rm_gate_diag_done = false;
 
                         SLT_TRC(slot, "new prompt, n_ctx_slot = %d, n_keep = %d, task.n_tokens = %d\n",
@@ -3289,6 +3303,21 @@ private:
                                     n_total, (int) slot.task->tokens.has_mtmd, n_text, n_total - n_text);
                             for (const auto & range : slot.task->params.da_rm) {
                                 SLT_INF(slot, "da_rm:   range [%d, %d)\n", range.first, range.second);
+                            }
+                        }
+
+                        // da_tag diagnostics: the model's own <focus
+                        // magic_chunks="N"> tag drives the removals; the client
+                        // only supplies the chunk layout.
+                        if (!slot.task->params.da_chunks.empty()) {
+                            SLT_INF(slot, "da_tag: request start - %zu chunk(s), da_b=%d, filler=%s\n",
+                                    slot.task->params.da_chunks.size(), (int) slot.task->params.da_b,
+                                    slot.task->params.da_filler.first >= 0
+                                        ? string_format("[%d, %d)", slot.task->params.da_filler.first, slot.task->params.da_filler.second).c_str()
+                                        : "none");
+                            for (size_t n = 0; n < slot.task->params.da_chunks.size(); n++) {
+                                SLT_INF(slot, "da_tag:   chunk %zu [%d, %d)\n", n + 1,
+                                        slot.task->params.da_chunks[n].first, slot.task->params.da_chunks[n].second);
                             }
                         }
 
@@ -3659,9 +3688,9 @@ private:
                             slot.prompt.n_tokens() >= slot.task->params.da_rm_at) {
                         if (slot.da_rm_text_only) {
                             if (slot.task->params.da_b) {
-                                apply_da_b(slot, "at da_rm_at");
+                                apply_da_b(slot, slot.task->params.da_rm, da_static_bound(slot), "at da_rm_at");
                             } else {
-                                apply_da_rm(slot, "at da_rm_at");
+                                apply_da_rm(slot, slot.task->params.da_rm, da_static_bound(slot), "at da_rm_at");
                             }
                             slot.da_rm_pending = false;
                         } else if (!slot.da_rm_gate_diag_done) {
@@ -4004,26 +4033,36 @@ private:
         return true;
     }
 
-    // Declarative Attention: remove the requested prompt token ranges from the KV
+    // The removal boundary for the static (client-supplied da_rm) path: the
+    // da_rm_at position clamped to the prompt length, or the prompt end when
+    // da_rm_at < 0. (The tag path computes its own boundary - the current
+    // decode position - in apply_da_tag.)
+    int32_t da_static_bound(const server_slot & slot) const {
+        const int32_t n_prompt = slot.task->n_tokens();
+        return slot.task->params.da_rm_at >= 0
+            ? std::min(slot.task->params.da_rm_at, n_prompt)
+            : n_prompt;
+    }
+
+    // Declarative Attention: remove the given prompt token ranges from the KV
     // cache of the target context (and the draft context, when speculative
-    // decoding is active). The removal is a no-op for positions whose KV does not
-    // exist yet, so callers must invoke it once the covered positions are fully
-    // prefilled. Ranges are clamped to the removal boundary (da_rm_at, or the
-    // prompt end when da_rm_at < 0).
-    void apply_da_rm(server_slot & slot, const char * when) {
-        if (slot.task->params.da_rm.empty()) {
+    // decoding is active). The removal is a no-op for positions whose KV does
+    // not exist yet, so callers must invoke it once the covered positions are
+    // fully prefilled (or, for the tag path, mid-decode, where the ranges are
+    // mid-range and the covered positions already exist). Ranges are clamped
+    // to the removal boundary `bound`: the next token is placed at `bound`, so
+    // position bound - 1 must stay in the cache for contiguity.
+    void apply_da_rm(server_slot & slot, const std::vector<std::pair<int32_t, int32_t>> & ranges, int32_t bound, const char * when) {
+        if (ranges.empty()) {
             return;
         }
 
         const int32_t n_prompt = slot.task->n_tokens();
-        const int32_t bound    = slot.task->params.da_rm_at >= 0
-                                ? std::min(slot.task->params.da_rm_at, n_prompt)
-                                : n_prompt;
 
         SLT_INF(slot, "da_rm: applying %zu range(s) (%s) - bound=%d, n_prompt=%d\n",
-                slot.task->params.da_rm.size(), when, bound, n_prompt);
+                ranges.size(), when, bound, n_prompt);
 
-        for (const auto & range : slot.task->params.da_rm) {
+        for (const auto & range : ranges) {
             int32_t lo = range.first;
             int32_t hi = range.second;
 
@@ -4099,19 +4138,22 @@ private:
     // Read-reduction logs: INF at the switch (keep ranges, logical read set
     // "N of M"), DBG per decode step (handle_last_sampled_token), INF summary
     // in release().
-    void apply_da_b(server_slot & slot, const char * when) {
-        if (slot.task->params.da_rm.empty()) {
+    //
+    // `ranges` are the removal ranges and `bound` the removal boundary, both
+    // supplied by the caller. The static path passes the client's da_rm ranges
+    // and the da_rm_at/prompt-end boundary (before the first generated token).
+    // The tag path (apply_da_tag) passes the tag-derived ranges and the current
+    // decode position: the keep ranges then also cover the already-generated
+    // tokens [n_prompt, bound), which are shared into the second sequence so
+    // the switch stays position-contiguous.
+    void apply_da_b(server_slot & slot, const std::vector<std::pair<int32_t, int32_t>> & ranges, int32_t bound, const char * when) {
+        if (ranges.empty()) {
             return;
         }
 
-        const int32_t n_prompt = slot.task->n_tokens();
-        const int32_t bound    = slot.task->params.da_rm_at >= 0
-                                ? std::min(slot.task->params.da_rm_at, n_prompt)
-                                : n_prompt;
-
         if (bound <= 0) {
             SLT_WRN(slot, "da_b: removal boundary is empty (bound=%d) - falling back to logical removal (%s)\n", bound, when);
-            apply_da_rm(slot, when);
+            apply_da_rm(slot, ranges, bound, when);
             return;
         }
 
@@ -4122,7 +4164,7 @@ private:
         if (slot.prompt.n_tokens() > bound) {
             SLT_WRN(slot, "da_b: prefilled prompt (%d tokens) exceeds the removal boundary %d - falling back to logical removal (%s)\n",
                     slot.prompt.n_tokens(), bound, when);
-            apply_da_rm(slot, when);
+            apply_da_rm(slot, ranges, bound, when);
             return;
         }
 
@@ -4130,7 +4172,7 @@ private:
         // (one stream for all sequences) supports it via metadata retagging
         if (!llama_kv_unified(ctx_tgt) || (ctx_dft && !llama_kv_unified(ctx_dft))) {
             SLT_WRN(slot, "da_b: requires --kv-unified (partial-range seq_cp across KV streams is unsupported) - falling back to logical removal (%s)\n", when);
-            apply_da_rm(slot, when);
+            apply_da_rm(slot, ranges, bound, when);
             return;
         }
 
@@ -4161,23 +4203,22 @@ private:
         }
         if (da_seq < 0) {
             SLT_WRN(slot, "da_b: no sequence id beyond the slot ids (n_seq_max=%d, n_slots=%d) - falling back to logical removal (%s)\n", n_seq_max, n_slots, when);
-            apply_da_rm(slot, when);
+            apply_da_rm(slot, ranges, bound, when);
             return;
         }
 
-        // build the keep ranges: the complement of the da_rm ranges in
+        // build the keep ranges: the complement of the removal ranges in
         // [0, bound). The clamping mirrors apply_da_rm: a range reaching the
         // boundary is cut at bound - 1 so the last position of the prefilled
         // prefix stays in the new sequence (position contiguity for the
         // continuation).
         //
-        // The da_rm ranges are user-supplied and may be unsorted or
-        // overlapping (e.g. [[100,120],[10,20]]). Clamping, sorting by lo and
-        // merging overlaps BEFORE taking the complement - a forward-only sweep
-        // over the raw ranges would let an out-of-order range corrupt the keep
-        // set.
+        // The removal ranges may be unsorted or overlapping (e.g.
+        // [[100,120],[10,20]]). Clamping, sorting by lo and merging overlaps
+        // BEFORE taking the complement - a forward-only sweep over the raw
+        // ranges would let an out-of-order range corrupt the keep set.
         std::vector<std::pair<int32_t, int32_t>> rm;
-        for (const auto & range : slot.task->params.da_rm) {
+        for (const auto & range : ranges) {
             int32_t lo = range.first;
             int32_t hi = range.second;
 
@@ -4227,7 +4268,7 @@ private:
         const size_t n_remove = (size_t) bound - n_keep;
 
         if (n_remove == 0) {
-            SLT_WRN(slot, "da_b: da_rm ranges cover nothing in [0, %d) after clamping - nothing to remove, staying on seq %d (%s)\n", bound, slot.id, when);
+            SLT_WRN(slot, "da_b: removal ranges cover nothing in [0, %d) after clamping - nothing to remove, staying on seq %d (%s)\n", bound, slot.id, when);
             return;
         }
 
@@ -4247,6 +4288,98 @@ private:
             SLT_INF(slot, "da_b:   keep [%d, %d) %zu token(s)\n", r.first, r.second, (size_t) (r.second - r.first));
         }
         SLT_INF(slot, "da_b: original seq %d untouched (%d token(s)) - rollback/reference\n", slot.id, bound);
+    }
+
+    // Scan the accumulated generated text for the first complete
+    // <focus ... magic_chunks="N" ...> tag. Returns the chunk numbers encoded
+    // in the tag's magic_chunks attribute (all digit runs), or empty while no
+    // complete tag exists yet. Ported from da-probe/da_probe_dynamic.cpp
+    // (scan_magic_tag): generation is short and the scan stops as soon as the
+    // tag is applied, so a full re-scan per token is fine.
+    static std::vector<int32_t> scan_da_magic_tag(const std::string & text) {
+        for (size_t p = 0; (p = text.find("<focus", p)) != std::string::npos; ) {
+            const size_t close = text.find('>', p);
+            if (close == std::string::npos) {
+                return {};  // tag not closed yet
+            }
+            const std::string tag = text.substr(p, close - p + 1);
+            const size_t q0 = tag.find("magic_chunks");
+            if (q0 != std::string::npos) {
+                std::vector<int32_t> nums;
+                for (size_t q = q0 + std::strlen("magic_chunks"); q < tag.size(); q++) {
+                    if (std::isdigit((unsigned char) tag[q])) {
+                        int v = 0;
+                        while (q < tag.size() && std::isdigit((unsigned char) tag[q])) {
+                            v = v * 10 + (tag[q] - '0');
+                            q++;
+                        }
+                        nums.push_back(v);
+                    }
+                }
+                if (!nums.empty()) {
+                    return nums;  // first complete tag wins
+                }
+            }
+            p = close + 1;  // this tag had no magic_chunks: keep looking
+        }
+        return {};
+    }
+
+    // Declarative Attention tag parser: when the client supplies the chunk
+    // layout (da_chunks), scan the slot's accumulated generated text for the
+    // model's own <focus ... magic_chunks="N" ...> tag. On the first complete
+    // tag, compute the removal ranges - every chunk except the kept one, plus
+    // the filler - and apply them exactly once, mid-decode, via apply_da_b
+    // (da_b mode) or apply_da_rm. The model's tag, not a client-supplied da_rm
+    // range, drives the attention restriction.
+    //
+    // Called from process_token() after each generated token is appended to
+    // slot.generated_text; it no-ops until the tag closes and after it is
+    // applied. The removal boundary is the current decode position, so the B
+    // switch (or the A removal) stays position-contiguous for the next token.
+    void apply_da_tag(server_slot & slot) {
+        if (slot.da_tag_applied || slot.task->params.da_chunks.empty()) {
+            return;
+        }
+
+        const std::vector<int32_t> keep_nums = scan_da_magic_tag(slot.generated_text);
+        if (keep_nums.empty()) {
+            return;  // no complete tag yet
+        }
+
+        // consume the tag exactly once, even if the keep number is invalid
+        slot.da_tag_applied = true;
+
+        const auto & chunks = slot.task->params.da_chunks;
+        const int32_t keep = keep_nums[0];
+        if (keep < 1 || keep > (int32_t) chunks.size()) {
+            SLT_WRN(slot, "da_tag: magic_chunks=\"%d\" is out of range (1..%zu) - no removal applied\n",
+                    keep, chunks.size());
+            return;
+        }
+
+        // removal = every chunk except the kept one, plus the filler
+        std::vector<std::pair<int32_t, int32_t>> ranges;
+        for (size_t n = 0; n < chunks.size(); n++) {
+            if ((int32_t) (n + 1) == keep) {
+                continue;
+            }
+            ranges.push_back(chunks[n]);
+        }
+        if (slot.task->params.da_filler.first >= 0) {
+            ranges.push_back(slot.task->params.da_filler);
+        }
+
+        const int32_t bound = (int32_t) slot.prompt.n_tokens();
+
+        SLT_INF(slot, "da_tag: <focus magic_chunks=\"%d\"> closed at generated token %d - removing %zu range(s), bound=%d\n",
+                keep, (int) slot.stats.n_gen, ranges.size(), bound);
+
+        if (slot.task->params.da_b) {
+            apply_da_b(slot, ranges, bound, "at tag close");
+        } else {
+            apply_da_rm(slot, ranges, bound, "at tag close");
+        }
     }
 
     void post_decode(int32_t n_batch_tokens, int32_t off, llama_batch & batch_view) {
@@ -4318,17 +4451,20 @@ private:
                                 n_text, n_total - n_text);
                     }
                     if (slot.task->params.da_b) {
-                        apply_da_b(slot, "after prefill");
+                        apply_da_b(slot, slot.task->params.da_rm, da_static_bound(slot), "after prefill");
                     } else {
-                        apply_da_rm(slot, "after prefill");
+                        apply_da_rm(slot, slot.task->params.da_rm, da_static_bound(slot), "after prefill");
                     }
                     slot.da_rm_pending = false;
                 }
 
                 // speculative decoding drafts on the slot's own sequence; a
                 // 2-stream (B) slot decodes on its second sequence, so spec is
-                // disabled there (draft tokens would land on the wrong seq)
-                if (slot.can_speculate() && slot.da_seq < 0) {
+                // disabled there (draft tokens would land on the wrong seq).
+                // da_b is checked (not just da_seq): in tag mode (da_chunks)
+                // the B switch happens mid-decode, so da_seq is still -1 here
+                // and spec must not start before the tag is parsed.
+                if (slot.can_speculate() && slot.da_seq < 0 && !slot.task->params.da_b) {
                     common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
                 }
             } else if (slot.state != SLOT_STATE_GENERATING) {

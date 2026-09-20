@@ -81,6 +81,20 @@ struct task_params {
     // speculative decoding is disabled for the slot.
     bool da_b = false;
 
+    // Declarative Attention tag parser: the client-side chunk layout as
+    // explicit prompt token ranges, one per chunk (da_chunks[N-1] = [lo, hi)
+    // of chunk N, 1-based). When non-empty, the server scans the model's own
+    // generated text for the first complete <focus ... magic_chunks="N" ...>
+    // tag and, at tag close, removes every chunk except N plus da_filler -
+    // the model's tag (not a client-supplied da_rm range) drives the
+    // attention restriction. Applied exactly once, mid-decode, via apply_da_b
+    // (when da_b is set) or apply_da_rm. Supersedes da_rm: when da_chunks is
+    // set the static da_rm removals are not applied.
+    std::vector<std::pair<int32_t, int32_t>> da_chunks;
+    // Filler segment range [lo, hi), removed together with the non-kept
+    // chunks. {-1, -1} when the layout has no filler.
+    std::pair<int32_t, int32_t> da_filler = { -1, -1 };
+
     int64_t t_max_prompt_ms  = -1; // TODO: implement
     int64_t t_max_predict_ms = -1; // if positive, limit the generation phase to this time limit
 

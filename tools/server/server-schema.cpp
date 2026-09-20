@@ -93,6 +93,42 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
     add((new field_bool("da_b", params.da_b))
         ->set_desc("Declarative attention 2-stream mode: instead of removing the da_rm ranges from this slot's sequence (logical removal), copy the keep ranges (complement of da_rm in [0, da_rm_at)) to a fresh sequence via llama_memory_seq_cp and switch the slot's decode to it. The original sequence is left intact. Requires the server to run with --kv-unified; speculative decoding is disabled for the request"));
 
+    add((new field_json("da_chunks"))
+        ->set_desc("Declarative attention tag parser: array of [start, end) prompt token ranges, one per chunk (index N-1 = chunk N, 1-based). When set, the server scans the model's own generated text for the first complete <focus ... magic_chunks=\"N\" ...> tag and, at tag close, removes every chunk except N plus da_filler - the model's tag drives the attention restriction instead of a client-supplied da_rm range. Applied exactly once, mid-decode. Supersedes da_rm")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            ctx.params.da_chunks.clear();
+            const auto & da_chunks = data.at("da_chunks");
+            if (!da_chunks.is_array()) {
+                return;
+            }
+            for (const auto & el : da_chunks) {
+                if (!el.is_array() || el.size() != 2) continue;
+                if (!el[0].is_number_integer() || !el[1].is_number_integer()) continue;
+                const int32_t lo = el[0].get<int32_t>();
+                const int32_t hi = el[1].get<int32_t>();
+                if (lo < 0 || hi <= lo) continue;
+                ctx.params.da_chunks.emplace_back(lo, hi);
+            }
+        }));
+
+    add((new field_json("da_filler"))
+        ->set_desc("Declarative attention tag parser: [start, end) prompt token range of the filler segment, removed together with the non-kept chunks (see da_chunks). Omit when the layout has no filler")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            const auto & f = data.at("da_filler");
+            if (!f.is_array() || f.size() != 2) {
+                return;
+            }
+            if (!f[0].is_number_integer() || !f[1].is_number_integer()) {
+                return;
+            }
+            const int32_t lo = f[0].get<int32_t>();
+            const int32_t hi = f[1].get<int32_t>();
+            if (lo < 0 || hi <= lo) {
+                return;
+            }
+            ctx.params.da_filler = { lo, hi };
+        }));
+
     // TODO: implement t_max_prompt_ms
     // add((new field_num("t_max_prompt_ms", params.t_max_prompt_ms))
 
