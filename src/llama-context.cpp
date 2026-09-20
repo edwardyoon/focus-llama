@@ -4632,6 +4632,10 @@ uint32_t llama_n_rs_seq(const llama_context * ctx) {
     return ctx->get_cparams().n_rs_seq;
 }
 
+bool llama_kv_unified(const llama_context * ctx) {
+    return ctx->get_cparams().kv_unified;
+}
+
 const llama_model * llama_get_model(const llama_context * ctx) {
     return &ctx->get_model();
 }
