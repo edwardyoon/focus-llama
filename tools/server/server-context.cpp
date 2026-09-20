@@ -672,7 +672,10 @@ struct server_slot {
 
             // do not keep context of the child slots - the parent's context is enough
             // nor of the stateless slots - no task ever reuses it
-            if (task->is_child() || task->is_stateless() || audio_stream || task->type == SERVER_TASK_TYPE_REALTIME) {
+            // da_rm requests remove KV ranges but leave prompt.tokens intact, so the
+            // kept slot would advertise a prefix whose cache has holes; a reused slot
+            // would read the holed KV. Clear it like a child slot.
+            if (task->is_child() || task->is_stateless() || audio_stream || task->type == SERVER_TASK_TYPE_REALTIME || !task->params.da_rm.empty()) {
                 prompt_clear();
             }
 
