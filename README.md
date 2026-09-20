@@ -88,7 +88,7 @@ Numbers below are from the DA paper (zero-shot, vLLM, batched serving), **not** 
 Same as upstream `llama.cpp`:
 
 ```bash
-git clone https://github.com/<your-account>/focus-llama.git
+git clone https://github.com/edwardyoon/focus-llama.git
 cd focus-llama
 cmake -B build -DGGML_CUDA=ON     # or omit for CPU, or use Metal on macOS
 cmake --build build --config Release -j
