@@ -49,13 +49,13 @@ Core checks:
   3. answers     : baseline / bkeep / bkeep2 exactly ZEBRA-42; bnofact /
                    logical clean (pure attn) or informational (hybrid).
 
-Phase 2 — cache integrity (--parallel 2, LRU slot selection is deterministic
-for these prompts): C1 (P1, cache_prompt=true) lands on slot 0 and keeps its
-prompt cache; C2 (ZEBRA + da_b) lands on slot 1 and switches to the reserved
-da_seq; C3 (P1 again, cache_prompt=true) must hit slot 0's cache UNTOUCHED by
-C2's B switch (journal: 'cache reuse: n_past = <full>' on slot 0). The old
-bug let a B slot take an idle slot's id as da_seq, whose prompt_clear() then
-destroyed the cached prompt.
+Phase 2 — cache integrity (--parallel 2): C1 (P1, cache_prompt=true) lands
+on one idle slot (S1) and keeps its prompt cache; C2 (ZEBRA + da_b) lands on
+the other slot (S2) and switches to the reserved da_seq; C3 (P1 again,
+cache_prompt=true) must land back on S1 and hit the cache UNTOUCHED by C2's
+B switch (journal: 'cache reuse: n_past = <full>' on S1). The old bug let a
+B slot take an idle slot's id as da_seq, whose prompt_clear() then destroyed
+the cached prompt.
 
 After the run, the journal chain for a B request is:
   request start (da_b=1) -> batch fill stopped at boundary
@@ -102,9 +102,12 @@ FACT_END = "red letters."
 QUESTION_START = "Question: What is the"
 THINK_END = "\n</think>\n"
 
-# Phase 2 (cache integrity): a short prompt unrelated to the ZEBRA prompt, so
-# LRU slot selection is deterministic: C1 -> slot 0 (first free), C2 -> slot 1
-# (least recently used), C3 -> slot 0 (cache hit, least recently used).
+# Phase 2 (cache integrity): a short prompt unrelated to the ZEBRA prompt.
+# LRU slot selection: C1 lands on one idle slot (S1) and keeps its prompt
+# cache; C2 (ZEBRA + da_b) lands on the OTHER slot (S2) and switches to the
+# reserved da_seq; C3 (P1 again) lands back on S1 and must hit the cache
+# UNTOUCHED by C2's B switch. Which physical slot is S1/S2 depends on the
+# LRU tie-break; the check is slot-independent (C3 == C1).
 P1 = ("The capital of France is Paris. It is famous for the Eiffel Tower. "
       "What is the capital of France? Reply with the city name only.\n")
 P1_ANSWER = "Paris"
@@ -372,9 +375,9 @@ def main():
             t1 = strip_thinking(c1["choices"][0]["text"]).strip()
             t2 = strip_thinking(c2["choices"][0]["text"]).strip()
             t3 = strip_thinking(c3["choices"][0]["text"]).strip()
-            print("C1 (P1, cache)   : %r" % t1)
-            print("C2 (ZEBRA da_b)  : %r  (runs on slot 1, switches to da_seq)" % t2)
-            print("C3 (P1, cache)   : %r  (must equal C1 — slot 0 cache intact)" % t3)
+            print("C1 (P1, cache)   : %r  (slot S1 keeps the P1 cache)" % t1)
+            print("C2 (ZEBRA da_b)  : %r  (slot S2, switches to the reserved da_seq)" % t2)
+            print("C3 (P1, cache)   : %r  (must equal C1 — S1's cache intact)" % t3)
             print("          C1 prompt_tokens=%s  C3 prompt_tokens=%s"
                   % (c1["usage"]["prompt_tokens"], c3["usage"]["prompt_tokens"]))
             ok1 = (t1 == P1_ANSWER)
@@ -382,7 +385,7 @@ def main():
             checks.append(ok1)
             checks.append(ok3)
             print("C1 answer        : %s (exact %r)" % ("PASS" if ok1 else "FAIL", P1_ANSWER))
-            print("C3 == C1         : %s (journal: 'cache reuse: n_past = %d' on slot 0 "
+            print("C3 == C1         : %s (journal: 'cache reuse: n_past = %d' on S1 "
                   "means the full cache survived C2's B switch)"
                   % ("PASS" if ok3 else "FAIL", c1["usage"]["prompt_tokens"]))
         else:
@@ -395,7 +398,7 @@ def main():
     print("journal checks (must match):")
     print("  grep 'da_b: switched decode to seq'            -> 1 line per B run (bkeep, bnofact, bkeep2, C2)")
     print("  grep 'falling back to logical removal'         -> EMPTY")
-    print("  grep 'cache reuse: n_past'                     -> C3's full prompt length on slot 0")
+    print("  grep 'cache reuse: n_past'                     -> C3's full prompt length (on S1)")
     print("  per-step 'logical read set' lines with -v; final 'finished on seq' summary always.")
     sys.exit(0 if ok else 1)
 
