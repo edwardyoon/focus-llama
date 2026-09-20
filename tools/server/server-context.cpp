@@ -555,7 +555,10 @@ struct server_slot {
             state = SLOT_STATE_IDLE;
 
             // do not keep context of the child slots - the parent's context is enough
-            if (task->is_child()) {
+            // da_rm requests remove KV ranges but leave prompt.tokens intact, so the
+            // kept slot would advertise a prefix whose cache has holes; a reused slot
+            // would read the holed KV. Clear it like a child slot.
+            if (task->is_child() || !task->params.da_rm.empty()) {
                 prompt_clear();
             }
 
