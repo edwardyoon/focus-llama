@@ -3185,6 +3185,22 @@ private:
                         SLT_TRC(slot, "new prompt, n_ctx_slot = %d, n_keep = %d, task.n_tokens = %d\n",
                                 slot.n_ctx, slot.task->params.n_keep, slot.task->n_tokens());
 
+                        // da_rm diagnostics: full input state at request start, so the
+                        // journal shows whether the fields arrived and whether the
+                        // mid-prefill gate can run. Note: has_mtmd is true for
+                        // text-only prompts too when the server has an mmproj loaded
+                        // (mctx != nullptr), so n_media distinguishes real media.
+                        if (slot.da_rm_pending || slot.task->params.da_rm_at >= 0) {
+                            const size_t n_total = slot.task->tokens.size();
+                            const size_t n_text  = slot.task->tokens.get_text_tokens().size();
+                            SLT_INF(slot, "da_rm: request start - %zu range(s), da_rm_at=%d, n_tokens=%zu, has_mtmd=%d, n_text=%zu, n_media=%zu\n",
+                                    slot.task->params.da_rm.size(), slot.task->params.da_rm_at,
+                                    n_total, (int) slot.task->tokens.has_mtmd, n_text, n_total - n_text);
+                            for (const auto & range : slot.task->params.da_rm) {
+                                SLT_INF(slot, "da_rm:   range [%d, %d)\n", range.first, range.second);
+                            }
+                        }
+
                         // print prompt tokens (for debugging)
                         /*if (1) {
                             // first 16 tokens (avoid flooding logs)
@@ -3551,8 +3567,14 @@ private:
                             slot.da_rm_pending = false;
                         } else if (!slot.da_rm_gate_diag_done) {
                             slot.da_rm_gate_diag_done = true;
-                            SLT_INF(slot, "da_rm: mid-prefill boundary reached but skipped (has_mtmd) - da_rm_at=%d has_mtmd=%d n_tokens=%d; applying after prefill instead\n",
-                                    slot.task->params.da_rm_at, (int) slot.task->tokens.has_mtmd, (int) slot.prompt.n_tokens());
+                            const size_t n_total = slot.task->tokens.size();
+                            const size_t n_text  = slot.task->tokens.get_text_tokens().size();
+                            SLT_INF(slot, "da_rm: mid-prefill boundary reached but skipped (has_mtmd) - da_rm_at=%d has_mtmd=%d n_tokens=%d n_text=%zu n_media=%zu; applying after prefill instead%s\n",
+                                    slot.task->params.da_rm_at, (int) slot.task->tokens.has_mtmd, (int) slot.prompt.n_tokens(),
+                                    n_text, n_total - n_text,
+                                    n_total == n_text
+                                        ? " (n_media=0: text-only prompt with mmproj loaded - mid-prefill is safe, relax the gate to a media-presence check)"
+                                        : "");
                         }
                     }
 
@@ -3636,6 +3658,11 @@ private:
                         if (slot.da_rm_pending && slot.task->params.da_rm_at >= 0 &&
                                 !slot.task->tokens.has_mtmd &&
                                 slot.prompt.n_tokens() >= slot.task->params.da_rm_at) {
+                            // fires at most once: da_rm_pending is cleared when the
+                            // gate applies the removals in the next prefill round
+                            SLT_INF(slot, "da_rm: batch fill stopped at boundary - n_tokens=%d, da_rm_at=%d, %d token(s) left to prefill after removal\n",
+                                    (int) slot.prompt.n_tokens(), slot.task->params.da_rm_at,
+                                    (int) (slot.task->n_tokens() - slot.prompt.n_tokens()));
                             break;
                         }
 
@@ -3890,6 +3917,9 @@ private:
                                 ? std::min(slot.task->params.da_rm_at, n_prompt)
                                 : n_prompt;
 
+        SLT_INF(slot, "da_rm: applying %zu range(s) (%s) - bound=%d, n_prompt=%d\n",
+                slot.task->params.da_rm.size(), when, bound, n_prompt);
+
         for (const auto & range : slot.task->params.da_rm) {
             int32_t lo = range.first;
             int32_t hi = range.second;
@@ -3994,8 +4024,11 @@ private:
                 // decode steps see the reduced KV.
                 if (slot.da_rm_pending) {
                     if (slot.task->params.da_rm_at >= 0) {
-                        SLT_INF(slot, "da_rm: mid-prefill boundary never applied (da_rm_at=%d has_mtmd=%d n_tokens=%d) - applying after prefill\n",
-                                slot.task->params.da_rm_at, (int) slot.task->tokens.has_mtmd, (int) slot.prompt.n_tokens());
+                        const size_t n_total = slot.task->tokens.size();
+                        const size_t n_text  = slot.task->tokens.get_text_tokens().size();
+                        SLT_INF(slot, "da_rm: mid-prefill boundary never applied (da_rm_at=%d has_mtmd=%d n_tokens=%d n_text=%zu n_media=%zu) - applying after prefill\n",
+                                slot.task->params.da_rm_at, (int) slot.task->tokens.has_mtmd, (int) slot.prompt.n_tokens(),
+                                n_text, n_total - n_text);
                     }
                     apply_da_rm(slot, "after prefill");
                     slot.da_rm_pending = false;
