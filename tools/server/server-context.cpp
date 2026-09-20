@@ -335,7 +335,7 @@ struct server_slot {
     }
 
     void prompt_clear() {
-        SLT_TRC(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
+        SLT_INF(*this, "clearing prompt with %zu tokens (seq %d)\n", prompt.tokens.size(), id);
 
         mem.seq_rm(id, -1, -1);
 
@@ -559,6 +559,10 @@ struct server_slot {
             // kept slot would advertise a prefix whose cache has holes; a reused slot
             // would read the holed KV. Clear it like a child slot.
             if (task->is_child() || !task->params.da_rm.empty()) {
+                if (!task->params.da_rm.empty()) {
+                    SLT_INF(*this, "clearing slot after da_rm request: %zu prompt tokens, %zu range(s)\n",
+                            prompt.tokens.size(), task->params.da_rm.size());
+                }
                 prompt_clear();
             }
 
@@ -3253,6 +3257,10 @@ private:
                                     n_past = std::min(n_past, slot.alora_invocation_start - 1);
                                 }
 
+                                if (n_past > 0) {
+                                    SLT_INF(slot, "cache reuse: n_past = %d\n", n_past);
+                                }
+
                                 const auto n_cache_reuse = slot.task->params.n_cache_reuse;
 
                                 const bool can_cache_reuse =
@@ -3910,7 +3918,7 @@ private:
                     ok = llama_memory_seq_rm(mem_dft, slot.id, lo, hi) && ok;
                 }
             }
-            SLT_DBG(slot, "da_rm: [%d, %d) %s (%s)\n", lo, hi, ok ? "removed" : "rejected", when);
+            SLT_INF(slot, "da_rm: [%d, %d) %s (%s)\n", lo, hi, ok ? "removed" : "rejected", when);
         }
     }
 
