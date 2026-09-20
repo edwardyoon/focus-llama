@@ -249,8 +249,10 @@ The two fit together because FocusMemory **assembles the prompt from its own chu
 Early work in progress.
 
 - **Works:** `llama-server` accepts `da_rm` / `da_rm_at` to drop KV token ranges either mid-prefill or after prefill. Checked via first-token logprobs on a small smoke test.
+- **Works:** backend B (`da_b`) - the kept ranges are copied to a reserved second sequence and decoded there, with the original sequence intact (section 2).
 - **Works:** the server parses `<focus magic_chunks="N">` from the generated stream and removes the non-kept chunks at the tag close (`da_chunks`, section 3). The tag must be emitted by the model - on small thinking models without a chat template this may need the empty thinking-block priming from the smoke test.
-- **Probe only:** the standalone `da-probe/` probe binaries (multi-stream, per-step instrumentation) - a development aid, not a server feature.
+- **Development aids only:** the standalone `da-probe/` probe binaries (multi-stream, per-step instrumentation) are not server features - the server mechanisms above are complete and smoke-tested.
+- **Open:** the return to global attention without re-prefill; attaching the chunk layout to real requests (the FocusMemory backend wiring); measured speed-ups.
 - **Hybrid models** (e.g. Gated DeltaNet): only the attention layers are affected, as in the paper.
 - **Evidence so far is small:** one-prompt smoke tests and a 5-prompt tag-adherence check. For the paper's numbers and caveats, see arXiv:2609.02737.
 
