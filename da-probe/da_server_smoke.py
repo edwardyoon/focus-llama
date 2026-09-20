@@ -11,8 +11,8 @@ Usage:
               informational. The mechanism proof is the masked-all run.
 
 Runs 5 completions against BASE/v1/completions. All requests use
-stop=["\n"] and max_tokens=32, and the verdict is EXACT match, so a run
-that re-recites the document (or starts thinking) cannot pass by merely
+stop=["\n"], max_tokens=24 and n_probs=5, and the verdict is EXACT match, so a
+run that re-recites the document (or starts thinking) cannot pass by merely
 containing ZEBRA-42 somewhere in the text:
   a. baseline   - no da_rm                          -> expect exactly ZEBRA-42
   b. strict     - da_rm=fact range, da_rm_at=Q      -> clean (pure attn) / informational (hybrid)
@@ -24,7 +24,12 @@ Leak classification for removal runs (b/d):
   clean         - not the full answer and does not start with 'Z'
   PARTIAL-LEAK  - starts with 'Z' but is not the full answer: the first
                   token was sampled from pre-removal prefill logits (the
-                  post-prefill path ran) or from surviving state
+                  post-prefill path ran) or from surviving state. On a
+                  hybrid, once the mid-prefill path is confirmed working
+                  (path divergence PASS), a 'Z' start can only be
+                  surviving/recurrent-state leak - whether it really is the
+                  recurrent state is a separate observation, confirmed by
+                  the codeword-swap control (da_probe QUOKKA-17).
   FULL-LEAK     - exactly ZEBRA-42
 
 Why masked-all is the mechanism proof: on a hybrid the strict run leaks
@@ -39,9 +44,17 @@ verbosity) — a second piece of evidence.
 
 No server restart is required — provided the running binary was built from a
 commit that includes the da_rm field. Check first (macOS: the code lives in
-libllama.dylib, not the thin server binary):
-  strings build/bin/libllama.dylib | grep -m1 da_rm
+libllama-server-impl.dylib, not the thin server binary):
+  strings build/bin/libllama-server-impl.dylib | grep -m1 da_rm
 (run_probe.sh only rebuilds da_probe, not llama-server).
+
+After the run, grep the server journal for the da_rm diagnostic chain:
+  request start -> batch fill stopped at boundary -> applying (at da_rm_at)
+  or: request start -> boundary reached but skipped (has_mtmd) ->
+      mid-prefill boundary never applied -> applying (after prefill)
+n_text == n_tokens (n_media=0) with has_mtmd=1 means the server has an
+mmproj loaded and the text-only prompt is mis-gated — restart without
+--mmproj, or relax the gate to a media-presence check.
 
 Note: chat_template_kwargs (e.g. enable_thinking:false) only applies to
 /v1/chat/completions, not to /v1/completions. Thinking is neutralized
@@ -259,20 +272,26 @@ def main():
 
     # path divergence fingerprint: strict (da_rm_at=Q) and paper (no boundary)
     # sample the first token from different computations iff the mid-prefill
-    # path ran for strict; identical logprobs mean both took the same path
+    # path ran for strict; identical logprobs mean both took the same path.
+    # Applies whenever both runs executed, regardless of the --runs subset;
+    # missing logprobs fail instead of slipping through as "n/a".
     if "strict" in lps and "paper" in lps:
         s_tok, s_lp, _ = lps["strict"]
         p_tok, p_lp, _ = lps["paper"]
-        if s_lp is not None and p_lp is not None:
+        if s_lp is None or p_lp is None:
+            checks.append(False)
+            print("path divergence  : FAIL (no logprobs: strict=%s paper=%s) - the prefill "
+                  "path cannot be proven. Check that the first_token=... lines printed "
+                  "above; if this server does not return n_probs on /v1/completions, "
+                  "switch to native /completion with completion_probabilities"
+                  % (s_lp is not None, p_lp is not None))
+        else:
             d = round(abs(s_lp - p_lp), 6)
             same = d < 1e-6
-            if L_MASKED in results:
-                checks.append(not same)
+            checks.append(not same)
             print("path divergence  : strict vs paper first-token Δlp=%s — %s"
                   % (d, "IDENTICAL, same prefill path (mid-prefill did not run)"
                      if same else "different prefill paths"))
-        else:
-            print("path divergence  : n/a (no logprobs in response)")
 
     ok = machine_ok and all(checks) if checks else machine_ok
     print("OVERALL          : %s" % ("PASS" if ok else "FAIL"))
