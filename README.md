@@ -112,6 +112,35 @@ paper run is informational on both architectures (decode-time restriction).
 also check the server terminal for a WARN 'clamping end' line from the masked-all run.
 ```
 
+### Two-stream backend B smoke test (`da-probe/da_b_smoke.py`)
+
+Backend B copies the kept prefix (scaffold + focus) to a reserved second stream and decodes there; the original stream is preserved, so a return to global attention needs no re-prefill. The server **must** be started with `--kv-unified --parallel 2` (a partial-range `seq_cp` aborts on a non-unified pool, and B needs one extra reserved sequence id). Without those flags the server falls back to logical removal (`da_rm`) with a WARN — the smoke answers would still pass, so the journal is the real evidence.
+
+```bash
+$ ./build/bin/llama-server -m <model>.gguf --kv-unified --parallel 2 -v
+$ python3 ~/focus-llama/da-probe/da_b_smoke.py http://127.0.0.1:8080 [--hybrid] [--runs k1,k2,...] [--skip-cache]
+```
+
+- `--hybrid` — model has recurrent/linear-attention layers (e.g. Qwen3-Next): the fact-removed runs' TEXT is informational (the fact can survive via the recurrent state); the logprob checks are architecture-independent.
+- `--runs` — run a subset of phase-1 keys: `baseline,bkeep,bnofact,logical,bkeep2`.
+- `--skip-cache` — skip phase 2 (cache integrity; needs `--parallel 2`).
+
+Phase 1 (one ZEBRA prompt, `cache_prompt=false`) checks:
+
+1. **mechanism** — `baseline` vs `bkeep` first-token logprobs diverge: the question was prefilled against the copied KV, so identical logprobs mean the B switch did not run (old binary, missing flags, or fallback).
+2. **B vs A equal** — `bnofact` (B) and `logical` (A, `seq_rm`) apply the same removal by different means; the attended token sets are identical, so the first-token logprobs must agree within 5e-3 (observed 0.0003 on local Bonsai-8B). A large delta means B's keep-set computation is wrong.
+3. **answers** — `baseline`/`bkeep`/`bkeep2` exactly `ZEBRA-42` (the fact must be readable from the copied ranges); `bkeep2` (a consecutive `da_b`) proves the reserved id is reusable after the previous B slot released.
+
+Phase 2 (cache integrity, `--parallel 2`): C1 caches P1 on slot S1, C2 (ZEBRA + `da_b`) runs on S2, C3 (P1 again) must land back on S1 with its cache untouched — `C3 == C1` proves a B switch does not destroy another slot's prompt cache.
+
+**Reading the read-reduction log** — the server logs the logical read set for every B request. In the terminal, or via journal on the service node:
+
+```bash
+$ grep 'da_b:' <server log>        # or: journalctl -u llama-server | grep 'da_b:'
+```
+
+Per B request: `da_b: switched decode to seq N (at da_rm_at) - logical read set now X of Y prefix token(s) (Z removed, -P%)`, one `da_b:   keep [lo, hi) n token(s)` line per kept range, per-step `da_b: decode #p: logical read set X of Y ...` lines (with `-v`), and a final `da_b: finished on seq N - final logical read set ...` summary. These are logical (attended) counts; the physical KV load is reduced too (the FA kernels skip fully-masked chunks) but is chunk-quantized and not logged as a byte count. Also verify `grep 'falling back to logical removal'` is empty.
+
 ## Relationship to FocusMemory
 
 [FocusMemory](https://github.com/edwardyoon/FocusMemory) chunks and indexes long-term context. `focus-llama` is the inference-side counterpart: it lets the model read a compact index in `global` mode and then commit attention to specific chunks. The two are independent and can be used separately.
