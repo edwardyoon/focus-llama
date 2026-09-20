@@ -298,8 +298,15 @@ struct server_slot {
     bool da_rm_pending = false;
 
     // one-shot diagnostic emitted when the da_rm_at boundary is crossed
-    // without applying the removals (e.g. has_mtmd)
+    // without applying the removals (e.g. media present)
     bool da_rm_gate_diag_done = false;
+
+    // true when the prompt contains no media chunks (text tokens == all
+    // tokens). has_mtmd is true whenever an mmproj is loaded, even for
+    // text-only prompts, so the mid-prefill guards test this instead.
+    // Computed once at request start: get_text_tokens() is O(n) and the
+    // batch-fill loop runs per token.
+    bool da_rm_text_only = false;
 
     server_prompt prompt;
 
@@ -3193,6 +3200,7 @@ private:
                         if (slot.da_rm_pending || slot.task->params.da_rm_at >= 0) {
                             const size_t n_total = slot.task->tokens.size();
                             const size_t n_text  = slot.task->tokens.get_text_tokens().size();
+                            slot.da_rm_text_only = (n_text == n_total);
                             SLT_INF(slot, "da_rm: request start - %zu range(s), da_rm_at=%d, n_tokens=%zu, has_mtmd=%d, n_text=%zu, n_media=%zu\n",
                                     slot.task->params.da_rm.size(), slot.task->params.da_rm_at,
                                     n_total, (int) slot.task->tokens.has_mtmd, n_text, n_total - n_text);
@@ -3558,23 +3566,24 @@ private:
                     // complete at this point (tokens pushed in earlier rounds have
                     // been decoded), so the remaining prompt is prefilled without
                     // the removed ranges. Mid-prefill application is skipped for
-                    // multimodal prompts (the boundary must not fall inside an
-                    // mtmd chunk); those fall through to the post-prefill path.
+                    // prompts that contain media (the boundary must not fall
+                    // inside an mtmd chunk); those fall through to the
+                    // post-prefill path. has_mtmd is not the right test here: it
+                    // is true whenever an mmproj is loaded, even for text-only
+                    // prompts, so the guard uses da_rm_text_only (the prompt has
+                    // no media chunks).
                     if (slot.da_rm_pending && slot.task->params.da_rm_at >= 0 &&
                             slot.prompt.n_tokens() >= slot.task->params.da_rm_at) {
-                        if (!slot.task->tokens.has_mtmd) {
+                        if (slot.da_rm_text_only) {
                             apply_da_rm(slot, "at da_rm_at");
                             slot.da_rm_pending = false;
                         } else if (!slot.da_rm_gate_diag_done) {
                             slot.da_rm_gate_diag_done = true;
                             const size_t n_total = slot.task->tokens.size();
                             const size_t n_text  = slot.task->tokens.get_text_tokens().size();
-                            SLT_INF(slot, "da_rm: mid-prefill boundary reached but skipped (has_mtmd) - da_rm_at=%d has_mtmd=%d n_tokens=%d n_text=%zu n_media=%zu; applying after prefill instead%s\n",
+                            SLT_INF(slot, "da_rm: mid-prefill boundary reached but skipped (media present) - da_rm_at=%d has_mtmd=%d n_tokens=%d n_text=%zu n_media=%zu; applying after prefill instead (the boundary may fall inside an mtmd chunk)\n",
                                     slot.task->params.da_rm_at, (int) slot.task->tokens.has_mtmd, (int) slot.prompt.n_tokens(),
-                                    n_text, n_total - n_text,
-                                    n_total == n_text
-                                        ? " (n_media=0: text-only prompt with mmproj loaded - mid-prefill is safe, relax the gate to a media-presence check)"
-                                        : "");
+                                    n_text, n_total - n_text);
                         }
                     }
 
@@ -3654,9 +3663,13 @@ private:
 
                         // Declarative Attention: stop filling at the removal boundary
                         // so the removals can run before the remaining prompt
-                        // (e.g. the question) is prefilled
+                        // (e.g. the question) is prefilled. Without this break the
+                        // checkpoint offset (4 tokens before the end) would push the
+                        // first batch past da_rm_at and the removal would apply too
+                        // late. da_rm_text_only, not has_mtmd: the latter is true
+                        // for text-only prompts on an mmproj server.
                         if (slot.da_rm_pending && slot.task->params.da_rm_at >= 0 &&
-                                !slot.task->tokens.has_mtmd &&
+                                slot.da_rm_text_only &&
                                 slot.prompt.n_tokens() >= slot.task->params.da_rm_at) {
                             // fires at most once: da_rm_pending is cleared when the
                             // gate applies the removals in the next prefill round
@@ -4018,8 +4031,8 @@ private:
                 slot.state = SLOT_STATE_GENERATING;
 
                 // Declarative Attention: apply the removals that were not applied
-                // mid-prefill (da_rm_at < 0, multimodal prompts, or the boundary
-                // coincides with the end of the prompt). The first generated token
+                // mid-prefill (da_rm_at < 0, prompts containing media, or the
+                // boundary coincides with the end of the prompt). The first generated token
                 // is sampled from the already-computed prompt logits; subsequent
                 // decode steps see the reduced KV.
                 if (slot.da_rm_pending) {
