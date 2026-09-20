@@ -57,7 +57,7 @@ Key points:
 | Backend | Mechanism | Speed-up | Cost |
 |---------|-----------|----------|------|
 | **A. `seq_rm`** | Remove non-focus ranges, restore by re-prefill | None guaranteed (semantic equivalence only) | Re-prefill on every focus → global switch |
-| **B. Two streams** | Stream 0 holds the full context permanently; stream 1 holds the kept (scaffold + focus) chunks + response, copied with `seq_cp` (a cell retag in the unified pool, no data copy) | Logical read-set reduction only - the attended tokens shrink, but the physical KV scan is unchanged (removed cells stay in place, masked with `-inf`); a physical reduction needs the FA kernel to skip masked tiles (C). B's unique value: the original stream is preserved, so a global return needs no re-prefill | ~2x KV metadata (unified pool) |
+| **B. Two streams** | Stream 0 holds the full context permanently; stream 1 holds the kept (scaffold + focus) chunks + response, copied with `seq_cp` (a cell retag in the unified pool, no data copy) | Logical read-set reduction - the attended tokens shrink, and the FA kernels' masked-chunk skipping (Metal 32-cell decode / 64-block prefill, CPU per-position) reduces the physical KV load at chunk granularity. B's unique value: the original stream is preserved, so a global return needs no re-prefill | ~2x KV metadata (unified pool) |
 | **C. Kernel skipping** | Skip fully-masked tiles/blocks in the flash-attention kernels | Potentially in-place, no extra memory | Kernel work per backend (CUDA / Metal) |
 
 Backend A is for validating protocol adherence and accuracy. Backend B is the first candidate for measuring real speed-ups. C is only worth building if B's numbers justify it.

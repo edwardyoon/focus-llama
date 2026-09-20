@@ -380,11 +380,15 @@ def main():
             print("C3 (P1, cache)   : %r  (must equal C1 — S1's cache intact)" % t3)
             print("          C1 prompt_tokens=%s  C3 prompt_tokens=%s"
                   % (c1["usage"]["prompt_tokens"], c3["usage"]["prompt_tokens"]))
-            ok1 = (t1 == P1_ANSWER)
+            # thinking models may prepend a thinking preamble despite the
+            # "reply with the city name only" instruction (stop=["\n"] cuts
+            # the first line), so check containment; the cache-integrity
+            # check itself is C3 == C1
+            ok1 = (P1_ANSWER in t1)
             ok3 = (t3 == t1)
             checks.append(ok1)
             checks.append(ok3)
-            print("C1 answer        : %s (exact %r)" % ("PASS" if ok1 else "FAIL", P1_ANSWER))
+            print("C1 answer        : %s (contains %r)" % ("PASS" if ok1 else "FAIL", P1_ANSWER))
             print("C3 == C1         : %s (journal: 'cache reuse: n_past = %d' on S1 "
                   "means the full cache survived C2's B switch)"
                   % ("PASS" if ok3 else "FAIL", c1["usage"]["prompt_tokens"]))
