@@ -583,9 +583,10 @@ struct server_slot {
 
         // 2-stream (B) read-reduction log: the logical read set (attended
         // tokens) is the kept prefix plus the tokens added after the boundary
-        // ("read 30 of 100"). In the unified KV pool the physical KV scan is
-        // unchanged - the removed cells stay in place, masked with -inf - so
-        // this number is logical, not a measured read count.
+        // ("read 30 of 100"). The FA kernels still scan the full [0, n_kv)
+        // range but skip fully-masked chunks (see apply_da_b), so the
+        // physical KV load shrinks at chunk granularity; this number is the
+        // logical (attended) count, not a measured byte count.
         if (da_seq >= 0) {
             const int32_t n_full = (int32_t) prompt.n_tokens();
             const int32_t n_read = (int32_t) da_keep_count + (n_full - da_bound);
@@ -1172,9 +1173,14 @@ private:
         // sequence metadata, not KV capacity. n_parallel is the sole driver of
         // cparams.n_seq_max (common.cpp), so bump it only around context
         // creation and restore it before the slot loop reads it.
+        //
+        // n_outputs_max must move with it: llama_context::output_reserve sizes
+        // the output buffer for max(n_outputs, n_seq_max) rows and asserts
+        // n_outputs_max >= n_seq_max, so the reserved id needs one more row.
         const int n_da_b_slots = params_base.n_parallel;
         if (params_base.kv_unified) {
             params_base.n_parallel = n_da_b_slots + 1;
+            params_base.n_outputs_max = std::max(params_base.n_outputs_max, n_da_b_slots + 1);
         }
 
         llama_init = common_init_from_params(params_base);
@@ -1210,11 +1216,13 @@ private:
 
                 // the draft context must accept the same da_seq id as the target
                 // context: common_memory::seq_cp operates on both, and a B slot
-                // reserves id n_da_b_slots. (n_outputs_max was already fixed to
-                // the original slot count by common_base_params_to_speculative,
-                // so this only widens the draft context's n_seq_max.)
+                // reserves id n_da_b_slots. common_base_params_to_speculative
+                // fixed n_outputs_max to the original slot count, so widen
+                // n_seq_max AND n_outputs_max together (llama_context::
+                // output_reserve asserts n_outputs_max >= n_seq_max).
                 if (params_base.kv_unified) {
                     params_dft.n_parallel = n_da_b_slots + 1;
+                    params_dft.n_outputs_max = std::max(params_dft.n_outputs_max, n_da_b_slots + 1);
                 }
 
                 // progress callback
@@ -4066,12 +4074,13 @@ private:
     // without a re-prefill (the return function is not implemented yet).
     //
     // Read-reduction semantics: in the unified KV pool, seq_cp only retags
-    // cell metadata - the cells are not moved and the attention scan is not
-    // shortened. The decode's LOGICAL read set (the tokens it attends to)
-    // shrinks to the kept prefix plus the tokens added after the boundary;
-    // the removed cells stay in place, masked with -inf. The physical KV read
-    // volume is unchanged unless the FA kernel skips masked tiles/chunks
-    // (backend C; the CUDA FA skip is inactive for 1-token decode).
+    // cell metadata - the cells are not moved and the attention scan range
+    // [0, n_kv) is not shortened. The decode's LOGICAL read set (the tokens
+    // it attends to) shrinks to the kept prefix plus the tokens added after
+    // the boundary; the removed cells stay in place, masked with -inf. The
+    // physical KV load IS reduced where the FA kernel skips fully-masked
+    // chunks (Metal: 32-cell decode / 64-block prefill, CPU: per-position;
+    // CUDA unverified), so the reduction is real but chunk-quantized.
     //
     // Preconditions (checked here; on violation, fall back to the logical
     // removal apply_da_rm):
