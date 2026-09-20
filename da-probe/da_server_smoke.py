@@ -65,10 +65,7 @@ FACT_END = "red letters."
 OTHER_START = "Tasks are scheduled using"
 OTHER_END = "after five minutes."
 QUESTION_START = "Question: What is the"
-THINK_END = "
-</think>
-
-"
+THINK_END = "\n</think>\n"
 
 
 def post(path, body, timeout=180):
