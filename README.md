@@ -266,11 +266,13 @@ llama-server \
 | `--spec-draft-n-max 4` | Up to 4 draft tokens per step | Enough to overlap decode with drafting, without so many that rejections waste work |
 | `--spec-draft-ngl all` | Puts the whole draft model on the GPU | The draft model is small; keeping it fully on-GPU avoids CPU round-trips that would erase the spec gain |
 
-**Path A on 123.** The 123 launch does **not** set `--kv-unified`, so the server uses **backend A**
-(`seq_rm` holes) for the focus/local restriction - not backend B. Backend A is monotonic: a removal is
-irreversible within the request, and returning to global attention needs a re-prefill. That is the
-intended, validated low-risk configuration on 123. Backend B (two streams, reversible, no re-prefill) is
-only active when `--kv-unified` is also set.
+**Backend A vs B.** The focus/local restriction runs on backend A (`seq_rm` holes, monotonic - a removal
+is irreversible within the request and a return to global attention needs a re-prefill) or backend B
+(two streams, reversible, no re-prefill), selected by `--kv-unified`. Note that `--kv-unified` is
+**implied by `--parallel`**: when `--parallel` is left at its default (auto), the server sets
+`n_parallel=4` **and** `kv_unified=true`, so DA runs on backend B. To run backend A instead, launch with
+an explicit `--parallel` (e.g. `--parallel 1`) and without `--kv-unified`. Confirm which backend a
+request used from the scan log: `da_scan: ... - A path` vs `da_scan: ... - B path`.
 
 **Verifying DA in the journal.** After a chat that carries DA markers, confirm the DA path ran:
 
