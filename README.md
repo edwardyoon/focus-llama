@@ -242,7 +242,27 @@ speed-up. Measuring real speed is still open.
 
 [FocusMemory](https://github.com/edwardyoon/FocusMemory) chunks and indexes long-term context. `focus-llama` is the inference-side counterpart: it lets the model read a compact index in `global` mode and then commit attention to specific chunks.
 
-The two fit together because FocusMemory **assembles the prompt from its own chunks** - so its backend already knows the token range of every chunk it inserted, which is exactly what `da_chunks` asks for (section 3). The integration is a client-side change only: the FocusMemory backend tokenizes the assembled prompt (e.g. via `/tokenize`), maps each chunk to its `[lo, hi)` range (plus the filler, if any), and attaches `da_chunks` / `da_filler` (and `da_b`) to the `/v1/completions` request. From then on the model's own `<focus magic_chunks="N">` tag decides which chunk the next tokens attend to, and the server enforces it. Until that wiring exists, requests from a FocusMemory backend carry no `da_*` fields and run with full attention - the two projects remain independently usable.
+There are two ways to get a chunk layout onto the wire:
+
+1. **Auto-chunking (`--da-auto`, recommended for production).** The server splits the rendered
+   chat prompt itself at message boundaries, so the client sends a **plain**
+   `/v1/chat/completions` request - no markers, no `da_*` fields, no hook. This works with any
+   OpenAI-compatible client (qwen-code, curl, other agents) and needs nothing from FocusMemory
+   beyond a normal chat. **When `--da-auto` is on, the FocusMemory hook does not need to inject
+   `<da:N>` markers at all** - the server builds the layout from the same conversation history the
+   hook would have indexed, and the savings target (whole history + tool output) is larger than a
+   hook-injected index.
+2. **Marker path (`--da-prompt-scan` + client markers).** FocusMemory assembles the prompt from
+   its own chunks and wraps them in `<da:N>` ... `<da:layout:N>` markers (its backend already
+   knows the token range of every chunk it inserted). The server scans the rendered prompt, maps
+   the markers to token ranges, and the model's `<focus magic_chunks="N">` tag decides which chunk
+   the next tokens attend to. Use this when the client can declare a layout finer than message
+   boundaries. Note: some clients (e.g. qwen-code 0.24.2's hook pipeline) HTML-escape injected
+   context, which breaks literal `<da:` markers - that is exactly what `--da-auto` sidesteps.
+
+The two paths coexist (marker layout wins when present; auto takes over otherwise - see
+Production launch). Without either, requests run with full attention - the two projects remain
+independently usable.
 
 ## Production launch (recommended options)
 
@@ -254,6 +274,9 @@ llama-server \
   --parallel 1 \
   --metrics \
   --da-prompt-scan \
+  --da-auto \
+  --da-min-ctx 4096 \
+  --da-chunk-tokens 2048 \
   --spec-type draft-mtp \
   --spec-draft-n-max 4 \
   --spec-draft-ngl all
@@ -264,10 +287,26 @@ llama-server \
 | Option | What it does | Why it is on |
 |--------|--------------|--------------|
 | `--metrics` | Exposes Prometheus metrics on the server port | Observability for a long-running service |
-| `--da-prompt-scan` | **Prompt scanning** (P1): on each request the prompt is scanned for `<da:N>` chunk markers and their token ranges are pre-computed, so DA tags / static `da_rm` ranges resolve to real KV positions | The FocusMemory backend marks the chunks it assembled; scanning maps those markers to positions. A prompt with no markers runs with full attention (fail-open) |
+| `--da-prompt-scan` | **Prompt scanning** (marker path): on each request the prompt is scanned for `<da:N>` chunk markers and their token ranges are pre-computed, so DA tags / static `da_rm` ranges resolve to real KV positions | Lets a client (e.g. the FocusMemory hook) declare the exact chunk layout it assembled. A prompt with no markers runs with full attention (fail-open) |
+| `--da-auto` | **Auto-chunking** (server path): when a request carries no valid marker block and its prompt is at least `--da-min-ctx` tokens, the server splits the rendered chat prompt itself into magic chunks at message boundaries, inserts `[Magic Chunk N]` headers, appends the DA instruction, re-tokenizes, and maps the layout to token ranges. The client needs to send nothing extra | Makes DA work with **any** OpenAI-compatible client (qwen-code, curl, other agents) - no hook, no markers, no `da_*` request fields. The savings target is the whole history/tool output, not just a client-injected index. Verified on 123: 85-93 chunks from 68-74 messages (88K-98K tokens), 0 fail-opens |
+| `--da-min-ctx 4096` | Auto-chunking threshold: prompts shorter than this many tokens run vanilla | Short prompts have little to save; chunking a 2K prompt would only add headers and instruction for no benefit. 4096 matches the node's typical conversation length |
+| `--da-chunk-tokens 2048` | Target size of one magic chunk (tokens) in auto-chunking | The paper's segmenter target (~2K tokens). Long messages are split paragraph → line → sentence until they fit; chunk ids are index-based so they stay stable as history grows |
 | `--spec-type draft-mtp` | **Speculative decoding** with the model's MTP draft head | Speed-up on top of DA. Since P6, spec and DA **coexist**: while a slot is in DA mode (`da_seq` active) spec is paused automatically and resumes on the return to global attention - so spec stays ON without breaking DA |
 | `--spec-draft-n-max 4` | Up to 4 draft tokens per step | Enough to overlap decode with drafting, without so many that rejections waste work |
 | `--spec-draft-ngl all` | Puts the whole draft model on the GPU | The draft model is small; keeping it fully on-GPU avoids CPU round-trips that would erase the spec gain |
+
+**Two layout paths, one priority.** `--da-prompt-scan` (marker path) and `--da-auto` (server path)
+are independent and can both be on. Per request the server first scans for a client-provided marker
+block; if that yields a valid layout it wins, and auto-chunking is skipped for that request. If the
+scan finds nothing (no markers, or malformed markers that fail open), auto-chunking takes over for
+prompts at or above `--da-min-ctx`. So a node can serve both marker-aware clients and plain
+OpenAI-compatible clients with the same launch line.
+
+Both paths fail open to vanilla (full attention) on any mismatch - a wrong layout must never
+restrict attention to the wrong ranges. The auto path tolerates bounded tokenizer drift (up to 1%
+of the text length) when mapping the headers it inserted itself, because large rendered prompts
+(50K+ tokens with repeated content) do not round-trip tokenization exactly; drift beyond that
+still fails open.
 
 **Backend A vs B.** The focus/local restriction runs on backend A (`seq_rm` holes, monotonic - a removal
 is irreversible within the request and a return to global attention needs a re-prefill) or backend B
@@ -280,14 +319,15 @@ request used from the scan log: `da_scan: ... - A path` vs `da_scan: ... - B pat
 **Verifying DA in the journal.** After a chat that carries DA markers, confirm the DA path ran:
 
 ```bash
-journalctl -u qwen3.8-focus --since "10 min ago" | grep -E 'da_scan:|da_tag:'
+journalctl -u qwen3.8-focus --since "10 min ago" | grep -E 'da_scan:|da_auto:|da_tag:'
 ```
 
 - `da_scan:` - the prompt scanner found the `<da:N>` markers and built the chunk-to-range map
+- `da_auto:` - auto-chunking split the prompt (`da_auto: 91 chunk(s) from 72 source message(s), 94826 token(s) - A path`). A `da_auto: layout does not map to token boundaries` WARN means the layout failed open to vanilla
 - `da_tag:` - a `<focus>`/`<local>` tag was parsed and the attention restriction applied
 
-A plain chat (no DA markers) produces no `da_scan:` line and runs with full attention - that is the
-intended fail-open behavior.
+A plain chat (no markers, prompt below `--da-min-ctx`) produces no `da_scan:`/`da_auto:` line and
+runs with full attention - that is the intended fail-open behavior.
 
 **Verifying DA end-to-end with curl.** Send a chat whose user message carries a well-formed marker
 block (the same format the FocusMemory hook injects) and read the `timings` object of the response:
@@ -334,6 +374,8 @@ Early work in progress.
 - **Works:** backend B (`da_b`) - the kept ranges are copied to a reserved second sequence and decoded there, with the original sequence intact (section 2).
 - **Works:** the server parses `<focus magic_chunks="N">` from the generated stream and removes the non-kept chunks at the tag close (`da_chunks`, section 3). The tag must be emitted by the model - on small thinking models without a chat template this may need the empty thinking-block priming from the smoke test.
 - **Works:** prompt scanning (`--da-prompt-scan`) end-to-end with the FocusMemory marker block - verified on the 123 production node (qwen3.8, path A): the model emits the tag, the server applies the removal mid-decode alongside MTP speculation, and the response `timings` report `da_n_restricted_steps` / `da_n_attended_tokens` / `da_path`. Unmarked and malformed prompts fail open to vanilla.
+- **Works:** auto-chunking (`--da-auto`) end-to-end on the 123 production node (qwen3.8, path A) with plain `/v1/chat/completions` traffic - no markers, no `da_*` fields: 85-93 chunks from 68-74 messages (88K-98K tokens), 0 fail-opens across 4 consecutive requests.
+- **Works:** thinking-model structured output - a JSON grammar that rejects the thinking generation prompt no longer 500s: the grammar is rebuilt without the prefill (fail-open) and the response is still grammar-constrained JSON.
 - **Development aids only:** the standalone `da-probe/` probe binaries (multi-stream, per-step instrumentation) are not server features - the server mechanisms above are complete and smoke-tested.
 - **Open:** physical (not just logical) read reduction on CUDA; measured end-to-end speed-ups (the 123 break-even analysis found no speed gain at context lengths up to 64K - see the production notes); the return to global attention on the hybrid model is lossy for the recurrent (GDN) state and needs a dedicated accuracy probe.
 - **Hybrid models** (e.g. Gated DeltaNet): only the attention layers are affected, as in the paper.
