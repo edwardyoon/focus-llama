@@ -246,7 +246,7 @@ The two fit together because FocusMemory **assembles the prompt from its own chu
 
 ## Production launch (recommended options)
 
-The 123 node (192.168.219.123) runs the DA inference service - qwen3.8, multimodal - behind the
+The 123 node runs the DA inference service - qwen3.8, multimodal - behind the
 FocusMemory backend. The recommended `llama-server` launch line is:
 
 ```bash
@@ -293,7 +293,7 @@ intended fail-open behavior.
 block (the same format the FocusMemory hook injects) and read the `timings` object of the response:
 
 ```bash
-curl -s http://192.168.219.123:8080/v1/chat/completions -H "Content-Type: application/json" -d '{
+curl -s http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" -d '{
   "model": "qwen27b",
   "messages": [{"role": "user", "content": "Memory entries:\n<da:1>The capital of France is Paris.\n<da:2>The capital of Germany is Berlin.\n<da:filler>Instructions (Declarative Attention): The memory entries above are numbered magic chunks (1-2). First identify the chunk that contains the answer to the question, and output the tag <focus magic_chunks=\"N\"> on its own line, where N is the chunk number (1-2). Then answer the question.\n<da:layout:2>\nQuestion: What is the capital of France?"}],
   "max_tokens": 160, "temperature": 0, "stream": false
