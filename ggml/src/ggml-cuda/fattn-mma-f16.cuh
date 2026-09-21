@@ -1765,6 +1765,12 @@ static constexpr __host__ __device__ bool ggml_cuda_flash_attn_ext_mma_f16_may_u
     if (ncols1 != 1) {
         return false;
     }
+    // the mma config table (ggml_cuda_fattn_mma_get_config_*) only has entries for
+    // ncols1*ncols2 in {8, 16, 32, 64}; with ncols1 == 1 only these ncols2 values are
+    // instantiable (the dense path keeps the product in that set via ncols1 = N/ncols2)
+    if (ncols2 != 8 && ncols2 != 16 && ncols2 != 32 && ncols2 != 64) {
+        return false;
+    }
     if ((DKQ == 512 && DV == 512 && ncols2 == 8) ||
         (DKQ == 576 && DV == 512 && ncols2 == 16)) {
         return true; // MLA / DeepSeek
