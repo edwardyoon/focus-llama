@@ -21,9 +21,11 @@
 #include <cstddef>
 #include <cinttypes>
 #include <exception>
+#include <functional>
 #include <memory>
 #include <filesystem>
 #include <random>
+#include <regex>
 #include <utility>
 #include <fstream>
 
@@ -236,6 +238,15 @@ struct server_batch {
     }
 };
 
+// DA mode state machine (P3): the attention scope a slot is currently
+// decoding with. GLOBAL = full context; FOCUS = only the kept chunk(s) +
+// scaffold; LOCAL = scaffold + generated only (every chunk excluded).
+// Transitions are driven by the model's own tags (see apply_da_tag):
+//   <focus magic_chunks="N">  GLOBAL/LOCAL -> FOCUS (keep N)
+//   <local>                   GLOBAL/FOCUS -> LOCAL
+//   </focus> / </local>       FOCUS/LOCAL  -> GLOBAL (return)
+enum da_mode_t { DA_MODE_GLOBAL = 0, DA_MODE_FOCUS, DA_MODE_LOCAL };
+
 struct server_slot {
     int id;
 
@@ -320,10 +331,32 @@ struct server_slot {
     // read-reduction logs (per-step DBG, final INF in release()).
     int32_t da_bound = -1;
     size_t  da_keep_count = 0;
-    // DA tag parser: true once the first complete <focus magic_chunks> tag has
-    // been parsed from the generated text and the restriction applied (the
-    // removals run exactly once, mid-decode; see apply_da_tag).
-    bool da_tag_applied = false;
+    // DA mode state machine (P3) - see da_mode_t above.
+    da_mode_t da_mode = DA_MODE_GLOBAL;
+    // chunk indices (0-based, into task->params.da_chunks) currently kept:
+    // B path = present on da_seq, A path = not removed. Only meaningful when
+    // da_mode != DA_MODE_GLOBAL.
+    std::vector<int32_t> da_keep_chunks;
+    // DA tag scanner: char offset in generated_text up to which the text has
+    // already been scanned for complete tags (each tag is consumed exactly
+    // once; a tag may span several generated tokens).
+    size_t da_tag_scan_pos = 0;
+    // P2: true once a DA removal has actually been applied to this slot's KV
+    // (A path: holes cut into the original sequence; B path: switched to
+    // da_seq). Drives the release() cache policy - a tag request that never
+    // emitted a tag keeps its prompt cache like a vanilla request.
+    bool da_applied = false;
+    // P2: true once an A-path removal (seq_rm holes) was actually applied.
+    // B path may fall back to A (apply_da_b preconditions), so the release()
+    // cache policy keys on the path actually taken, not on task params:
+    // A holes are baked into the cached sequence (clear), a B slot that
+    // returned to the original sequence mid-decode keeps its cache.
+    bool da_removed_a = false;
+    // P5 instrumentation (logical attended tokens, not measured bytes):
+    // n_da_removed is the A-path removed-token count (read set = n_full -
+    // n_da_removed). The per-step counters live in stats (server_slot_stats)
+    // so they reach the response timings via stats.to_json().
+    uint32_t n_da_removed = 0;
     llama_seq_id kv_seq() const {
         return da_seq >= 0 ? da_seq : (llama_seq_id) id;
     }
@@ -437,11 +470,16 @@ struct server_slot {
 
         n_predict_max = -1;
 
-        // 2-stream (B) switch is request-scoped
-        da_seq        = -1;
-        da_bound      = -1;
-        da_keep_count = 0;
-        da_tag_applied = false;
+        // 2-stream (B) switch + DA state machine are request-scoped
+        da_seq           = -1;
+        da_bound         = -1;
+        da_keep_count    = 0;
+        da_mode          = DA_MODE_GLOBAL;
+        da_keep_chunks.clear();
+        da_tag_scan_pos  = 0;
+        da_applied       = false;
+        da_removed_a     = false;
+        n_da_removed     = 0;
 
         llama_set_sampler(ctx_tgt, id, nullptr);
 
@@ -595,8 +633,19 @@ struct server_slot {
         if (da_seq >= 0) {
             const int32_t n_full = (int32_t) prompt.n_tokens();
             const int32_t n_read = (int32_t) da_keep_count + (n_full - da_bound);
+            stats.n_da_restricted_steps += 1;
+            stats.n_da_attended_tokens  += (uint64_t) n_read;
+            stats.da_removed_a          = false;
             SLT_DBG(*this, "da_b: decode #%d: logical read set %d of %d token(s) on seq %d (%zu kept + %d after boundary %d; seq %d holds all %d)\n",
                     n_full - 1, n_read, n_full, da_seq, da_keep_count, n_full - da_bound, da_bound, id, n_full);
+        } else if (da_applied && n_da_removed > 0) {
+            // A path: the holes stay in the original sequence; the logical
+            // read set is the full length minus the removed tokens
+            const int32_t n_full = (int32_t) prompt.n_tokens();
+            const int32_t n_read = std::max(0, n_full - (int32_t) n_da_removed);
+            stats.n_da_restricted_steps += 1;
+            stats.n_da_attended_tokens  += (uint64_t) n_read;
+            stats.da_removed_a          = true;
         }
     }
 
@@ -615,21 +664,60 @@ struct server_slot {
                         da_seq, n_read, n_full, da_keep_count, n_full - da_bound, da_bound, id);
             }
 
+            // P5: DA instrumentation summary (logical attended tokens, not
+            // measured bytes) - also exposed in the response timings
+            if (stats.n_da_restricted_steps > 0) {
+                const uint64_t n_full = prompt.n_tokens();
+                const uint64_t n_full_steps = n_full * stats.n_da_restricted_steps;
+                const double reduction = n_full_steps > 0
+                        ? 100.0 * (1.0 - (double) stats.n_da_attended_tokens / (double) n_full_steps) : 0.0;
+                SLT_INF(*this, "da: %s path - %lu restricted step(s), logical attended %lu of %lu token-step(s) (-%.1f%%)\n",
+                        stats.da_removed_a ? "A" : "B",
+                        (unsigned long) stats.n_da_restricted_steps,
+                        (unsigned long) stats.n_da_attended_tokens,
+                        (unsigned long) n_full_steps, reduction);
+            }
+
             t_last_used = ggml_time_us();
 
             state = SLOT_STATE_IDLE;
 
-            // do not keep context of the child slots - the parent's context is enough
-            // da_rm requests remove KV ranges but leave prompt.tokens intact, so the
-            // kept slot would advertise a prefix whose cache has holes; a reused slot
-            // would read the holed KV. Clear it like a child slot.
-            if (task->is_child() || !task->params.da_rm.empty()) {
-                if (!task->params.da_rm.empty()) {
-                    SLT_INF(*this, "clearing slot after da_rm request: %zu prompt tokens, %zu range(s)\n",
-                            prompt.tokens.size(), task->params.da_rm.size());
+            // DA cache policy (P2):
+            // - child slot: always clear (the parent's context is enough)
+            // - static da_rm request: KV holes in the original sequence -> clear
+            // - DA tag request that applied a removal (da_applied):
+            //     B path: the original sequence is intact; copy the tail
+            //             generated on da_seq back so it holds the full
+            //             conversation, free da_seq, and KEEP the prompt cache
+            //             (the next turn reuses the complete prefix)
+            //     A path: holes persist in the original sequence -> clear
+            // - DA tag request that never emitted a tag: cache kept (vanilla)
+            if (task->is_child()) {
+                prompt_clear();
+            } else if (!task->params.da_rm.empty()) {
+                SLT_INF(*this, "clearing slot after da_rm request: %zu prompt tokens, %zu range(s)\n",
+                        prompt.tokens.size(), task->params.da_rm.size());
+                prompt_clear();
+            } else if (da_applied && da_seq >= 0) {
+                const int32_t n_full = (int32_t) prompt.n_tokens();
+                if (n_full > da_bound) {
+                    mem.seq_cp(da_seq, id, da_bound, n_full);
                 }
+                mem.seq_rm(da_seq, -1, -1);
+                SLT_INF(*this, "da_b: returned %d generated token(s) to seq %d - prompt cache kept\n",
+                        n_full - da_bound, id);
+                da_seq = -1;
+            } else if (da_removed_a) {
+                // A path (or a B request that fell back to A): holes persist
+                // in the original sequence -> the cached prompt is not
+                // reusable
+                SLT_INF(*this, "clearing slot after DA removal (A path, holes persist): %zu prompt tokens\n",
+                        prompt.tokens.size());
                 prompt_clear();
             }
+            // a B slot that returned to the original sequence mid-decode
+            // (</focus> before the end) has a plain sequence again: the
+            // prompt cache is kept, like a vanilla request
 
             callback_on_reset(*this);
 
@@ -1976,8 +2064,19 @@ private:
 
             // check if there is any token to predict
             if (send_text) {
-                // no send the stop word in the response
-                result.text_to_send = slot.generated_text.substr(pos, std::string::npos);
+                // no send the stop word in the response. DA tag holdback: a
+                // trailing fragment that could still grow into a control tag
+                // stays unsent until it closes (apply_da_tag then erases it)
+                // or is proven to be plain text; an EOG token flushes it.
+                // Recomputed here because the stop-word erase above may have
+                // removed the previously held fragment.
+                size_t da_hold = 0;
+                if (!slot.task->params.da_chunks.empty() &&
+                        !llama_vocab_is_eog(vocab, result.tok)) {
+                    da_hold = da_tag_hold_len(slot.generated_text.substr(slot.n_sent_text));
+                }
+                const size_t send_end = slot.generated_text.size() - da_hold;
+                result.text_to_send = slot.generated_text.substr(pos, send_end - pos);
                 slot.n_sent_text += result.text_to_send.size();
                 // add the token to slot queue and cache
             } else {
@@ -3132,7 +3231,9 @@ private:
             generating.push_back(&slot);
 
             if (spec) {
-                common_speculative_get_draft_params(spec.get(), slot.id).drafting = false;
+                // kv_seq(): a 2-stream (B) slot drafts on its second sequence
+                // after the switch (P6)
+                common_speculative_get_draft_params(spec.get(), slot.kv_seq()).drafting = false;
 
                 const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
                 const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
@@ -3152,16 +3253,16 @@ private:
 
                         slot.spec_ckpt.update_pos(
                                 slot.prompt.n_tokens(),
-                                llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id),
-                                llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id));
+                                llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.kv_seq()),
+                                llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.kv_seq()));
 
                         if (use_ckpt_dft) {
-                            slot.spec_ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                            slot.spec_ckpt.update_dft(ctx_dft, slot.kv_seq(), LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                         }
 
                         slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
 
-                        common_speculative_get_draft_params(spec.get(), slot.id) = {
+                        common_speculative_get_draft_params(spec.get(), slot.kv_seq()) = {
                             /* .drafting = */ true,
                             /* .n_max    = */ n_draft_max,
                             /* .pos0     = */ slot.prompt.tokens.pos_next(),
@@ -3195,11 +3296,11 @@ private:
 
             if (ctx_dft) {
                 if (use_ckpt_dft) {
-                    ckpt.load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    ckpt.load_dft(ctx_dft, slot.kv_seq(), LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                 }
 
-                if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, ckpt.pos_max + 1, -1)) {
-                    GGML_ABORT("failed to remove sequence %d\n", slot.id);
+                if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.kv_seq(), ckpt.pos_max + 1, -1)) {
+                    GGML_ABORT("failed to remove sequence %d\n", (int) slot.kv_seq());
                 }
             }
 
@@ -3214,7 +3315,7 @@ private:
                 if (use_ckpt_tgt) {
                     //const int64_t t_start = ggml_time_us();
 
-                    ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    ckpt.update_tgt(ctx_tgt, slot.kv_seq(), LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
 
                     //const int64_t t_total = ggml_time_us() - t_start;
                     //printf("checkpoint total: %f ms\n", t_total / 1000.0);
@@ -3226,7 +3327,7 @@ private:
                 }
 
                 if (use_ckpt_dft) {
-                    ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    ckpt.update_dft(ctx_dft, slot.kv_seq(), LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                 }
             }
         });
@@ -4100,6 +4201,11 @@ private:
                     ok = llama_memory_seq_rm(mem_dft, slot.id, lo, hi) && ok;
                 }
             }
+            if (ok) {
+                slot.n_da_removed += (uint32_t) (hi - lo);
+                slot.da_applied    = true;
+                slot.da_removed_a  = true;
+            }
             SLT_INF(slot, "da_rm: [%d, %d) %s (%s)\n", lo, hi, ok ? "removed" : "rejected", when);
         }
     }
@@ -4290,95 +4396,350 @@ private:
         SLT_INF(slot, "da_b: original seq %d untouched (%d token(s)) - rollback/reference\n", slot.id, bound);
     }
 
-    // Scan the accumulated generated text for the first complete
-    // <focus ... magic_chunks="N" ...> tag. Returns the chunk numbers encoded
-    // in the tag's magic_chunks attribute (all digit runs), or empty while no
-    // complete tag exists yet. Ported from da-probe/da_probe_dynamic.cpp
-    // (scan_magic_tag): generation is short and the scan stops as soon as the
-    // tag is applied, so a full re-scan per token is fine.
-    static std::vector<int32_t> scan_da_magic_tag(const std::string & text) {
-        for (size_t p = 0; (p = text.find("<focus", p)) != std::string::npos; ) {
-            const size_t close = text.find('>', p);
-            if (close == std::string::npos) {
-                return {};  // tag not closed yet
-            }
-            const std::string tag = text.substr(p, close - p + 1);
-            const size_t q0 = tag.find("magic_chunks");
-            if (q0 != std::string::npos) {
-                std::vector<int32_t> nums;
-                for (size_t q = q0 + std::strlen("magic_chunks"); q < tag.size(); q++) {
-                    if (std::isdigit((unsigned char) tag[q])) {
-                        int v = 0;
-                        while (q < tag.size() && std::isdigit((unsigned char) tag[q])) {
-                            v = v * 10 + (tag[q] - '0');
-                            q++;
-                        }
-                        nums.push_back(v);
-                    }
-                }
-                if (!nums.empty()) {
-                    return nums;  // first complete tag wins
-                }
-            }
-            p = close + 1;  // this tag had no magic_chunks: keep looking
-        }
-        return {};
-    }
-
-    // Declarative Attention tag parser: when the client supplies the chunk
-    // layout (da_chunks), scan the slot's accumulated generated text for the
-    // model's own <focus ... magic_chunks="N" ...> tag. On the first complete
-    // tag, compute the removal ranges - every chunk except the kept one, plus
-    // the filler - and apply them exactly once, mid-decode, via apply_da_b
-    // (da_b mode) or apply_da_rm. The model's tag, not a client-supplied da_rm
-    // range, drives the attention restriction.
+    // ---------------------------------------------------------------------
+    // Declarative Attention (DA) tag state machine
+    // ---------------------------------------------------------------------
+    // The model emits control tags in its own output; the server enforces the
+    // matching attention scope mid-decode:
+    //   <focus magic_chunks="N">   enter FOCUS: keep chunk N (1-based) + scaffold
+    //   <local>                   enter LOCAL: scaffold + generated only
+    //   </focus> / </local>        return to GLOBAL (full attention)
+    // where scaffold = every prompt token outside the chunk/filler ranges
+    // (system, the question, the injected instruction); the generated tail
+    // is always attended.
     //
-    // Called from process_token() after each generated token is appended to
-    // slot.generated_text; it no-ops until the tag closes and after it is
-    // applied. The removal boundary is the current decode position, so the B
-    // switch (or the A removal) stays position-contiguous for the next token.
-    void apply_da_tag(server_slot & slot) {
-        if (slot.da_tag_applied || slot.task->params.da_chunks.empty()) {
-            return;
-        }
+    // B path (task da_b): the decode switches to a second sequence (da_seq)
+    // holding the kept ranges; the original sequence stays intact, so a
+    // switch/return is a seq_rm/seq_cp pair on da_seq (reversible).
+    // A path: seq_rm holes in the original sequence - monotonic, a chunk
+    // removed once is gone for the rest of the request.
+    //
+    // Consumed tags are erased from generated_text (they never reach the
+    // user); a trailing fragment that could still grow into a tag is held
+    // back from the output stream by process_token() via da_tag_hold_len().
+    struct da_tag_t {
+        int                  type      = -1; // 0=<focus N>, 1=<local>, 2=</focus>, 3=</local>
+        std::vector<int32_t> keep_nums;      // chunk numbers (type 0 only), as emitted
+        size_t               start     = 0;  // char offset in the scanned text
+        size_t               end       = 0;  // char offset just past the closing '>'
+    };
 
-        const std::vector<int32_t> keep_nums = scan_da_magic_tag(slot.generated_text);
-        if (keep_nums.empty()) {
-            return;  // no complete tag yet
-        }
-
-        // consume the tag exactly once, even if the keep number is invalid
-        slot.da_tag_applied = true;
-
-        const auto & chunks = slot.task->params.da_chunks;
-        const int32_t keep = keep_nums[0];
-        if (keep < 1 || keep > (int32_t) chunks.size()) {
-            SLT_WRN(slot, "da_tag: magic_chunks=\"%d\" is out of range (1..%zu) - no removal applied\n",
-                    keep, chunks.size());
-            return;
-        }
-
-        // removal = every chunk except the kept one, plus the filler
-        std::vector<std::pair<int32_t, int32_t>> ranges;
-        for (size_t n = 0; n < chunks.size(); n++) {
-            if ((int32_t) (n + 1) == keep) {
+    // Find the earliest complete DA tag in text[from, size). Returns
+    // type < 0 while no tag is closed yet. A full re-scan per token is fine:
+    // generation is short and the scan starts at the last consumed position.
+    // A tag must start at the beginning of the text or right after
+    // whitespace: the model emits it as a standalone token, and a literal
+    // "<local>" inside a tool-call JSON string (preceded by '"' or ':') is
+    // data, not a control tag.
+    static da_tag_t scan_da_tag(const std::string & text, size_t from) {
+        da_tag_t best;
+        for (size_t lt = text.find('<', from); lt != std::string::npos; lt = text.find('<', lt + 1)) {
+            if (lt > 0 && !std::isspace((unsigned char) text[lt - 1])) {
                 continue;
             }
-            ranges.push_back(chunks[n]);
+            da_tag_t cand;
+            cand.start = lt;
+            if (text.compare(lt, 8, "</focus>") == 0) {
+                cand.type = 2;
+                cand.end  = lt + 8;
+            } else if (text.compare(lt, 9, "</local>") == 0) {
+                cand.type = 3;
+                cand.end  = lt + 9;
+            } else if (text.compare(lt, 7, "<local>") == 0) {
+                cand.type = 1;
+                cand.end  = lt + 7;
+            } else if (text.compare(lt, 6, "<focus") == 0) {
+                const size_t close = text.find('>', lt + 6);
+                if (close != std::string::npos) {
+                    const std::string tag = text.substr(lt, close - lt + 1);
+                    const size_t q0 = tag.find("magic_chunks");
+                    if (q0 != std::string::npos) {
+                        // every number run after the attribute name - the
+                        // tag may keep several chunks (magic_chunks="1,3")
+                        for (size_t q = q0 + 14; q < tag.size(); q++) {
+                            if (std::isdigit((unsigned char) tag[q])) {
+                                int32_t v = 0;
+                                do {
+                                    v = v * 10 + (tag[q] - '0');
+                                    q++;
+                                } while (q < tag.size() && std::isdigit((unsigned char) tag[q]));
+                                q--;  // the loop increment steps past the run
+                                cand.keep_nums.push_back(v);
+                            }
+                        }
+                        if (!cand.keep_nums.empty()) {
+                            cand.type = 0;
+                            cand.end  = close + 1;
+                        }
+                    }
+                }
+            }
+            if (cand.type >= 0 && (best.type < 0 || cand.end < best.end)) {
+                best = cand;
+            }
         }
-        if (slot.task->params.da_filler.first >= 0) {
-            ranges.push_back(slot.task->params.da_filler);
+        return best;
+    }
+
+    // Longest suffix of `unsent` that is a prefix of a DA tag opener - the
+    // number of trailing characters process_token() must hold back from the
+    // output stream while the fragment could still grow into a control tag.
+    static size_t da_tag_hold_len(const std::string & unsent) {
+        static const char * const openers[] = {
+            "<focus magic_chunks=", "<local>", "</focus>", "</local>",
+        };
+        size_t hold = 0;
+        for (const char * opener : openers) {
+            const size_t olen = std::strlen(opener);
+            for (size_t l = std::min(unsent.size(), olen); l > hold; l--) {
+                if (unsent.compare(unsent.size() - l, l, opener, l) == 0) {
+                    hold = l;
+                    break;
+                }
+            }
+        }
+        return hold;
+    }
+
+    // DA tag state machine (P3): process every control tag that has closed
+    // since the last call and apply the mode transition to the KV cache.
+    // Called from process_token() after each generated token is appended to
+    // slot.generated_text. No-op unless the client supplied the chunk layout
+    // (task params da_chunks). The removal boundary is the current decode
+    // position, so the B switch (or the A removal) stays position-contiguous
+    // for the next token.
+    void apply_da_tag(server_slot & slot) {
+        if (slot.task->params.da_chunks.empty()) {
+            return;
         }
 
-        const int32_t bound = (int32_t) slot.prompt.n_tokens();
+        const auto & chunks = slot.task->params.da_chunks;
+        const auto & filler = slot.task->params.da_filler;
+        const bool   is_b   = slot.task->params.da_b;
 
-        SLT_INF(slot, "da_tag: <focus magic_chunks=\"%d\"> closed at generated token %d - removing %zu range(s), bound=%d\n",
-                keep, (int) slot.stats.n_gen, ranges.size(), bound);
+        for (;;) {
+            da_tag_t tag = scan_da_tag(slot.generated_text, slot.da_tag_scan_pos);
+            if (tag.type < 0) {
+                break;  // no more complete tags
+            }
 
-        if (slot.task->params.da_b) {
-            apply_da_b(slot, ranges, bound, "at tag close");
-        } else {
-            apply_da_rm(slot, ranges, bound, "at tag close");
+            const int32_t n_full   = (int32_t) slot.prompt.n_tokens();
+            const bool    in_focus = slot.da_mode == DA_MODE_FOCUS;
+            const bool    in_local = slot.da_mode == DA_MODE_LOCAL;
+
+            // consume the tag: erase it from the user-visible text and
+            // restart the scan where the tag began (nothing complete can sit
+            // before it - the scanner returns the earliest tag)
+            slot.generated_text.erase(tag.start, tag.end - tag.start);
+            slot.da_tag_scan_pos = tag.start;
+
+            switch (tag.type) {
+                case 0: { // <focus magic_chunks="N"> (or "1,3") : enter/switch FOCUS
+                    // Resolve the emitted chunk numbers to layout indices:
+                    // the hook numbers chunks monotonically per session, so
+                    // the current block may start at da_chunk_base > 1.
+                    const int32_t base     = slot.task->params.da_chunk_base;
+                    const int32_t n_chunks = (int32_t) chunks.size();
+                    std::vector<size_t> keep_idx;
+                    for (int32_t n : tag.keep_nums) {
+                        if (n < base || n - base >= n_chunks) {
+                            SLT_WRN(slot, "da_tag: magic_chunks number %d out of range (%d..%d) - ignored\n",
+                                    n, base, base + n_chunks - 1);
+                            continue;
+                        }
+                        const size_t idx = (size_t) (n - base);
+                        if (std::find(keep_idx.begin(), keep_idx.end(), idx) == keep_idx.end()) {
+                            keep_idx.push_back(idx);
+                        }
+                    }
+                    if (keep_idx.empty()) {
+                        SLT_WRN(slot, "%s", "da_tag: no valid magic_chunks number - tag consumed, mode unchanged\n");
+                        break;
+                    }
+                    std::sort(keep_idx.begin(), keep_idx.end());
+
+                    const auto is_kept = [&keep_idx](size_t n) {
+                        return std::find(keep_idx.begin(), keep_idx.end(), n) != keep_idx.end();
+                    };
+                    const auto is_old = [&slot](size_t n) {
+                        return std::find(slot.da_keep_chunks.begin(), slot.da_keep_chunks.end(), (int32_t) n) != slot.da_keep_chunks.end();
+                    };
+                    std::string keep_str;
+                    for (size_t n : keep_idx) {
+                        if (!keep_str.empty()) {
+                            keep_str += ",";
+                        }
+                        keep_str += std::to_string((int) (n + base));
+                    }
+
+                    if (is_b) {
+                        if (slot.da_seq < 0) {
+                            // GLOBAL -> FOCUS: fresh da_seq = scaffold + keep + tail
+                            std::vector<std::pair<int32_t, int32_t>> ranges;
+                            for (size_t n = 0; n < chunks.size(); n++) {
+                                if (!is_kept(n)) {
+                                    ranges.push_back(chunks[n]);
+                                }
+                            }
+                            if (filler.first >= 0) {
+                                ranges.push_back(filler);
+                            }
+                            SLT_INF(slot, "da_tag: <focus magic_chunks=\"%s\"> closed at generated token %d - B switch, removing %zu range(s), bound=%d\n",
+                                    keep_str.c_str(), (int) slot.stats.n_gen, ranges.size(), n_full);
+                            apply_da_b(slot, ranges, n_full, "at tag close");
+                            if (slot.da_seq >= 0) {
+                                slot.da_mode        = DA_MODE_FOCUS;
+                                slot.da_keep_chunks.assign(keep_idx.begin(), keep_idx.end());
+                            }
+                        } else if (in_focus) {
+                            // FOCUS -> FOCUS: drop the old keep(s) that left
+                            // the set, copy in the new keep(s)
+                            for (int32_t n : slot.da_keep_chunks) {
+                                if (!is_kept((size_t) n)) {
+                                    slot.mem.seq_rm(slot.da_seq, chunks[n].first, chunks[n].second);
+                                    slot.da_keep_count -= (size_t) (chunks[n].second - chunks[n].first);
+                                }
+                            }
+                            for (size_t n : keep_idx) {
+                                if (!is_old(n)) {
+                                    slot.mem.seq_cp(slot.id, slot.da_seq, chunks[n].first, chunks[n].second);
+                                    slot.da_keep_count += (size_t) (chunks[n].second - chunks[n].first);
+                                }
+                            }
+                            slot.da_keep_chunks.assign(keep_idx.begin(), keep_idx.end());
+                            SLT_INF(slot, "da_tag: FOCUS switch - now keeping chunk(s) %s\n", keep_str.c_str());
+                        } else {
+                            // LOCAL -> FOCUS: copy the keep(s) into da_seq
+                            for (size_t n : keep_idx) {
+                                slot.mem.seq_cp(slot.id, slot.da_seq, chunks[n].first, chunks[n].second);
+                                slot.da_keep_count += (size_t) (chunks[n].second - chunks[n].first);
+                            }
+                            slot.da_keep_chunks.assign(keep_idx.begin(), keep_idx.end());
+                            slot.da_mode = DA_MODE_FOCUS;
+                            SLT_INF(slot, "da_tag: LOCAL -> FOCUS - keeping chunk(s) %s\n", keep_str.c_str());
+                        }
+                    } else {
+                        // A path: monotonic. The chunks still present in the
+                        // sequence are all of them before the first removal.
+                        std::vector<size_t> present;
+                        if (!slot.da_applied && slot.da_mode == DA_MODE_GLOBAL) {
+                            for (size_t n = 0; n < chunks.size(); n++) {
+                                present.push_back(n);
+                            }
+                        } else {
+                            for (int32_t n : slot.da_keep_chunks) {
+                                present.push_back((size_t) n);
+                            }
+                        }
+                        bool all_present = true;
+                        for (size_t n : keep_idx) {
+                            if (std::find(present.begin(), present.end(), n) == present.end()) {
+                                SLT_WRN(slot, "da_tag: A path is monotonic - chunk %d was already removed, cannot switch keep (staying %s)\n",
+                                        (int) (n + base), in_focus ? "FOCUS" : (in_local ? "LOCAL" : "GLOBAL"));
+                                all_present = false;
+                                break;
+                            }
+                        }
+                        if (all_present) {
+                            std::vector<std::pair<int32_t, int32_t>> ranges;
+                            for (size_t n : present) {
+                                if (!is_kept(n)) {
+                                    ranges.push_back(chunks[n]);
+                                }
+                            }
+                            if (!slot.da_applied && filler.first >= 0) {
+                                ranges.push_back(filler);
+                            }
+                            SLT_INF(slot, "da_tag: <focus magic_chunks=\"%s\"> closed at generated token %d - A removal, %zu range(s), bound=%d\n",
+                                    keep_str.c_str(), (int) slot.stats.n_gen, ranges.size(), n_full);
+                            apply_da_rm(slot, ranges, n_full, "at tag close");
+                            slot.da_keep_chunks.assign(keep_idx.begin(), keep_idx.end());
+                            slot.da_mode = DA_MODE_FOCUS;
+                        }
+                    }
+                    break;
+                }
+                case 1: { // <local> : enter LOCAL
+                    if (is_b) {
+                        if (slot.da_seq < 0) {
+                            // GLOBAL -> LOCAL: fresh da_seq = scaffold + tail
+                            std::vector<std::pair<int32_t, int32_t>> ranges(chunks.begin(), chunks.end());
+                            if (filler.first >= 0) {
+                                ranges.push_back(filler);
+                            }
+                            SLT_INF(slot, "da_tag: <local> closed at generated token %d - B switch, removing %zu range(s), bound=%d\n",
+                                    (int) slot.stats.n_gen, ranges.size(), n_full);
+                            apply_da_b(slot, ranges, n_full, "at tag close");
+                            if (slot.da_seq >= 0) {
+                                slot.da_mode        = DA_MODE_LOCAL;
+                                slot.da_keep_chunks.clear();
+                            }
+                        } else if (in_focus) {
+                            // FOCUS -> LOCAL: drop the kept chunk from da_seq
+                            for (int32_t n : slot.da_keep_chunks) {
+                                slot.mem.seq_rm(slot.da_seq, chunks[n].first, chunks[n].second);
+                                slot.da_keep_count -= (size_t) (chunks[n].second - chunks[n].first);
+                            }
+                            slot.da_keep_chunks.clear();
+                            slot.da_mode = DA_MODE_LOCAL;
+                            SLT_INF(slot, "%s", "da_tag: FOCUS -> LOCAL - keep chunk(s) dropped\n");
+                        }
+                        // LOCAL -> LOCAL: no-op
+                    } else {
+                        // A path: remove every chunk still present
+                        std::vector<size_t> present;
+                        if (!slot.da_applied && slot.da_mode == DA_MODE_GLOBAL) {
+                            for (size_t n = 0; n < chunks.size(); n++) {
+                                present.push_back(n);
+                            }
+                        } else {
+                            for (int32_t n : slot.da_keep_chunks) {
+                                present.push_back((size_t) n);
+                            }
+                        }
+                        std::vector<std::pair<int32_t, int32_t>> ranges;
+                        for (size_t n : present) {
+                            ranges.push_back(chunks[n]);
+                        }
+                        if (!slot.da_applied && filler.first >= 0) {
+                            ranges.push_back(filler);
+                        }
+                        SLT_INF(slot, "da_tag: <local> closed at generated token %d - A removal, %zu range(s), bound=%d\n",
+                                (int) slot.stats.n_gen, ranges.size(), n_full);
+                        apply_da_rm(slot, ranges, n_full, "at tag close");
+                        slot.da_keep_chunks.clear();
+                        slot.da_mode = DA_MODE_LOCAL;
+                    }
+                    break;
+                }
+                case 2:
+                case 3: { // </focus> / </local> : return to GLOBAL
+                    if (in_local && tag.type == 2) {
+                        SLT_WRN(slot, "%s", "da_tag: </focus> while in LOCAL - treating as </local>\n");
+                    }
+                    if (slot.da_seq >= 0) {
+                        // B: copy the generated tail back to the original
+                        // sequence and free da_seq - the slot decodes the full
+                        // context again without a re-prefill
+                        if (n_full > slot.da_bound) {
+                            slot.mem.seq_cp(slot.da_seq, slot.id, slot.da_bound, n_full);
+                        }
+                        slot.mem.seq_rm(slot.da_seq, -1, -1);
+                        SLT_INF(slot, "da_tag: returned to GLOBAL - %d generated token(s) copied back to seq %d, da_seq %d freed\n",
+                                std::max(0, n_full - slot.da_bound), (int) slot.id, (int) slot.da_seq);
+                        slot.da_seq        = -1;
+                        slot.da_bound      = -1;
+                        slot.da_keep_count = 0;
+                        slot.da_keep_chunks.clear();
+                    } else if (slot.da_applied) {
+                        SLT_WRN(slot, "da_tag: A path removals are irreversible - attention stays restricted (%zu chunk(s) kept), mode nominal GLOBAL\n",
+                                slot.da_keep_chunks.size());
+                    }
+                    // !da_applied: nothing was removed - a clean return
+                    slot.da_mode = DA_MODE_GLOBAL;
+                    break;
+                }
+            }
         }
     }
 
@@ -4458,14 +4819,15 @@ private:
                     slot.da_rm_pending = false;
                 }
 
-                // speculative decoding drafts on the slot's own sequence; a
-                // 2-stream (B) slot decodes on its second sequence, so spec is
-                // disabled there (draft tokens would land on the wrong seq).
-                // da_b is checked (not just da_seq): in tag mode (da_chunks)
-                // the B switch happens mid-decode, so da_seq is still -1 here
-                // and spec must not start before the tag is parsed.
-                if (slot.can_speculate() && slot.da_seq < 0 && !slot.task->params.da_b) {
-                    common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
+                // A 2-stream (B) slot that has already switched decodes on its
+                // second sequence (da_seq) - spec was started before the
+                // switch and follows it via kv_seq().
+                // DA tag mode (P6): spec starts before the tag fires. When a
+                // control tag closes mid-decode, the accept loop cuts the
+                // draft batch at the closing token and the mode transition
+                // runs; decoding (and the draft) then continues on kv_seq().
+                if (slot.can_speculate() && slot.da_seq < 0) {
+                    common_speculative_begin(spec.get(), slot.kv_seq(), slot.prompt.tokens.get_text_tokens());
                 }
             } else if (slot.state != SLOT_STATE_GENERATING) {
                 return;
@@ -4549,6 +4911,39 @@ private:
 
                 GGML_ASSERT(accepted.size() >= 1);
 
+                // DA tag batch cut (P6): if a control tag closes inside the
+                // accepted batch, discard everything after the closing token
+                // - the mode transition (apply_da_tag in process_token) must
+                // run before the following tokens are committed to the
+                // output stream and the KV cache. The cut point is the token
+                // whose text contains the tag's closing '>'.
+                if (!slot.task->params.da_chunks.empty()) {
+                    const size_t n_acc_full = accepted.size();
+                    const size_t gen_len    = slot.generated_text.size();
+                    std::string preview;
+                    for (llama_token tok : accepted) {
+                        preview += common_token_to_piece(slot.ctx_tgt, tok, accept_special_token(slot, tok));
+                    }
+                    // a tag may start in the held-back tail of generated_text
+                    // (process_token holds back partial tag openers) and close
+                    // inside this batch; only the closing position matters
+                    const da_tag_t tag = scan_da_tag(slot.generated_text + preview, slot.da_tag_scan_pos);
+                    if (tag.type >= 0 && tag.end > gen_len) {
+                        const size_t cut = tag.end - gen_len;  // offset into the preview
+                        size_t off = 0;
+                        for (size_t i = 0; i < accepted.size(); i++) {
+                            const std::string piece = common_token_to_piece(slot.ctx_tgt, accepted[i], accept_special_token(slot, accepted[i]));
+                            if (off + piece.size() >= cut) {
+                                accepted.resize(i + 1);
+                                SLT_INF(slot, "da_tag: batch cut - %zu of %zu accepted token(s) discarded (tag closed mid-batch)\n",
+                                        n_acc_full - (i + 1), n_acc_full);
+                                break;
+                            }
+                            off += piece.size();
+                        }
+                    }
+                }
+
                 const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
 
                 const bool use_ckpt_tgt =
@@ -4570,13 +4965,13 @@ private:
 
                         SLT_DBG(slot, "restoring speculative checkpoint (pos_min = %d, pos_max = %d, size = %zu)\n", ckpt.pos_min, ckpt.pos_max, ckpt.size());
 
-                        ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                        ckpt.load_tgt(slot.ctx_tgt, slot.kv_seq(), LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
 
                         if (slot.ctx_dft) {
-                            ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                            ckpt.load_dft(slot.ctx_dft, slot.kv_seq(), LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                         }
 
-                        slot.mem.seq_rm(slot.id, ckpt.pos_max + 1, -1);
+                        slot.mem.seq_rm(slot.kv_seq(), ckpt.pos_max + 1, -1);
 
                         slot.prompt.tokens.keep_first(ckpt.n_tokens);
                         common_sampler_copy(smpl_save.get(), slot.smpl.get());
@@ -4589,7 +4984,7 @@ private:
                     SLT_INF(slot, "accepted %2zu/%2zu draft tokens\n", accepted.size() - 1, n_draft);
                 }
 
-                common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
+                common_speculative_accept(spec.get(), slot.kv_seq(), accepted.size() - 1);
 
                 slot.spec_draft = std::move(accepted);
             }
@@ -4623,7 +5018,7 @@ private:
             slot.sampled = ids.back(); // last accepted token
             SLT_DBG(slot, "add accepted tokens: sampled=%d, ids.size=%zu, n_draft=%zu\n", slot.sampled, ids.size(), n_draft);
 
-            slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
+            slot.mem.seq_rm(slot.kv_seq(), slot.prompt.tokens.pos_next(), -1);
 
             for (size_t i = 0; i < ids.size(); ++i) {
                 completion_token_output result;
@@ -4878,6 +5273,377 @@ void server_context::set_state_callback(server_state_callback_t callback) {
     impl->callback_state = std::move(callback);
 }
 
+// ---------------------------------------------------------------------
+// DA prompt scan (P1)
+// ---------------------------------------------------------------------
+// The client hook (FocusMemory, FOCUSMEMORY_DA) appends a marker block to
+// the rendered prompt:
+//   <da:1>chunk 1<da:2>chunk 2 ... <da:C>chunk C<da:filler>instruction<da:layout:C>
+// where <da:N> marks the start of chunk N (1-based), <da:filler> the start
+// of the injected instruction (the removable filler), and <da:layout:C> the
+// footer (C = chunk count; kept - it sits at the prompt tail). This scan
+// recovers the chunk token ranges from the prompt string + its tokenization
+// and fills the task params (da_chunks, da_filler, da_b).
+//
+// Fail-open: no markers (a normal request) or any mismatch leaves the
+// request vanilla. The char->token mapping is strict (no drift): the token
+// pieces must concatenate exactly to the prompt string, and every marker
+// boundary must land exactly on a token boundary.
+
+// Strict char->token offsets: offsets[i] = char offset of token i (and
+// offsets[n] = text length). Returns {} when the pieces do not concatenate
+// exactly to the text (tokenization drift - the caller fails open).
+static std::vector<size_t> da_token_offsets(const llama_vocab * vocab, const std::string & text, const llama_tokens & tokens) {
+    std::vector<size_t> offsets(tokens.size() + 1);
+    offsets[0] = 0;
+    std::string concat;
+    concat.reserve(text.size());
+    for (size_t i = 0; i < tokens.size(); i++) {
+        concat += common_token_to_piece(vocab, tokens[i], true);
+        offsets[i + 1] = concat.size();
+    }
+    if (concat != text) {
+        return {};
+    }
+    return offsets;
+}
+
+// map a char offset to the token starting there; -1 when the offset is not
+// exactly on a token boundary
+static int32_t da_char_to_token(const std::vector<size_t> & offsets, size_t c) {
+    const auto it = std::lower_bound(offsets.begin(), offsets.end(), c);
+    if (it == offsets.end() || *it != c) {
+        return -1;
+    }
+    return (int32_t) (it - offsets.begin());
+}
+
+static bool da_scan_prompt(
+        const llama_vocab * vocab,
+        const std::string & text,
+        const llama_tokens & tokens,
+        bool kv_unified,
+        task_params & params) {
+    struct marker_t {
+        int     kind  = -1;  // 0=chunk, 1=filler, 2=layout
+        int32_t num   = 0;   // chunk number (kind 0) / chunk count (kind 2)
+        size_t  start = 0;   // char offset
+        size_t  end   = 0;   // char offset, exclusive
+    };
+
+    std::vector<marker_t> markers;
+    size_t p = text.find("<da:");
+    while (p != std::string::npos) {
+        const size_t close = text.find('>', p);
+        if (close == std::string::npos) {
+            break;
+        }
+        const std::string inner = text.substr(p + 4, close - p - 4);
+        marker_t m;
+        m.start = p;
+        m.end   = close + 1;
+        if (inner == "filler") {
+            m.kind = 1;
+        } else if (inner.size() > 7 && inner.compare(0, 7, "layout:") == 0) {
+            m.kind = 2;
+            m.num  = std::atoi(inner.c_str() + 7);
+        } else if (!inner.empty() &&
+                   std::all_of(inner.begin(), inner.end(), [](unsigned char c) { return std::isdigit(c); })) {
+            m.kind = 0;
+            m.num  = std::atoi(inner.c_str());
+        }
+        if (m.kind >= 0) {
+            markers.push_back(m);
+        }
+        p = text.find("<da:", close + 1);
+    }
+
+    // Multi-turn: the FocusMemory hook numbers chunks monotonically per
+    // session, so earlier turns' blocks (their own markers + footers) remain
+    // in the prompt history. Only the last block (the current turn's, at the
+    // prompt tail) is authoritative; everything before the previous footer is
+    // inert history.
+    std::vector<const marker_t *> footers;
+    for (const auto & m : markers) {
+        if (m.kind == 2) {
+            footers.push_back(&m);
+        }
+    }
+    if (footers.empty()) {
+        return false;  // no layout footer - a normal request
+    }
+    const size_t block_start = footers.size() >= 2 ? footers[footers.size() - 2]->end : 0;
+
+    std::vector<marker_t> block;  // last block's markers, in order
+    const marker_t * filler = nullptr;
+    for (const auto & m : markers) {
+        if (m.start < block_start) {
+            continue;
+        }
+        if (m.kind == 1) {
+            if (filler != nullptr) {
+                SRV_WRN("%s", "da_scan: multiple <da:filler> markers in the last block - failing open to vanilla\n");
+                return false;
+            }
+            filler = &m;
+        }
+        block.push_back(m);
+    }
+
+    const size_t n_chunks = std::count_if(block.begin(), block.end(),
+            [](const marker_t & m) { return m.kind == 0; });
+    const marker_t * footer = footers.back();
+    if (n_chunks == 0 || footer->num != (int32_t) n_chunks) {
+        SRV_WRN("da_scan: last block has %zu chunk marker(s) but the footer says %d - failing open to vanilla\n",
+                n_chunks, footer->num);
+        return false;
+    }
+    if (&block.back() != footer) {
+        SRV_WRN("%s", "da_scan: <da:layout:N> is not the last marker - failing open to vanilla\n");
+        return false;
+    }
+    // chunk markers must be consecutive (k, k+1, ...); the session counter
+    // lets the block start at k > 1
+    int32_t chunk_ordinal = 0;
+    int32_t base = -1;
+    for (const auto & m : block) {
+        if (m.kind == 0) {
+            if (base < 0) {
+                base = m.num;
+                if (base < 1) {
+                    SRV_WRN("da_scan: first chunk marker number %d < 1 - failing open to vanilla\n", base);
+                    return false;
+                }
+            }
+            chunk_ordinal++;
+            if (m.num != base + (chunk_ordinal - 1)) {
+                SRV_WRN("da_scan: chunk markers are not consecutive from %d - failing open to vanilla\n", base);
+                return false;
+            }
+            if (filler != nullptr && filler->start < m.start) {
+                SRV_WRN("%s", "da_scan: <da:filler> precedes a chunk marker - failing open to vanilla\n");
+                return false;
+            }
+        }
+    }
+
+    // strict char->token mapping: pieces must concatenate exactly to the
+    // prompt, and every marker boundary must land on a token boundary
+    const std::vector<size_t> offsets = da_token_offsets(vocab, text, tokens);
+    if (offsets.empty()) {
+        SRV_WRN("da_scan: token pieces do not reconstruct the prompt exactly (%zu tokens) - failing open to vanilla\n",
+                tokens.size());
+        return false;
+    }
+
+    std::vector<std::pair<int32_t, int32_t>> da_chunks;
+    std::pair<int32_t, int32_t> da_filler = { -1, -1 };
+    for (size_t i = 0; i < block.size(); i++) {
+        if (block[i].kind == 2) {
+            continue;  // footer: kept, no removal range
+        }
+        if (i + 1 >= block.size()) {
+            SRV_WRN("da_scan: marker %zu has no following boundary - failing open to vanilla\n", i);
+            return false;
+        }
+        const int32_t lo = da_char_to_token(offsets, block[i].start);
+        const int32_t hi = da_char_to_token(offsets, block[i + 1].start);
+        if (lo < 0 || hi < 0 || hi <= lo) {
+            SRV_WRN("da_scan: marker %zu boundaries are not on token boundaries (lo=%d, hi=%d) - failing open to vanilla\n",
+                    i, lo, hi);
+            return false;
+        }
+        if (block[i].kind == 0) {
+            da_chunks.emplace_back(lo, hi);
+        } else {
+            da_filler = { lo, hi };
+        }
+    }
+
+    params.da_chunks     = std::move(da_chunks);
+    params.da_filler     = da_filler;
+    params.da_chunk_base = base;
+    params.da_b          = kv_unified;
+
+    SRV_INF("da_scan: %zu chunk(s) numbered %d..%d%s, %zu prompt token(s) - %s path\n",
+            params.da_chunks.size(),
+            base, base + (int32_t) params.da_chunks.size() - 1,
+            da_filler.first >= 0 ? " + filler" : "",
+            tokens.size(),
+            kv_unified ? "B" : "A");
+    return true;
+}
+
+// ---------------------------------------------------------------------
+// DA auto-chunking (P4)
+// ---------------------------------------------------------------------
+// When no client markers are present, --da-auto is set and the prompt has
+// at least --da-min-ctx tokens, the server splits the rendered chat prompt
+// (qwen family template) into magic chunks itself:
+//   scaffold : system + the last user message + trailing assistant prefill
+//   chunks   : the middle messages, each headed by a [Magic Chunk N] line
+// A middle message longer than --da-chunk-tokens is split paragraph ->
+// line -> sentence into several chunks. The DA instruction is appended at
+// the prompt tail (the removable filler, mirroring the P1 hook layout).
+// The caller re-tokenizes the modified string and maps the returned char
+// positions to exact token ranges (strict walk, fail-open).
+struct da_auto_layout {
+    bool   ok = false;
+    std::string modified;
+    std::vector<size_t> header_pos;  // final char offsets of the [Magic Chunk N] lines
+    size_t tail_pos = 0;             // final char offset of the last user message start
+    std::pair<size_t, size_t> filler = { 0, 0 };  // final char range of the appended instruction
+    size_t n_source_msgs = 0;
+};
+
+static da_auto_layout da_auto_chunk(const llama_vocab * vocab, const std::string & text, int32_t da_chunk_tokens) {
+    da_auto_layout out;
+
+    // chat template message boundaries: <\|im_start\|>ROLE\n
+    struct msg_t { size_t start; size_t role_end; std::string role; };
+    std::vector<msg_t> msgs;
+    {
+        static const std::regex msg_re(R"(<\|im_start\|>([a-zA-Z_]+)\n)");
+        for (std::sregex_iterator it(text.cbegin(), text.cend(), msg_re), end; it != end; ++it) {
+            msg_t m;
+            m.start    = (size_t) it->position(0);
+            m.role_end = m.start + (size_t) it->length(0);
+            m.role     = (*it)[1].str();
+            msgs.push_back(m);
+        }
+    }
+    if (msgs.size() < 3 || msgs[0].role != "system") {
+        return out;  // not a rendered qwen chat prompt - leave vanilla
+    }
+
+    // the last user message is the question (scaffold); anything after it
+    // (an assistant prefill) is scaffold too
+    size_t last_user = 0;
+    for (size_t i = 0; i < msgs.size(); i++) {
+        if (msgs[i].role == "user") {
+            last_user = i;
+        }
+    }
+    if (last_user < 2) {
+        return out;  // nothing between system and the last user
+    }
+
+    auto n_tok = [&](const std::string & s) -> int32_t {
+        return (int32_t) common_tokenize(vocab, s, true, true).size();
+    };
+
+    // split [lo, hi) into offset ranges of at most da_chunk_tokens tokens,
+    // trying the separators in order: paragraph (blank line), line, sentence
+    std::function<std::vector<std::pair<size_t, size_t>>(size_t, size_t, int)> split_range;
+    split_range = [&](size_t lo, size_t hi, int level) -> std::vector<std::pair<size_t, size_t>> {
+        if (da_chunk_tokens <= 0 || hi - lo < 2 || n_tok(text.substr(lo, hi - lo)) <= da_chunk_tokens) {
+            return { { lo, hi - lo } };
+        }
+        std::vector<size_t> bounds = { lo };
+        if (level == 0) {
+            for (size_t p = lo; (p = text.find("\n\n", p)) != std::string::npos && p + 2 < hi; ) {
+                bounds.push_back(p + 2);
+                p += 2;
+            }
+        } else if (level == 1) {
+            for (size_t p = lo; (p = text.find('\n', p)) != std::string::npos && p + 1 < hi; ) {
+                bounds.push_back(p + 1);
+                p += 1;
+            }
+        } else {
+            static const std::regex sent_re(R"([.!?．！？][ \t]*)");
+            for (std::sregex_iterator it(text.cbegin() + lo, text.cbegin() + hi, sent_re), end; it != end; ++it) {
+                bounds.push_back(lo + (size_t) it->position(0) + (size_t) it->length(0));
+            }
+        }
+        if (bounds.size() < 3) {
+            if (level < 2) {
+                return split_range(lo, hi, level + 1);
+            }
+            return { { lo, hi - lo } };  // unsplittable: keep whole
+        }
+        if (bounds.back() != hi) {
+            bounds.push_back(hi);
+        }
+
+        // greedily pack the segments between the cut points: extend the
+        // current range over consecutive segments until it would exceed the
+        // budget, then close it at the previous cut
+        std::vector<std::pair<size_t, size_t>> ranges;
+        size_t cur_lo = bounds[0];
+        for (size_t b = 1; b < bounds.size(); b++) {
+            if (bounds[b - 1] > cur_lo && n_tok(text.substr(cur_lo, bounds[b] - cur_lo)) > da_chunk_tokens) {
+                ranges.push_back({ cur_lo, bounds[b - 1] - cur_lo });
+                cur_lo = bounds[b - 1];
+            }
+        }
+        ranges.push_back({ cur_lo, bounds.back() - cur_lo });
+        // recurse on any range still too long
+        std::vector<std::pair<size_t, size_t>> result;
+        for (auto & r : ranges) {
+            if (level < 2 && n_tok(text.substr(r.first, r.second)) > da_chunk_tokens) {
+                auto sub = split_range(r.first, r.first + r.second, level + 1);
+                result.insert(result.end(), sub.begin(), sub.end());
+            } else {
+                result.push_back(r);
+            }
+        }
+        return result;
+    };
+
+    // one [Magic Chunk N] header per piece, inserted right before the piece
+    // (original-text positions; applied descending so earlier positions are
+    // not shifted)
+    std::vector<std::pair<size_t, int32_t>> ins;  // (original pos, chunk number)
+    int32_t n_chunks = 0;
+    for (size_t i = 1; i < last_user; i++) {
+        const size_t content_lo = msgs[i].role_end;
+        const size_t content_hi = (i + 1 < msgs.size()) ? msgs[i + 1].start : text.size();
+        out.n_source_msgs++;
+        for (auto & r : split_range(content_lo, content_hi, 0)) {
+            n_chunks++;
+            ins.push_back({ r.first, n_chunks });
+        }
+    }
+    if (ins.empty()) {
+        return out;
+    }
+
+    std::sort(ins.begin(), ins.end(), [](const auto & a, const auto & b) { return a.first > b.first; });
+    std::string modified = text;
+    size_t total_header_len = 0;
+    for (auto & [pos, num] : ins) {
+        const std::string header = "[Magic Chunk " + std::to_string(num) + "]\n";
+        modified.insert(pos, header);  // descending order: pos is unshifted
+        total_header_len += header.size();
+    }
+
+    // the DA instruction (paper Appendix F, thinking off) - appended at the
+    // prompt tail, where the P1 hook places it too (recency + prefix-cache
+    // safe). It is the removable filler.
+    const std::string instruction =
+        "\n\nInstructions (Declarative Attention):\n"
+        "The context above is split into numbered magic chunks marked by [Magic Chunk N] lines.\n"
+        "1. First identify the chunk that contains the answer to the question, and output the tag <focus magic_chunks=\"N\"> on its own line, where N is the chunk number (1-" +
+        std::to_string(n_chunks) + ").\n"
+        "2. Then answer the question.";
+    out.filler = { modified.size(), modified.size() + instruction.size() };
+    modified += instruction;
+
+    // all header insertions sit before the last user message, so its start
+    // shifts by the total header length
+    out.modified   = std::move(modified);
+    out.header_pos.resize(ins.size());
+    for (size_t i = 0; i < ins.size(); i++) {
+        // ins is descending; the i-th header (ascending chunk order) is at
+        // ins[ins.size() - 1 - i].first, which is its final position
+        out.header_pos[i] = ins[ins.size() - 1 - i].first;
+    }
+    out.tail_pos = msgs[last_user].start + total_header_len;
+    out.ok       = true;
+    return out;
+}
+
 //
 // server_routes
 //
@@ -4945,6 +5711,69 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     params,
                     meta->logit_bias_eog,
                     data);
+
+            // DA prompt scan (P1): the client hook (FocusMemory) may have
+            // appended a marker block to the rendered prompt; recover the
+            // chunk layout so the tag state machine can drive the attention
+            // restriction. String prompts only (the hook renders one string);
+            // fail-open: any mismatch leaves the request vanilla.
+            if (params.da_prompt_scan && prompt.is_string()) {
+                da_scan_prompt(ctx_server.vocab, prompt.get<std::string>(),
+                        task.tokens.get_tokens(), params.kv_unified, task.params);
+            }
+
+            // DA auto-chunking (P4): no client markers and the prompt is long
+            // enough - split the rendered chat prompt into magic chunks
+            // ourselves, re-tokenize, and map the layout to token ranges.
+            // Any mapping failure leaves the original tokens untouched.
+            if (params.da_auto && prompt.is_string() && task.params.da_chunks.empty() &&
+                    (int32_t) task.tokens.get_tokens().size() >= params.da_min_ctx) {
+                const da_auto_layout layout =
+                        da_auto_chunk(ctx_server.vocab, prompt.get<std::string>(), params.da_chunk_tokens);
+                if (layout.ok) {
+                    const llama_tokens  toks = common_tokenize(ctx_server.vocab, layout.modified, true, true);
+                    const std::vector<size_t> offs = da_token_offsets(ctx_server.vocab, layout.modified, toks);
+                    bool ok = !offs.empty();
+
+                    // chunk c = [header_c, header_{c+1}) ; last = [header_last, tail)
+                    std::vector<std::pair<int32_t, int32_t>> chunks;
+                    if (ok) {
+                        chunks.reserve(layout.header_pos.size());
+                        for (size_t c = 0; c < layout.header_pos.size(); c++) {
+                            const size_t next = c + 1 < layout.header_pos.size() ? layout.header_pos[c + 1] : layout.tail_pos;
+                            const int32_t lo = da_char_to_token(offs, layout.header_pos[c]);
+                            const int32_t hi = da_char_to_token(offs, next);
+                            if (lo < 0 || hi < 0 || hi <= lo) {
+                                ok = false;
+                                break;
+                            }
+                            chunks.push_back({ (int32_t) (c + 1), hi - lo });
+                        }
+                    }
+                    std::pair<int32_t, int32_t> filler = { -1, -1 };
+                    if (ok && layout.filler.second > layout.filler.first) {
+                        const int32_t lo = da_char_to_token(offs, layout.filler.first);
+                        const int32_t hi = da_char_to_token(offs, layout.filler.second);
+                        if (lo < 0 || hi < 0 || hi <= lo) {
+                            ok = false;
+                        } else {
+                            filler = { lo, hi - lo };
+                        }
+                    }
+                    if (!ok) {
+                        SRV_WRN("%s", "da_auto: layout does not map to token boundaries - keeping vanilla\n");
+                    } else {
+                        task.tokens  = server_tokens(toks, false);
+                        task.params.da_chunks = std::move(chunks);
+                        task.params.da_filler = filler;
+                        task.params.da_b      = params.kv_unified;
+                        SRV_INF("da_auto: %zu chunk(s) from %zu source message(s), %zu token(s) - %s path\n",
+                                task.params.da_chunks.size(), layout.n_source_msgs,
+                                task.tokens.get_tokens().size(),
+                                task.params.da_b ? "B" : "A");
+                    }
+                }
+            }
 
             task.params.message_spans = task.tokens.find_message_spans(delimiters);
 

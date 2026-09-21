@@ -94,6 +94,11 @@ struct task_params {
     // Filler segment range [lo, hi), removed together with the non-kept
     // chunks. {-1, -1} when the layout has no filler.
     std::pair<int32_t, int32_t> da_filler = { -1, -1 };
+    // First chunk number of the scanned layout block (the FocusMemory hook
+    // numbers chunks monotonically per session, so a later turn's block may
+    // start at k > 1). The tag state machine maps magic_chunks="N" to
+    // da_chunks[N - da_chunk_base]. 1 for single-block prompts.
+    int32_t da_chunk_base = 1;
 
     int64_t t_max_prompt_ms  = -1; // TODO: implement
     int64_t t_max_predict_ms = -1; // if positive, limit the generation phase to this time limit

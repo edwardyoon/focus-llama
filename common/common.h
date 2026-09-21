@@ -631,6 +631,12 @@ struct common_params {
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
 
+    // Declarative Attention (DA) server options
+    bool    da_prompt_scan      = false; // scan the rendered prompt for <da:N>/<da:filler>/<da:layout:N> layout markers
+    bool    da_auto             = false; // auto-chunk long marker-less prompts by message boundaries
+    int32_t da_min_ctx          = 0;     // da_auto: only chunk when the prompt is at least this many tokens
+    int32_t da_chunk_tokens     = 2048;  // da_auto: target size (tokens) of a split long message
+
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT
     std::string api_prefix    = "";                                                                         // NOLINT

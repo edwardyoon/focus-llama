@@ -101,6 +101,12 @@ json server_slot_stats::to_json() const {
         base["draft_n_accepted"] = n_draft_accepted;
     }
 
+    if (n_da_restricted_steps > 0) {
+        base["da_n_restricted_steps"] = n_da_restricted_steps;
+        base["da_n_attended_tokens"]  = n_da_attended_tokens;
+        base["da_path"]               = da_removed_a ? "A" : "B";
+    }
+
     return base;
 }
 

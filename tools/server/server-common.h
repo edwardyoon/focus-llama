@@ -362,6 +362,14 @@ struct server_slot_stats {
     uint64_t n_draft_accepted    = 0;
     uint64_t n_draft_verif_steps = 0;
 
+    // DA (Declarative Attention) instrumentation - logical attended tokens,
+    // not measured bytes: decode steps that ran with a restricted read set
+    // and the sum of those logical read sets. da_removed_a distinguishes the
+    // A path (seq_rm holes) from the B path (second sequence).
+    uint64_t n_da_restricted_steps = 0;
+    uint64_t n_da_attended_tokens  = 0;
+    bool     da_removed_a          = false;
+
     // these are absolute timestamps (in us)
     // note: must be signed - they are subtracted before the later ones are set
     int64_t t_start       = 0;

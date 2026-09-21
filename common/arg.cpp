@@ -1718,6 +1718,36 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--da-prompt-scan"},
+        {"--no-da-prompt-scan"},
+        "scan the rendered prompt for Declarative Attention layout markers (<da:N>, <da:filler>, <da:layout:N>) and let the model's <focus magic_chunks=\"N\"> tags restrict attention (default: disabled, fail-open to vanilla on any mismatch)",
+        [](common_params & params, bool value) {
+            params.da_prompt_scan = value;
+        }
+    ).set_env("LLAMA_ARG_DA_PROMPT_SCAN").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        {"--da-auto"},
+        {"--no-da-auto"},
+        "Declarative Attention auto-chunking: when the rendered prompt has no layout markers and is at least --da-min-ctx tokens, chunk it by message boundaries (\"Magic Chunk N\" labels) so the model's <focus magic_chunks=\"N\"> tags can restrict attention (default: disabled)",
+        [](common_params & params, bool value) {
+            params.da_auto = value;
+        }
+    ).set_env("LLAMA_ARG_DA_AUTO").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        {"--da-min-ctx"}, "N",
+        "da_auto: minimum prompt length (tokens) before auto-chunking kicks in (default: 0)",
+        [](common_params & params, int value) {
+            params.da_min_ctx = value;
+        }
+    ).set_env("LLAMA_ARG_DA_MIN_CTX").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        {"--da-chunk-tokens"}, "N",
+        "da_auto: target size (tokens) when splitting a long message into chunks (default: 2048)",
+        [](common_params & params, int value) {
+            params.da_chunk_tokens = value;
+        }
+    ).set_env("LLAMA_ARG_DA_CHUNK_TOKENS").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",
