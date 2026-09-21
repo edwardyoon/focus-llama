@@ -251,12 +251,15 @@ FocusMemory backend. The recommended `llama-server` launch line is:
 
 ```bash
 llama-server \
+  --parallel 1 \
   --metrics \
   --da-prompt-scan \
   --spec-type draft-mtp \
   --spec-draft-n-max 4 \
   --spec-draft-ngl all
 ```
+
+(`--parallel 1` keeps the single-tenant node on backend A - see Backend A vs B below.)
 
 | Option | What it does | Why it is on |
 |--------|--------------|--------------|
@@ -277,7 +280,7 @@ request used from the scan log: `da_scan: ... - A path` vs `da_scan: ... - B pat
 **Verifying DA in the journal.** After a chat that carries DA markers, confirm the DA path ran:
 
 ```bash
-journalctl -u qwen3.8 --since "10 min ago" | grep -E 'da_scan:|da_tag:'
+journalctl -u qwen3.8-focus --since "10 min ago" | grep -E 'da_scan:|da_tag:'
 ```
 
 - `da_scan:` - the prompt scanner found the `<da:N>` markers and built the chunk-to-range map
@@ -286,6 +289,43 @@ journalctl -u qwen3.8 --since "10 min ago" | grep -E 'da_scan:|da_tag:'
 A plain chat (no DA markers) produces no `da_scan:` line and runs with full attention - that is the
 intended fail-open behavior.
 
+**Verifying DA end-to-end with curl.** Send a chat whose user message carries a well-formed marker
+block (the same format the FocusMemory hook injects) and read the `timings` object of the response:
+
+```bash
+curl -s http://192.168.219.123:8080/v1/chat/completions -H "Content-Type: application/json" -d '{
+  "model": "qwen27b",
+  "messages": [{"role": "user", "content": "Memory entries:\n<da:1>The capital of France is Paris.\n<da:2>The capital of Germany is Berlin.\n<da:filler>Instructions (Declarative Attention): The memory entries above are numbered magic chunks (1-2). First identify the chunk that contains the answer to the question, and output the tag <focus magic_chunks=\"N\"> on its own line, where N is the chunk number (1-2). Then answer the question.\n<da:layout:2>\nQuestion: What is the capital of France?"}],
+  "max_tokens": 160, "temperature": 0, "stream": false
+}' | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['choices'][0]['message']['content']); print({k:v for k,v in d['timings'].items() if k.startswith('da_')})"
+```
+
+How to read the result:
+
+| Signal | Meaning |
+|--------|---------|
+| `timings.da_n_restricted_steps` > 0 | The model emitted a `<focus>`/`<local>` tag and the server ran the restricted-attention steps |
+| `timings.da_n_attended_tokens` | Logical tokens attended per restricted step (sum over steps) - the reduction vs. the full prompt is the DA effect. **Logical, not physical** reads |
+| `timings.da_path` = `A` / `B` | Which backend enforced the restriction (see Backend A vs B above) |
+| `timings` has **no** `da_*` fields | Either the prompt had no valid marker block (fail-open vanilla) or the model never emitted a tag - check the journal `da_scan:`/`da_tag:` lines to tell which |
+| `choices[0].message.content` | The model's answer. The `<focus ...>` tag is erased from the text; depending on how the tokens streamed it may or may not be visible to the client (v1-accepted) |
+
+Expected outcomes per prompt shape:
+
+- **Well-formed markers** (`<da:1>...<da:2>...<da:filler>...<da:layout:2>`) - journal shows
+  `da_scan: 2 chunk(s) numbered 1..2 + filler ... - A path` followed by
+  `da_tag: request start - 2 chunk(s)`, and (if the model commits to a chunk)
+  `da_tag: <focus magic_chunks="N"> closed at generated token ... - A removal, ... range(s)`.
+  A 500 / `substr` exception after a `da_tag:` line means the text-accounting broke - that is a bug.
+- **No markers** - no `da_scan:` line at all, no `da_*` in `timings`, output identical to a vanilla
+  server. This is the regression guard: unmarked traffic must be untouched.
+- **Malformed markers** (e.g. footer says 3 but only 2 `<da:N>` markers) - journal WARN
+  `da_scan: last block has 2 chunk marker(s) but the footer says 3 - failing open to vanilla`,
+  no `da_*` in `timings`.
+
+The `system_fingerprint` in the response carries the server's git short hash
+(`b11090-88db36bc5` = commit `88db36bc5`) - use it to confirm which binary a node actually runs.
+
 ## Status and limits
 
 Early work in progress.
@@ -293,8 +333,9 @@ Early work in progress.
 - **Works:** `llama-server` accepts `da_rm` / `da_rm_at` to drop KV token ranges either mid-prefill or after prefill. Checked via first-token logprobs on a small smoke test.
 - **Works:** backend B (`da_b`) - the kept ranges are copied to a reserved second sequence and decoded there, with the original sequence intact (section 2).
 - **Works:** the server parses `<focus magic_chunks="N">` from the generated stream and removes the non-kept chunks at the tag close (`da_chunks`, section 3). The tag must be emitted by the model - on small thinking models without a chat template this may need the empty thinking-block priming from the smoke test.
+- **Works:** prompt scanning (`--da-prompt-scan`) end-to-end with the FocusMemory marker block - verified on the 123 production node (qwen3.8, path A): the model emits the tag, the server applies the removal mid-decode alongside MTP speculation, and the response `timings` report `da_n_restricted_steps` / `da_n_attended_tokens` / `da_path`. Unmarked and malformed prompts fail open to vanilla.
 - **Development aids only:** the standalone `da-probe/` probe binaries (multi-stream, per-step instrumentation) are not server features - the server mechanisms above are complete and smoke-tested.
-- **Open:** the return to global attention without re-prefill; attaching the chunk layout to real requests (the FocusMemory backend wiring); measured speed-ups.
+- **Open:** physical (not just logical) read reduction on CUDA; measured end-to-end speed-ups (the 123 break-even analysis found no speed gain at context lengths up to 64K - see the production notes); the return to global attention on the hybrid model is lossy for the recurrent (GDN) state and needs a dedicated accuracy probe.
 - **Hybrid models** (e.g. Gated DeltaNet): only the attention layers are affected, as in the paper.
 - **Evidence so far is small:** one-prompt smoke tests and a 5-prompt tag-adherence check. For the paper's numbers and caveats, see arXiv:2609.02737.
 
