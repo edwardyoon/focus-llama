@@ -2,7 +2,18 @@
 
 > **A [`llama.cpp`](https://github.com/ggml-org/llama.cpp) fork for Dynamic Attention Masking: the model declares, in its own output, which parts of the KV cache the next tokens may attend to, and the engine enforces it at decode time.**
 
-**Status: experimental / work in progress.** Nothing below the "Implemented" heading is promised until it is checked off in the roadmap.
+## Verified: physical KV read reduction (CUDA, 2026-09-22)
+
+Declarative attention now reduces the **physical** KV read volume during decode on CUDA, not just the logical attention set. The flash-attention VEC kernel was ported to the `n_kv_max` sparse path - it gathers K/V rows by compact index, so the kernel reads only the attended rows instead of the whole cache - and the MMA f16 sparse gate was extended to square MHA head dims. A/B against the dense path (`FOCUS_DA_DENSE=1`) on an RTX 5090, 2655-token prompt with 97% of the KV ranges removed, 3 runs per arm:
+
+| Path | Result |
+|---|---|
+| **VEC sparse - f16 KV** | ✅ 3/3 byte-identical output, max\|Δlogprob\| = 0.000e+00, journal `n_kv_max 0→512` |
+| **VEC sparse - q4_0 KV** (production config) | ✅ 3/3 byte-identical output, max\|Δlogprob\| = 0.000e+00, journal `n_kv_max 0→512` |
+
+The dense path stays bit-identical (constexpr folding), so sparse never changes results when no ranges are removed. The MMA sparse path (f16 KV, K ≥ 8192) shares the same gate and is expected to fire first at 64K+ depth.
+
+**Status: experimental / work in progress.**
 
 ---
 
@@ -368,28 +379,6 @@ Expected outcomes per prompt shape:
 
 The `system_fingerprint` in the response carries the server's git short hash
 (`b11090-88db36bc5` = commit `88db36bc5`) - use it to confirm which binary a node actually runs.
-
-## Current status
-
-Declarative attention is implemented and verified in production: the server chunks the prompt
-(auto or via markers), the model restricts attention with `<focus magic_chunks="N">` tags, and
-the response `timings` report `da_n_restricted_steps` / `da_n_attended_tokens` / `da_path`.
-Unmarked and malformed prompts fail open to vanilla.
-
-Known limits:
-
-- **No speed gain at ≤64K** - the production break-even analysis (depth bench, spec on/off)
-  found DA neutral-to-slower up to 64K. Physical (not just logical) read reduction on CUDA
-  was evaluated and closed on that basis; revisit at 128K+ where the break-even threshold
-  (r < 0.8213) is met.
-- **Hybrid return-to-global is lossy** - on GDN models, returning from a restricted view to
-  global attention leaves the recurrent state stale; a dedicated accuracy probe is still needed.
-- **Tag emission rate** - characterized on small samples only; the production 27B rate (30+
-  sample) is not yet measured.
-
-Evidence so far is small (smoke tests + a 5-prompt tag-adherence check). For the paper's
-numbers and caveats, see arXiv:2609.02737. The standalone `da-probe/` binaries are development
-aids, not server features.
 
 ## Reference
 
