@@ -1748,6 +1748,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_DA_CHUNK_TOKENS").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
+        {"--da-measure-only"},
+        {"--no-da-measure-only"},
+        "Declarative Attention measure-only mode: run the DA tag state machine and logging but skip all KV removals (apply_da_rm/apply_da_b), so the output stays vanilla. Used to measure the tag position (g) and emission rate on real traffic without touching the KV cache (default: disabled)",
+        [](common_params & params, bool value) {
+            params.da_measure_only = value;
+        }
+    ).set_env("LLAMA_ARG_DA_MEASURE_ONLY").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",

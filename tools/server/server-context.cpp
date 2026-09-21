@@ -352,6 +352,16 @@ struct server_slot {
     // A holes are baked into the cached sequence (clear), a B slot that
     // returned to the original sequence mid-decode keeps its cache.
     bool da_removed_a = false;
+    // Phase 0 (measure-only): server-level flag copied at slot init. When set,
+    // apply_da_rm/apply_da_b skip the KV mutation (output stays vanilla) so the
+    // tag state machine + logging can measure g (tag position) and emission
+    // rate on real traffic without touching the KV cache.
+    bool da_measure_only = false;
+    // Phase 0: generated-token index at which the first <focus>/<local> tag
+    // closed (-1 = no restriction tag emitted yet). release() logs it together
+    // with the total n_gen to give g = first_tag / total (the global-step
+    // share before the first attention restriction).
+    int32_t da_first_tag_gen = -1;
     // P5 instrumentation (logical attended tokens, not measured bytes):
     // n_da_removed is the A-path removed-token count (read set = n_full -
     // n_da_removed). The per-step counters live in stats (server_slot_stats)
@@ -480,6 +490,7 @@ struct server_slot {
         da_applied       = false;
         da_removed_a     = false;
         n_da_removed     = 0;
+        da_first_tag_gen = -1;
 
         llama_set_sampler(ctx_tgt, id, nullptr);
 
@@ -676,6 +687,18 @@ struct server_slot {
                         (unsigned long) stats.n_da_restricted_steps,
                         (unsigned long) stats.n_da_attended_tokens,
                         (unsigned long) n_full_steps, reduction);
+            }
+
+            // Phase 0 (measure-only): report the tag-position distribution
+            // (g) on real traffic. g = first_tag / total is the global-step
+            // share before the first attention restriction; the break-even
+            // gate uses (1+d)*(g + (1-g)*r). Only logged in measure-only mode
+            // (the production path keeps its current summary).
+            if (da_measure_only && da_first_tag_gen >= 0) {
+                const double total = (double) stats.n_gen;
+                const double g     = total > 0 ? (double) da_first_tag_gen / total : 0.0;
+                SLT_INF(*this, "da_measure: first <focus>/<local> tag at generated token %d of %lu - g=%.4f (global-step share before restriction)\n",
+                        da_first_tag_gen, (unsigned long) stats.n_gen, g);
             }
 
             t_last_used = ggml_time_us();
@@ -1486,6 +1509,7 @@ private:
             slot.mem.init(ctx_tgt, ctx_dft);
             slot.spec    = spec.get();
             slot.n_ctx   = n_ctx_slot();
+            slot.da_measure_only = params_base.da_measure_only;
 
             slot.mctx                   = mctx;
             slot.prompt.tokens.has_mtmd = mctx != nullptr;
@@ -4161,6 +4185,12 @@ private:
             return;
         }
 
+        if (slot.da_measure_only) {
+            SLT_INF(slot, "da_rm: SKIPPED (measure-only) - %zu range(s) not applied to KV (%s); output stays vanilla\n",
+                    ranges.size(), when);
+            return;
+        }
+
         const int32_t n_prompt = slot.task->n_tokens();
 
         SLT_INF(slot, "da_rm: applying %zu range(s) (%s) - bound=%d, n_prompt=%d\n",
@@ -4257,6 +4287,12 @@ private:
     // the switch stays position-contiguous.
     void apply_da_b(server_slot & slot, const std::vector<std::pair<int32_t, int32_t>> & ranges, int32_t bound, const char * when) {
         if (ranges.empty()) {
+            return;
+        }
+
+        if (slot.da_measure_only) {
+            SLT_INF(slot, "da_b: SKIPPED (measure-only) - %zu range(s) not applied to KV (%s); da_seq stays -1, output stays vanilla\n",
+                    ranges.size(), when);
             return;
         }
 
@@ -4549,6 +4585,16 @@ private:
                         : tag.start;
             }
             slot.da_tag_scan_pos = tag.start;
+
+            // Phase 0 (g measurement): remember where the first restriction
+            // tag (<focus>/<local>) closed. release() combines this with the
+            // total n_gen to report g = first_tag / total, the global-step
+            // share before the attention restriction kicked in. The return
+            // tags (</focus>/</local>, type 2/3) do not start the restricted
+            // phase, so they are not recorded here.
+            if ((tag.type == 0 || tag.type == 1) && slot.da_first_tag_gen < 0) {
+                slot.da_first_tag_gen = (int32_t) slot.stats.n_gen;
+            }
 
             switch (tag.type) {
                 case 0: { // <focus magic_chunks="N"> (or "1,3") : enter/switch FOCUS

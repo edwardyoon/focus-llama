@@ -636,6 +636,7 @@ struct common_params {
     bool    da_auto             = false; // auto-chunk long marker-less prompts by message boundaries
     int32_t da_min_ctx          = 0;     // da_auto: only chunk when the prompt is at least this many tokens
     int32_t da_chunk_tokens     = 2048;  // da_auto: target size (tokens) of a split long message
+    bool    da_measure_only     = false; // run the DA tag state machine + logging but skip all KV removals (apply_da_rm/apply_da_b) - output stays vanilla, for measuring g (tag position) and emission rate without touching the KV
 
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT
