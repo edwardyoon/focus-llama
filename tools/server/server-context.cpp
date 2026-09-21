@@ -5414,11 +5414,23 @@ static bool da_scan_prompt(
         p = end;
     }
 
-    // Multi-turn: the FocusMemory hook numbers chunks monotonically per
-    // session, so earlier turns' blocks (their own markers + footers) remain
-    // in the prompt history. Only the last block (the current turn's, at the
-    // prompt tail) is authoritative; everything before the previous footer is
-    // inert history.
+    // Multi-turn + conversation-text safety: the FocusMemory hook numbers
+    // chunks monotonically per session, so earlier turns' blocks (their own
+    // markers + footers) remain in the prompt history. The current block is
+    // the LAST footer whose block - the markers between the previous footer
+    // and this footer - validates.
+    //
+    // Why not simply "the last footer": the prompt is a rendered
+    // conversation, and code comments, plan docs and the model's own
+    // discussion can contain literal marker text (e.g. a "<da:layout:N>"
+    // template, where atoi("N") == 0, or a quoted example block). Such junk
+    // footers regularly end up last, and the "last footer" rule then either
+    // fails open on every request or - worse - accepts a junk block that
+    // looks valid. Validation therefore requires a signature: the hook's
+    // filler content is a fixed instruction that names the block's exact
+    // chunk range (see buildDaBlock in FocusMemory/index.js - keep the two
+    // in sync). Conversation text cannot reproduce it with a matching
+    // range, so a junk footer never wins.
     std::vector<const marker_t *> footers;
     for (const auto & m : markers) {
         if (m.kind == 2) {
@@ -5428,61 +5440,99 @@ static bool da_scan_prompt(
     if (footers.empty()) {
         return false;  // no layout footer - a normal request
     }
-    const size_t block_start = footers.size() >= 2 ? footers[footers.size() - 2]->end : 0;
 
-    std::vector<marker_t> block;  // last block's markers, in order
-    const marker_t * filler = nullptr;
-    for (const auto & m : markers) {
-        if (m.start < block_start) {
+    std::vector<marker_t> block;  // accepted block's markers (incl. the footer)
+    int32_t base = -1;
+    bool accepted = false;
+
+    for (int fi = (int) footers.size() - 1; fi >= 0 && !accepted; --fi) {
+        const marker_t * footer  = footers[fi];
+        const size_t win_start   = fi >= 1 ? footers[fi - 1]->end : 0;
+
+        std::vector<marker_t> cand;
+        const marker_t * filler = nullptr;
+        bool multi_filler      = false;
+        for (const auto & m : markers) {
+            if (m.start < win_start || m.start >= footer->start) {
+                continue;
+            }
+            if (m.kind == 1) {
+                if (filler != nullptr) {
+                    multi_filler = true;
+                } else {
+                    filler = &m;
+                }
+            }
+            cand.push_back(m);
+        }
+        if (multi_filler) {
             continue;
         }
-        if (m.kind == 1) {
-            if (filler != nullptr) {
-                SRV_WRN("%s", "da_scan: multiple <da:filler> markers in the last block - failing open to vanilla\n");
-                return false;
-            }
-            filler = &m;
-        }
-        block.push_back(m);
-    }
 
-    const size_t n_chunks = std::count_if(block.begin(), block.end(),
-            [](const marker_t & m) { return m.kind == 0; });
-    const marker_t * footer = footers.back();
-    if (n_chunks == 0 || footer->num != (int32_t) n_chunks) {
-        SRV_WRN("da_scan: last block has %zu chunk marker(s) but the footer says %d - failing open to vanilla\n",
-                n_chunks, footer->num);
-        return false;
-    }
-    // block holds copies of the markers, so compare by the marker's unique
-    // char offset, not by address (footer points into the markers vector).
-    if (block.back().start != footer->start) {
-        SRV_WRN("%s", "da_scan: <da:layout:N> is not the last marker - failing open to vanilla\n");
-        return false;
-    }
-    // chunk markers must be consecutive (k, k+1, ...); the session counter
-    // lets the block start at k > 1
-    int32_t chunk_ordinal = 0;
-    int32_t base = -1;
-    for (const auto & m : block) {
-        if (m.kind == 0) {
-            if (base < 0) {
-                base = m.num;
-                if (base < 1) {
-                    SRV_WRN("da_scan: first chunk marker number %d < 1 - failing open to vanilla\n", base);
-                    return false;
+        const size_t n_chunks = std::count_if(cand.begin(), cand.end(),
+                [](const marker_t & m) { return m.kind == 0; });
+        if (n_chunks == 0 || footer->num != (int32_t) n_chunks) {
+            continue;  // junk footer (e.g. a "<da:layout:N>" template, atoi -> 0)
+        }
+
+        // chunk markers must be consecutive (k, k+1, ...); the session
+        // counter lets the block start at k > 1; the filler must follow
+        // all chunks
+        int32_t chunk_ordinal = 0;
+        int32_t cand_base     = -1;
+        bool ok = true;
+        for (const auto & m : cand) {
+            if (m.kind != 0) {
+                continue;
+            }
+            if (cand_base < 0) {
+                cand_base = m.num;
+                if (cand_base < 1) {
+                    ok = false;
+                    break;
                 }
             }
             chunk_ordinal++;
-            if (m.num != base + (chunk_ordinal - 1)) {
-                SRV_WRN("da_scan: chunk markers are not consecutive from %d - failing open to vanilla\n", base);
-                return false;
+            if (m.num != cand_base + (chunk_ordinal - 1)) {
+                ok = false;
+                break;
             }
             if (filler != nullptr && filler->start < m.start) {
-                SRV_WRN("%s", "da_scan: <da:filler> precedes a chunk marker - failing open to vanilla\n");
-                return false;
+                ok = false;
+                break;
             }
         }
+        if (!ok || filler == nullptr) {
+            continue;
+        }
+
+        // filler signature: the hook's fixed instruction names this block's
+        // exact chunk range. Two substrings that bracket the <focus ...>
+        // tag (whose escaping may vary in the rendered prompt).
+        const std::string filler_text = text.substr(filler->end, footer->start - filler->end);
+        char sig[160];
+        snprintf(sig, sizeof(sig),
+                 "Instructions (Declarative Attention): The memory entries above are numbered magic chunks (%d-%d). First identify",
+                 cand_base, cand_base + (int) n_chunks - 1);
+        if (filler_text.find(sig) == std::string::npos) {
+            continue;
+        }
+        snprintf(sig, sizeof(sig),
+                 "on its own line, where N is the chunk number (%d-%d). Then answer the question.",
+                 cand_base, cand_base + (int) n_chunks - 1);
+        if (filler_text.find(sig) == std::string::npos) {
+            continue;
+        }
+
+        cand.push_back(*footer);  // footer as the final range boundary
+        block = std::move(cand);
+        base  = cand_base;
+        accepted = true;
+    }
+
+    if (!accepted) {
+        SRV_DBG("%s", "da_scan: layout footer(s) present but no block matches the hook signature - failing open to vanilla\n");
+        return false;
     }
 
     // lenient char->token mapping (as in da_auto, P4): the strict round trip
