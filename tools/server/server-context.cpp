@@ -5305,44 +5305,18 @@ void server_context::set_state_callback(server_state_callback_t callback) {
 // and fills the task params (da_chunks, da_filler, da_b).
 //
 // Fail-open: no markers (a normal request) or any mismatch leaves the
-// request vanilla. The char->token mapping is strict (no drift): the token
-// pieces must concatenate exactly to the prompt string, and every marker
-// boundary must land exactly on a token boundary.
+// request vanilla. The char->token mapping is lenient (as in da_auto): the
+// round trip may drift by up to 1%, and even an exact round trip can leave a
+// marker start mid-token (the BPE merges the preceding char into it, e.g.
+// " [["), so marker boundaries map to the nearest token boundary.
 
-// Strict char->token offsets: offsets[i] = char offset of token i (and
-// offsets[n] = text length). Returns {} when the pieces do not concatenate
-// exactly to the text (tokenization drift - the caller fails open).
-static std::vector<size_t> da_token_offsets(const llama_vocab * vocab, const std::string & text, const llama_tokens & tokens) {
-    std::vector<size_t> offsets(tokens.size() + 1);
-    offsets[0] = 0;
-    std::string concat;
-    concat.reserve(text.size());
-    for (size_t i = 0; i < tokens.size(); i++) {
-        concat += common_token_to_piece(vocab, tokens[i], true);
-        offsets[i + 1] = concat.size();
-    }
-    if (concat != text) {
-        return {};
-    }
-    return offsets;
-}
-
-// map a char offset to the token starting there; -1 when the offset is not
-// exactly on a token boundary
-static int32_t da_char_to_token(const std::vector<size_t> & offsets, size_t c) {
-    const auto it = std::lower_bound(offsets.begin(), offsets.end(), c);
-    if (it == offsets.end() || *it != c) {
-        return -1;
-    }
-    return (int32_t) (it - offsets.begin());
-}
-
-// Lenient round-trip for da_auto (P4). The strict da_token_offsets requires
-// detokenize(tokenize(text)) to equal text exactly, which large rendered
-// prompts (50K+ tokens with repeated filler) do not guarantee: the tokenizer
-// drifts a few chars per repeated unit, so the round-trip is off and the
-// strict walk fails open. Here we tolerate bounded drift (<=1% of the text
-// length) and still return the (monotonic) offsets; larger drift fails open.
+// Lenient char->token round-trip (P4, da_auto; also used by da_scan):
+// offsets[i] = char offset of token i in the detokenized concat (and
+// offsets[n] = concat length). The strict round trip
+// (detokenize(tokenize(text)) == text) is not guaranteed for large rendered
+// prompts, so drift of up to 1% of the text length is tolerated and the
+// (monotonic) offsets are returned anyway; larger drift returns {} and the
+// caller fails open.
 static std::vector<size_t> da_token_offsets_lenient(const llama_vocab * vocab, const std::string & text, const llama_tokens & tokens) {
     std::vector<size_t> offsets(tokens.size() + 1);
     offsets[0] = 0;
@@ -5511,11 +5485,14 @@ static bool da_scan_prompt(
         }
     }
 
-    // strict char->token mapping: pieces must concatenate exactly to the
-    // prompt, and every marker boundary must land on a token boundary
-    const std::vector<size_t> offsets = da_token_offsets(vocab, text, tokens);
+    // lenient char->token mapping (as in da_auto, P4): the strict round trip
+    // fails on large rendered prompts, and even when it matches the BPE may
+    // merge the preceding char into a marker (" [["), leaving the marker
+    // start mid-token. Nearest-boundary mapping tolerates both, at the cost
+    // of a shift of at most a token or two at each chunk boundary.
+    const std::vector<size_t> offsets = da_token_offsets_lenient(vocab, text, tokens);
     if (offsets.empty()) {
-        SRV_WRN("da_scan: token pieces do not reconstruct the prompt exactly (%zu tokens) - failing open to vanilla\n",
+        SRV_WRN("da_scan: token round-trip drift exceeds 1%% (%zu tokens) - failing open to vanilla\n",
                 tokens.size());
         return false;
     }
@@ -5530,10 +5507,10 @@ static bool da_scan_prompt(
             SRV_WRN("da_scan: marker %zu has no following boundary - failing open to vanilla\n", i);
             return false;
         }
-        const int32_t lo = da_char_to_token(offsets, block[i].start);
-        const int32_t hi = da_char_to_token(offsets, block[i + 1].start);
+        const int32_t lo = da_char_to_token_nearest(offsets, block[i].start);
+        const int32_t hi = da_char_to_token_nearest(offsets, block[i + 1].start);
         if (lo < 0 || hi < 0 || hi <= lo) {
-            SRV_WRN("da_scan: marker %zu boundaries are not on token boundaries (lo=%d, hi=%d) - failing open to vanilla\n",
+            SRV_WRN("da_scan: marker %zu boundaries collapse to the same token (lo=%d, hi=%d) - failing open to vanilla\n",
                     i, lo, hi);
             return false;
         }
