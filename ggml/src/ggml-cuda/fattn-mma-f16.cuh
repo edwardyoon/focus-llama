@@ -1759,8 +1759,19 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
 
 static constexpr __host__ __device__ bool ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(
         const int DKQ, const int DV, const int ncols1, const int ncols2) {
-    return (DKQ == 512 && DV == 512 && ncols1 == 1 && ncols2 == 8) ||
-           (DKQ == 576 && DV == 512 && ncols1 == 1 && ncols2 == 16);
+    // the sparse kernel gathers the compact KV rows per query-row block (jt*ncols1), so
+    // every row of a block shares the first row's index list; with causal masks the finite
+    // set grows per row, which is only consistent when a block holds a single query row
+    if (ncols1 != 1) {
+        return false;
+    }
+    if ((DKQ == 512 && DV == 512 && ncols2 == 8) ||
+        (DKQ == 576 && DV == 512 && ncols2 == 16)) {
+        return true; // MLA / DeepSeek
+    }
+    // standard MHA with square K/V head dims (Qwen, Llama, ...): the gather path is
+    // shape-generic, ncols1 == 1 above guarantees per-row index correctness
+    return DKQ == DV && (DKQ == 64 || DKQ == 80 || DKQ == 96 || DKQ == 112 || DKQ == 128 || DKQ == 256);
 }
 
 template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, bool V_is_K_view, bool use_sparse>
