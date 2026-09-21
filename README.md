@@ -266,7 +266,7 @@ independently usable.
 
 ## Production launch (recommended options)
 
-The 123 node runs the DA inference service - qwen3.8, multimodal - behind the
+The production node runs the DA inference service - qwen3.8, multimodal - behind the
 FocusMemory backend. The recommended `llama-server` launch line is:
 
 ```bash
@@ -288,7 +288,7 @@ llama-server \
 |--------|--------------|--------------|
 | `--metrics` | Exposes Prometheus metrics on the server port | Observability for a long-running service |
 | `--da-prompt-scan` | **Prompt scanning** (marker path): on each request the prompt is scanned for `<da:N>` chunk markers and their token ranges are pre-computed, so DA tags / static `da_rm` ranges resolve to real KV positions | Lets a client (e.g. the FocusMemory hook) declare the exact chunk layout it assembled. A prompt with no markers runs with full attention (fail-open) |
-| `--da-auto` | **Auto-chunking** (server path): when a request carries no valid marker block and its prompt is at least `--da-min-ctx` tokens, the server splits the rendered chat prompt itself into magic chunks at message boundaries, inserts `[Magic Chunk N]` headers, appends the DA instruction, re-tokenizes, and maps the layout to token ranges. The client needs to send nothing extra | Makes DA work with **any** OpenAI-compatible client (qwen-code, curl, other agents) - no hook, no markers, no `da_*` request fields. The savings target is the whole history/tool output, not just a client-injected index. Verified on 123: 85-93 chunks from 68-74 messages (88K-98K tokens), 0 fail-opens |
+| `--da-auto` | **Auto-chunking** (server path): when a request carries no valid marker block and its prompt is at least `--da-min-ctx` tokens, the server splits the rendered chat prompt itself into magic chunks at message boundaries, inserts `[Magic Chunk N]` headers, appends the DA instruction, re-tokenizes, and maps the layout to token ranges. The client needs to send nothing extra | Makes DA work with **any** OpenAI-compatible client (qwen-code, curl, other agents) - no hook, no markers, no `da_*` request fields. The savings target is the whole history/tool output, not just a client-injected index. Verified in production: 85-93 chunks from 68-74 messages (88K-98K tokens), 0 fail-opens |
 | `--da-min-ctx 4096` | Auto-chunking threshold: prompts shorter than this many tokens run vanilla | Short prompts have little to save; chunking a 2K prompt would only add headers and instruction for no benefit. 4096 matches the node's typical conversation length |
 | `--da-chunk-tokens 2048` | Target size of one magic chunk (tokens) in auto-chunking | The paper's segmenter target (~2K tokens). Long messages are split paragraph → line → sentence until they fit; chunk ids are index-based so they stay stable as history grows |
 | `--spec-type draft-mtp` | **Speculative decoding** with the model's MTP draft head | Speed-up on top of DA. Since P6, spec and DA **coexist**: while a slot is in DA mode (`da_seq` active) spec is paused automatically and resumes on the return to global attention - so spec stays ON without breaking DA |
@@ -373,11 +373,11 @@ Early work in progress.
 - **Works:** `llama-server` accepts `da_rm` / `da_rm_at` to drop KV token ranges either mid-prefill or after prefill. Checked via first-token logprobs on a small smoke test.
 - **Works:** backend B (`da_b`) - the kept ranges are copied to a reserved second sequence and decoded there, with the original sequence intact (section 2).
 - **Works:** the server parses `<focus magic_chunks="N">` from the generated stream and removes the non-kept chunks at the tag close (`da_chunks`, section 3). The tag must be emitted by the model - on small thinking models without a chat template this may need the empty thinking-block priming from the smoke test.
-- **Works:** prompt scanning (`--da-prompt-scan`) end-to-end with the FocusMemory marker block - verified on the 123 production node (qwen3.8, path A): the model emits the tag, the server applies the removal mid-decode alongside MTP speculation, and the response `timings` report `da_n_restricted_steps` / `da_n_attended_tokens` / `da_path`. Unmarked and malformed prompts fail open to vanilla.
-- **Works:** auto-chunking (`--da-auto`) end-to-end on the 123 production node (qwen3.8, path A) with plain `/v1/chat/completions` traffic - no markers, no `da_*` fields: 85-93 chunks from 68-74 messages (88K-98K tokens), 0 fail-opens across 4 consecutive requests.
+- **Works:** prompt scanning (`--da-prompt-scan`) end-to-end with the FocusMemory marker block - verified on the production node (qwen3.8, path A): the model emits the tag, the server applies the removal mid-decode alongside MTP speculation, and the response `timings` report `da_n_restricted_steps` / `da_n_attended_tokens` / `da_path`. Unmarked and malformed prompts fail open to vanilla.
+- **Works:** auto-chunking (`--da-auto`) end-to-end on the production node (qwen3.8, path A) with plain `/v1/chat/completions` traffic - no markers, no `da_*` fields: 85-93 chunks from 68-74 messages (88K-98K tokens), 0 fail-opens across 4 consecutive requests.
 - **Works:** thinking-model structured output - a JSON grammar that rejects the thinking generation prompt no longer 500s: the grammar is rebuilt without the prefill (fail-open) and the response is still grammar-constrained JSON.
 - **Development aids only:** the standalone `da-probe/` probe binaries (multi-stream, per-step instrumentation) are not server features - the server mechanisms above are complete and smoke-tested.
-- **Open:** physical (not just logical) read reduction on CUDA; measured end-to-end speed-ups (the 123 break-even analysis found no speed gain at context lengths up to 64K - see the production notes); the return to global attention on the hybrid model is lossy for the recurrent (GDN) state and needs a dedicated accuracy probe.
+- **Open:** physical (not just logical) read reduction on CUDA; measured end-to-end speed-ups (the production break-even analysis found no speed gain at context lengths up to 64K - see the production notes); the return to global attention on the hybrid model is lossy for the recurrent (GDN) state and needs a dedicated accuracy probe.
 - **Hybrid models** (e.g. Gated DeltaNet): only the attention layers are affected, as in the paper.
 - **Evidence so far is small:** one-prompt smoke tests and a 5-prompt tag-adherence check. For the paper's numbers and caveats, see arXiv:2609.02737.
 
