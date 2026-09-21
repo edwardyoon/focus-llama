@@ -366,20 +366,27 @@ Expected outcomes per prompt shape:
 The `system_fingerprint` in the response carries the server's git short hash
 (`b11090-88db36bc5` = commit `88db36bc5`) - use it to confirm which binary a node actually runs.
 
-## Status and limits
+## Current status
 
-Early work in progress.
+Declarative attention is implemented and verified in production: the server chunks the prompt
+(auto or via markers), the model restricts attention with `<focus magic_chunks="N">` tags, and
+the response `timings` report `da_n_restricted_steps` / `da_n_attended_tokens` / `da_path`.
+Unmarked and malformed prompts fail open to vanilla.
 
-- **Works:** `llama-server` accepts `da_rm` / `da_rm_at` to drop KV token ranges either mid-prefill or after prefill. Checked via first-token logprobs on a small smoke test.
-- **Works:** backend B (`da_b`) - the kept ranges are copied to a reserved second sequence and decoded there, with the original sequence intact (section 2).
-- **Works:** the server parses `<focus magic_chunks="N">` from the generated stream and removes the non-kept chunks at the tag close (`da_chunks`, section 3). The tag must be emitted by the model - on small thinking models without a chat template this may need the empty thinking-block priming from the smoke test.
-- **Works:** prompt scanning (`--da-prompt-scan`) end-to-end with the FocusMemory marker block - verified on the production node (qwen3.8, path A): the model emits the tag, the server applies the removal mid-decode alongside MTP speculation, and the response `timings` report `da_n_restricted_steps` / `da_n_attended_tokens` / `da_path`. Unmarked and malformed prompts fail open to vanilla.
-- **Works:** auto-chunking (`--da-auto`) end-to-end on the production node (qwen3.8, path A) with plain `/v1/chat/completions` traffic - no markers, no `da_*` fields: 85-93 chunks from 68-74 messages (88K-98K tokens), 0 fail-opens across 4 consecutive requests.
-- **Works:** thinking-model structured output - a JSON grammar that rejects the thinking generation prompt no longer 500s: the grammar is rebuilt without the prefill (fail-open) and the response is still grammar-constrained JSON.
-- **Development aids only:** the standalone `da-probe/` probe binaries (multi-stream, per-step instrumentation) are not server features - the server mechanisms above are complete and smoke-tested.
-- **Open:** physical (not just logical) read reduction on CUDA; measured end-to-end speed-ups (the production break-even analysis found no speed gain at context lengths up to 64K - see the production notes); the return to global attention on the hybrid model is lossy for the recurrent (GDN) state and needs a dedicated accuracy probe.
-- **Hybrid models** (e.g. Gated DeltaNet): only the attention layers are affected, as in the paper.
-- **Evidence so far is small:** one-prompt smoke tests and a 5-prompt tag-adherence check. For the paper's numbers and caveats, see arXiv:2609.02737.
+Known limits:
+
+- **No speed gain at ≤64K** - the production break-even analysis (depth bench, spec on/off)
+  found DA neutral-to-slower up to 64K. Physical (not just logical) read reduction on CUDA
+  was evaluated and closed on that basis; revisit at 128K+ where the break-even threshold
+  (r < 0.8213) is met.
+- **Hybrid return-to-global is lossy** - on GDN models, returning from a restricted view to
+  global attention leaves the recurrent state stale; a dedicated accuracy probe is still needed.
+- **Tag emission rate** - characterized on small samples only; the production 27B rate (30+
+  sample) is not yet measured.
+
+Evidence so far is small (smoke tests + a 5-prompt tag-adherence check). For the paper's
+numbers and caveats, see arXiv:2609.02737. The standalone `da-probe/` binaries are development
+aids, not server features.
 
 ## Reference
 
