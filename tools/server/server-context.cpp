@@ -2073,7 +2073,10 @@ private:
                 size_t da_hold = 0;
                 if (!slot.task->params.da_chunks.empty() &&
                         !llama_vocab_is_eog(vocab, result.tok)) {
-                    da_hold = da_tag_hold_len(slot.generated_text.substr(slot.n_sent_text));
+                    // clamp like the stop-word path above: a stop-word erase
+                    // can truncate generated_text past n_sent_text
+                    da_hold = da_tag_hold_len(slot.generated_text.substr(
+                            std::min(slot.n_sent_text, slot.generated_text.size())));
                 }
                 const size_t send_end = slot.generated_text.size() - da_hold;
                 result.text_to_send = slot.generated_text.substr(pos, send_end - pos);
@@ -4530,7 +4533,21 @@ private:
             // consume the tag: erase it from the user-visible text and
             // restart the scan where the tag began (nothing complete can sit
             // before it - the scanner returns the earliest tag)
-            slot.generated_text.erase(tag.start, tag.end - tag.start);
+            const size_t da_erased = tag.end - tag.start;
+            slot.generated_text.erase(tag.start, da_erased);
+            // The tag may already be counted in n_sent_text: the holdback
+            // only covers the exact opener prefix, so once the model writes
+            // the attribute (e.g. "1"), the tag characters leak into the
+            // sent text before the closing '>' completes the tag. Reconcile
+            // the pointer so the send path (substr(n_sent_text)) stays in
+            // range: fully sent - shift back by the tag length (the tag
+            // stays visible in the client's output, v1-accepted); partially
+            // sent - clamp to the tag start.
+            if (slot.n_sent_text > tag.start) {
+                slot.n_sent_text = (slot.n_sent_text >= tag.end)
+                        ? slot.n_sent_text - da_erased
+                        : tag.start;
+            }
             slot.da_tag_scan_pos = tag.start;
 
             switch (tag.type) {
