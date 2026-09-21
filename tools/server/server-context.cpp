@@ -5716,8 +5716,11 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             // appended a marker block to the rendered prompt; recover the
             // chunk layout so the tag state machine can drive the attention
             // restriction. String prompts only (the hook renders one string);
-            // fail-open: any mismatch leaves the request vanilla.
-            if (params.da_prompt_scan && prompt.is_string()) {
+            // fail-open: any mismatch leaves the request vanilla. Text-only:
+            // a multimodal (mtmd) prompt tokenizes into media placeholder
+            // tokens that do not map to the rendered string, and get_tokens()
+            // asserts on them - so skip DA entirely for mtmd requests.
+            if (params.da_prompt_scan && prompt.is_string() && !task.tokens.has_mtmd) {
                 da_scan_prompt(ctx_server.vocab, prompt.get<std::string>(),
                         task.tokens.get_tokens(), params.kv_unified, task.params);
             }
@@ -5726,7 +5729,8 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             // enough - split the rendered chat prompt into magic chunks
             // ourselves, re-tokenize, and map the layout to token ranges.
             // Any mapping failure leaves the original tokens untouched.
-            if (params.da_auto && prompt.is_string() && task.params.da_chunks.empty() &&
+            if (params.da_auto && prompt.is_string() && !task.tokens.has_mtmd &&
+                    task.params.da_chunks.empty() &&
                     (int32_t) task.tokens.get_tokens().size() >= params.da_min_ctx) {
                 const da_auto_layout layout =
                         da_auto_chunk(ctx_server.vocab, prompt.get<std::string>(), params.da_chunk_tokens);

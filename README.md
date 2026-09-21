@@ -244,6 +244,46 @@ speed-up. Measuring real speed is still open.
 
 The two fit together because FocusMemory **assembles the prompt from its own chunks** - so its backend already knows the token range of every chunk it inserted, which is exactly what `da_chunks` asks for (section 3). The integration is a client-side change only: the FocusMemory backend tokenizes the assembled prompt (e.g. via `/tokenize`), maps each chunk to its `[lo, hi)` range (plus the filler, if any), and attaches `da_chunks` / `da_filler` (and `da_b`) to the `/v1/completions` request. From then on the model's own `<focus magic_chunks="N">` tag decides which chunk the next tokens attend to, and the server enforces it. Until that wiring exists, requests from a FocusMemory backend carry no `da_*` fields and run with full attention - the two projects remain independently usable.
 
+## Production launch (recommended options)
+
+The 123 node (192.168.219.123) runs the DA inference service - qwen3.8, multimodal - behind the
+FocusMemory backend. The recommended `llama-server` launch line is:
+
+```bash
+llama-server \
+  --metrics \
+  --da-prompt-scan \
+  --spec-type draft-mtp \
+  --spec-draft-n-max 4 \
+  --spec-draft-ngl all
+```
+
+| Option | What it does | Why it is on |
+|--------|--------------|--------------|
+| `--metrics` | Exposes Prometheus metrics on the server port | Observability for a long-running service |
+| `--da-prompt-scan` | **Prompt scanning** (P1): on each request the prompt is scanned for `<da:N>` chunk markers and their token ranges are pre-computed, so DA tags / static `da_rm` ranges resolve to real KV positions | The FocusMemory backend marks the chunks it assembled; scanning maps those markers to positions. A prompt with no markers runs with full attention (fail-open) |
+| `--spec-type draft-mtp` | **Speculative decoding** with the model's MTP draft head | Speed-up on top of DA. Since P6, spec and DA **coexist**: while a slot is in DA mode (`da_seq` active) spec is paused automatically and resumes on the return to global attention - so spec stays ON without breaking DA |
+| `--spec-draft-n-max 4` | Up to 4 draft tokens per step | Enough to overlap decode with drafting, without so many that rejections waste work |
+| `--spec-draft-ngl all` | Puts the whole draft model on the GPU | The draft model is small; keeping it fully on-GPU avoids CPU round-trips that would erase the spec gain |
+
+**Path A on 123.** The 123 launch does **not** set `--kv-unified`, so the server uses **backend A**
+(`seq_rm` holes) for the focus/local restriction - not backend B. Backend A is monotonic: a removal is
+irreversible within the request, and returning to global attention needs a re-prefill. That is the
+intended, validated low-risk configuration on 123. Backend B (two streams, reversible, no re-prefill) is
+only active when `--kv-unified` is also set.
+
+**Verifying DA in the journal.** After a chat that carries DA markers, confirm the DA path ran:
+
+```bash
+journalctl -u qwen3.8 --since "10 min ago" | grep -E 'da_scan:|da_tag:'
+```
+
+- `da_scan:` - the prompt scanner found the `<da:N>` markers and built the chunk-to-range map
+- `da_tag:` - a `<focus>`/`<local>` tag was parsed and the attention restriction applied
+
+A plain chat (no DA markers) produces no `da_scan:` line and runs with full attention - that is the
+intended fail-open behavior.
+
 ## Status and limits
 
 Early work in progress.
