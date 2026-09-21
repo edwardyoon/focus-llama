@@ -5335,6 +5335,50 @@ static int32_t da_char_to_token(const std::vector<size_t> & offsets, size_t c) {
     return (int32_t) (it - offsets.begin());
 }
 
+// Lenient round-trip for da_auto (P4). The strict da_token_offsets requires
+// detokenize(tokenize(text)) to equal text exactly, which large rendered
+// prompts (50K+ tokens with repeated filler) do not guarantee: the tokenizer
+// drifts a few chars per repeated unit, so the round-trip is off and the
+// strict walk fails open. Here we tolerate bounded drift (<=1% of the text
+// length) and still return the (monotonic) offsets; larger drift fails open.
+static std::vector<size_t> da_token_offsets_lenient(const llama_vocab * vocab, const std::string & text, const llama_tokens & tokens) {
+    std::vector<size_t> offsets(tokens.size() + 1);
+    offsets[0] = 0;
+    std::string concat;
+    concat.reserve(text.size());
+    for (size_t i = 0; i < tokens.size(); i++) {
+        concat += common_token_to_piece(vocab, tokens[i], true);
+        offsets[i + 1] = concat.size();
+    }
+    const size_t drift = (concat.size() > text.size()) ? (concat.size() - text.size()) : (text.size() - concat.size());
+    if (text.size() > 0 && drift * 100 > text.size()) {
+        return {};
+    }
+    return offsets;
+}
+
+// Nearest token boundary (tolerant of drift); -1 only when offsets is empty.
+// da_auto uses this so a header char offset that lands a few chars off a true
+// boundary (tokenizer drift) still maps to the adjacent token.
+static int32_t da_char_to_token_nearest(const std::vector<size_t> & offsets, size_t c) {
+    if (offsets.empty()) {
+        return -1;
+    }
+    if (c >= offsets.back()) {
+        return (int32_t) (offsets.size() - 1);
+    }
+    const auto it = std::lower_bound(offsets.begin(), offsets.end(), c);
+    if (it == offsets.begin()) {
+        return 0;
+    }
+    if (it == offsets.end()) {
+        return (int32_t) (offsets.size() - 1);
+    }
+    const size_t prev = *(it - 1);
+    const size_t curr = *it;
+    return (c - prev <= curr - c) ? (int32_t) (it - offsets.begin() - 1) : (int32_t) (it - offsets.begin());
+}
+
 static bool da_scan_prompt(
         const llama_vocab * vocab,
         const std::string & text,
@@ -5765,7 +5809,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                         da_auto_chunk(ctx_server.vocab, prompt.get<std::string>(), params.da_chunk_tokens);
                 if (layout.ok) {
                     const llama_tokens  toks = common_tokenize(ctx_server.vocab, layout.modified, true, true);
-                    const std::vector<size_t> offs = da_token_offsets(ctx_server.vocab, layout.modified, toks);
+                    const std::vector<size_t> offs = da_token_offsets_lenient(ctx_server.vocab, layout.modified, toks);
                     bool ok = !offs.empty();
 
                     // chunk c = [header_c, header_{c+1}) ; last = [header_last, tail)
@@ -5774,8 +5818,8 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                         chunks.reserve(layout.header_pos.size());
                         for (size_t c = 0; c < layout.header_pos.size(); c++) {
                             const size_t next = c + 1 < layout.header_pos.size() ? layout.header_pos[c + 1] : layout.tail_pos;
-                            const int32_t lo = da_char_to_token(offs, layout.header_pos[c]);
-                            const int32_t hi = da_char_to_token(offs, next);
+                            const int32_t lo = da_char_to_token_nearest(offs, layout.header_pos[c]);
+                            const int32_t hi = da_char_to_token_nearest(offs, next);
                             if (lo < 0 || hi < 0 || hi <= lo) {
                                 ok = false;
                                 break;
@@ -5785,8 +5829,8 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     }
                     std::pair<int32_t, int32_t> filler = { -1, -1 };
                     if (ok && layout.filler.second > layout.filler.first) {
-                        const int32_t lo = da_char_to_token(offs, layout.filler.first);
-                        const int32_t hi = da_char_to_token(offs, layout.filler.second);
+                        const int32_t lo = da_char_to_token_nearest(offs, layout.filler.first);
+                        const int32_t hi = da_char_to_token_nearest(offs, layout.filler.second);
                         if (lo < 0 || hi < 0 || hi <= lo) {
                             ok = false;
                         } else {
