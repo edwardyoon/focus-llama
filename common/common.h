@@ -668,6 +668,12 @@ struct common_params {
     bool        server_connect      = false;
     std::string server_connect_code = "";
 
+    // Declarative Attention (DA) server options
+    bool    da_prompt_scan      = false; // scan the rendered prompt for <da:N>/<da:filler>/<da:layout:N> layout markers
+    bool    da_auto             = false; // auto-chunk long marker-less prompts by message boundaries
+    int32_t da_min_ctx          = 0;     // da_auto: only chunk when the prompt is at least this many tokens
+    int32_t da_chunk_tokens     = 2048;  // da_auto: target size (tokens) of a split long message
+
     std::string public_path   = "";                                                                         // NOLINT
     std::string api_prefix    = "";                                                                         // NOLINT
     std::string chat_template = "";                                                                         // NOLINT
