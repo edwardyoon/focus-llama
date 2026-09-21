@@ -300,10 +300,20 @@ struct common_sampler * common_sampler_init(
                 llama_sampler_accept(grmr, token);
                 LOG_DBG("%s: grammar accepted prefill token (%d)\n", __func__, token);
             }
-        } catch (std::exception &e) {
-            LOG_ERR("%s: error initializing grammar sampler for grammar:\n%s\n\nGeneration prompt:\n'%s'\n", __func__,
-                common_grammar_value(params.grammar).c_str(), params.generation_prompt.c_str());
-            throw e;
+        } catch (const std::exception &) {
+            // Thinking models with structured output: the generation prompt
+            // carries the thinking open/close tags, which the JSON grammar
+            // cannot accept. Fail open: rebuild the grammar in its start state
+            // and skip the (non-JSON) thinking prefill. The grammar still
+            // constrains the model's output to valid JSON; only the thinking
+            // prefill is dropped, so the request no longer 500s.
+            LOG_WRN("%s: generation prompt '%s' not accepted by output-format grammar - rebuilding grammar without prefill (thinking-model structured output)\n",
+                __func__, params.generation_prompt.c_str());
+            llama_sampler_free(grmr);
+            grmr = llama_sampler_init_grammar(vocab, grammar_str.c_str(), "root");
+            if (!grmr) {
+                throw std::runtime_error("failed to re-init grammar after prefill failure");
+            }
         }
     }
 
