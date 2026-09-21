@@ -5295,10 +5295,12 @@ void server_context::set_state_callback(server_state_callback_t callback) {
 // ---------------------------------------------------------------------
 // The client hook (FocusMemory, FOCUSMEMORY_DA) appends a marker block to
 // the rendered prompt:
-//   <da:1>chunk 1<da:2>chunk 2 ... <da:C>chunk C<da:filler>instruction<da:layout:C>
-// where <da:N> marks the start of chunk N (1-based), <da:filler> the start
-// of the injected instruction (the removable filler), and <da:layout:C> the
-// footer (C = chunk count; kept - it sits at the prompt tail). This scan
+//   [[da:1]]chunk 1[[da:2]]chunk 2 ... [[da:C]]chunk C[[da:filler]]instruction[[da:layout:C]]
+// (the legacy <da:N>/<da:filler>/<da:layout:C> form is accepted as well)
+// where the chunk marker marks the start of chunk N (1-based), the filler
+// marker the start of the injected instruction (the removable filler), and
+// the layout marker the footer (C = chunk count; kept - it sits at the
+// prompt tail). This scan
 // recovers the chunk token ranges from the prompt string + its tokenization
 // and fills the task params (da_chunks, da_filler, da_b).
 //
@@ -5393,16 +5395,35 @@ static bool da_scan_prompt(
     };
 
     std::vector<marker_t> markers;
-    size_t p = text.find("<da:");
-    while (p != std::string::npos) {
-        const size_t close = text.find('>', p);
+    // Both marker forms are accepted: <da:N> (legacy) and [[da:N]] (the
+    // FocusMemory hook's current form - angle brackets get mangled by
+    // markdown/HTML escaping between the hook and the rendered prompt).
+    size_t p = 0;
+    while (p < text.size()) {
+        const size_t p_angle = text.find("<da:", p);
+        const size_t p_brack = text.find("[[da:", p);
+        const bool   brack   = p_brack != std::string::npos &&
+                               (p_angle == std::string::npos || p_brack < p_angle);
+        const size_t start   = brack ? p_brack : p_angle;
+        if (start == std::string::npos) {
+            break;
+        }
+        // "<da:" content starts at +4 and closes at '>'; "[[da:" content
+        // starts at +5 and closes at the first ']' (the doubled close
+        // bracket is consumed when present)
+        const size_t content_off = brack ? 5 : 4;
+        const size_t close = text.find(brack ? ']' : '>', start + content_off);
         if (close == std::string::npos) {
             break;
         }
-        const std::string inner = text.substr(p + 4, close - p - 4);
+        size_t end = close + 1;
+        if (brack && close + 1 < text.size() && text[close + 1] == ']') {
+            end = close + 2;
+        }
+        const std::string inner = text.substr(start + content_off, close - start - content_off);
         marker_t m;
-        m.start = p;
-        m.end   = close + 1;
+        m.start = start;
+        m.end   = end;
         if (inner == "filler") {
             m.kind = 1;
         } else if (inner.size() > 7 && inner.compare(0, 7, "layout:") == 0) {
@@ -5416,7 +5437,7 @@ static bool da_scan_prompt(
         if (m.kind >= 0) {
             markers.push_back(m);
         }
-        p = text.find("<da:", close + 1);
+        p = end;
     }
 
     // Multi-turn: the FocusMemory hook numbers chunks monotonically per

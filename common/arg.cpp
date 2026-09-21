@@ -1720,7 +1720,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--da-prompt-scan"},
         {"--no-da-prompt-scan"},
-        "scan the rendered prompt for Declarative Attention layout markers (<da:N>, <da:filler>, <da:layout:N>) and let the model's <focus magic_chunks=\"N\"> tags restrict attention (default: disabled, fail-open to vanilla on any mismatch)",
+        "scan the rendered prompt for Declarative Attention layout markers ([[da:N]] or <da:N>, [[da:filler]] or <da:filler>, [[da:layout:N]] or <da:layout:N>) and let the model's <focus magic_chunks=\"N\"> tags restrict attention (default: disabled, fail-open to vanilla on any mismatch)",
         [](common_params & params, bool value) {
             params.da_prompt_scan = value;
         }
