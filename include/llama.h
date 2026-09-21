@@ -1109,6 +1109,14 @@ extern "C" {
     // Returns whether the context is currently using causal attention
     LLAMA_API bool llama_get_causal_attn(const struct llama_context * ctx);
 
+    // Set a runtime upper bound on the number of finite (attended) KV cells per attention
+    // mask row. Backends with a sparse flash-attention path (CUDA MMA_F16, Metal, Vulkan)
+    // gather only those cells instead of reading the whole KV cache; 0 (the default) keeps
+    // the dense behavior. The value must be >= the actual number of finite cells per row,
+    // otherwise the excess cells are silently dropped from the attention.
+    // Changing the value invalidates the cached compute graphs (rebuilt on the next batch).
+    LLAMA_API void llama_set_n_kv_max(struct llama_context * ctx, int64_t n_kv_max);
+
     // Set abort callback
     LLAMA_API void llama_set_abort_callback(struct llama_context * ctx, ggml_abort_callback abort_callback, void * abort_callback_data);
 

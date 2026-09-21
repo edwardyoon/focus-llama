@@ -138,6 +138,7 @@ struct llama_context {
     bool supports_state_row() const;
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
+    void set_n_kv_max(int64_t value);
 
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
@@ -337,6 +338,11 @@ private:
     const llama_model & model;
 
     llama_cparams cparams;
+
+    // runtime upper bound on the finite (attended) KV cells per mask row, passed to the
+    // flash-attn nodes as n_kv_max so backends with a sparse path can gather only those
+    // cells (0 = dense, the default). changed via set_n_kv_max()
+    int64_t n_kv_max = 0;
 
     llama_adapter_cvec_ptr  cvec;
     llama_adapter_loras_ptr loras;
