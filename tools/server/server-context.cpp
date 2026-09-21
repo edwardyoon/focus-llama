@@ -5398,7 +5398,9 @@ static bool da_scan_prompt(
                 n_chunks, footer->num);
         return false;
     }
-    if (&block.back() != footer) {
+    // block holds copies of the markers, so compare by the marker's unique
+    // char offset, not by address (footer points into the markers vector).
+    if (block.back().start != footer->start) {
         SRV_WRN("%s", "da_scan: <da:layout:N> is not the last marker - failing open to vanilla\n");
         return false;
     }
