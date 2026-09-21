@@ -244,21 +244,26 @@ speed-up. Measuring real speed is still open.
 
 There are two ways to get a chunk layout onto the wire:
 
-1. **Auto-chunking (`--da-auto`, recommended for production).** The server splits the rendered
-   chat prompt itself at message boundaries, so the client sends a **plain**
-   `/v1/chat/completions` request - no markers, no `da_*` fields, no hook. This works with any
-   OpenAI-compatible client (qwen-code, curl, other agents) and needs nothing from FocusMemory
-   beyond a normal chat. **When `--da-auto` is on, the FocusMemory hook does not need to inject
-   `<da:N>` markers at all** - the server builds the layout from the same conversation history the
-   hook would have indexed, and the savings target (whole history + tool output) is larger than a
-   hook-injected index.
-2. **Marker path (`--da-prompt-scan` + client markers).** FocusMemory assembles the prompt from
-   its own chunks and wraps them in `<da:N>` ... `<da:layout:N>` markers (its backend already
-   knows the token range of every chunk it inserted). The server scans the rendered prompt, maps
-   the markers to token ranges, and the model's `<focus magic_chunks="N">` tag decides which chunk
-   the next tokens attend to. Use this when the client can declare a layout finer than message
-   boundaries. Note: some clients (e.g. qwen-code 0.24.2's hook pipeline) HTML-escape injected
-   context, which breaks literal `<da:` markers - that is exactly what `--da-auto` sidesteps.
+1. **Marker path (`--da-prompt-scan` + client markers, recommended).** FocusMemory assembles the
+   prompt from its own chunks and wraps them in `[[da:N]]` ... `[[da:layout:N]]` markers (the
+   legacy `<da:N>` form is accepted as well; the hook emits the bracket form because angle
+   brackets get mangled by markdown/HTML escaping between the hook and the rendered prompt). The
+   server scans the rendered prompt, maps the markers to token ranges, and the model's
+   `<focus magic_chunks="N">` tag decides which chunk the next tokens attend to. The marker block
+   sits at the prompt tail, so DA only touches the injected memory index - the rest of the
+   conversation is untouched. This is the path that works reliably with live agent sessions.
+2. **Auto-chunking (`--da-auto`, experimental - do not run on live agent sessions).** The server
+   splits the rendered chat prompt itself at message boundaries into 2K-token magic chunks, so the
+   client sends a plain request with nothing extra. Known limitations, observed in production:
+   - **Output corruption on agent sessions.** Auto-chunking re-chunks the *entire* conversation
+     (history + tool I/O) on every turn once the prompt passes `--da-min-ctx`. The DA tag
+     state machine (tail hold-back + spec batch cut) then operates on the model's whole output
+     stream, and when a tag boundary lands inside a structured block (e.g. a tool call) the
+     block is cut mid-stream and raw tag text leaks into the response.
+   - **Bigger blast radius.** A wrong layout or a misfired tag corrupts the session's own
+     conversation, not just the injected index.
+   Use `--da-auto` only for headless batch/bench traffic where the output is not consumed by an
+   agent.
 
 The two paths coexist (marker layout wins when present; auto takes over otherwise - see
 Production launch). Without either, requests run with full attention - the two projects remain
@@ -274,23 +279,21 @@ llama-server \
   --parallel 1 \
   --metrics \
   --da-prompt-scan \
-  --da-auto \
-  --da-min-ctx 4096 \
-  --da-chunk-tokens 2048 \
   --spec-type draft-mtp \
   --spec-draft-n-max 4 \
   --spec-draft-ngl all
 ```
+
+(`--da-auto` is deliberately off: it corrupts live agent sessions - see *Relationship to
+FocusMemory*. Headless batch/bench nodes may add it back with `--da-min-ctx` /
+`--da-chunk-tokens`.)
 
 (`--parallel 1` keeps the single-tenant node on backend A - see Backend A vs B below.)
 
 | Option | What it does | Why it is on |
 |--------|--------------|--------------|
 | `--metrics` | Exposes Prometheus metrics on the server port | Observability for a long-running service |
-| `--da-prompt-scan` | **Prompt scanning** (marker path): on each request the prompt is scanned for `<da:N>` chunk markers and their token ranges are pre-computed, so DA tags / static `da_rm` ranges resolve to real KV positions | Lets a client (e.g. the FocusMemory hook) declare the exact chunk layout it assembled. A prompt with no markers runs with full attention (fail-open) |
-| `--da-auto` | **Auto-chunking** (server path): when a request carries no valid marker block and its prompt is at least `--da-min-ctx` tokens, the server splits the rendered chat prompt itself into magic chunks at message boundaries, inserts `[Magic Chunk N]` headers, appends the DA instruction, re-tokenizes, and maps the layout to token ranges. The client needs to send nothing extra | Makes DA work with **any** OpenAI-compatible client (qwen-code, curl, other agents) - no hook, no markers, no `da_*` request fields. The savings target is the whole history/tool output, not just a client-injected index. Verified in production: 85-93 chunks from 68-74 messages (88K-98K tokens), 0 fail-opens |
-| `--da-min-ctx 4096` | Auto-chunking threshold: prompts shorter than this many tokens run vanilla | Short prompts have little to save; chunking a 2K prompt would only add headers and instruction for no benefit. 4096 matches the node's typical conversation length |
-| `--da-chunk-tokens 2048` | Target size of one magic chunk (tokens) in auto-chunking | The paper's segmenter target (~2K tokens). Long messages are split paragraph → line → sentence until they fit; chunk ids are index-based so they stay stable as history grows |
+| `--da-prompt-scan` | **Prompt scanning** (marker path): on each request the prompt is scanned for `[[da:N]]` (or legacy `<da:N>`) chunk markers and their token ranges are pre-computed, so DA tags / static `da_rm` ranges resolve to real KV positions | Lets a client (e.g. the FocusMemory hook) declare the exact chunk layout it assembled. A prompt with no markers runs with full attention (fail-open) |
 | `--spec-type draft-mtp` | **Speculative decoding** with the model's MTP draft head | Speed-up on top of DA. Since P6, spec and DA **coexist**: while a slot is in DA mode (`da_seq` active) spec is paused automatically and resumes on the return to global attention - so spec stays ON without breaking DA |
 | `--spec-draft-n-max 4` | Up to 4 draft tokens per step | Enough to overlap decode with drafting, without so many that rejections waste work |
 | `--spec-draft-ngl all` | Puts the whole draft model on the GPU | The draft model is small; keeping it fully on-GPU avoids CPU round-trips that would erase the spec gain |
@@ -322,12 +325,12 @@ request used from the scan log: `da_scan: ... - A path` vs `da_scan: ... - B pat
 journalctl -u qwen3.8-focus --since "10 min ago" | grep -E 'da_scan:|da_auto:|da_tag:'
 ```
 
-- `da_scan:` - the prompt scanner found the `<da:N>` markers and built the chunk-to-range map
-- `da_auto:` - auto-chunking split the prompt (`da_auto: 91 chunk(s) from 72 source message(s), 94826 token(s) - A path`). A `da_auto: layout does not map to token boundaries` WARN means the layout failed open to vanilla
+- `da_scan:` - the prompt scanner found the `[[da:N]]`/`<da:N>` markers and built the chunk-to-range map
+- `da_auto:` - auto-chunking split the prompt (only when `--da-auto` is on; off in the recommended production line)
 - `da_tag:` - a `<focus>`/`<local>` tag was parsed and the attention restriction applied
 
-A plain chat (no markers, prompt below `--da-min-ctx`) produces no `da_scan:`/`da_auto:` line and
-runs with full attention - that is the intended fail-open behavior.
+A plain chat (no markers) produces no `da_scan:`/`da_auto:` line and runs with full attention -
+that is the intended fail-open behavior.
 
 **Verifying DA end-to-end with curl.** Send a chat whose user message carries a well-formed marker
 block (the same format the FocusMemory hook injects) and read the `timings` object of the response:
@@ -335,7 +338,7 @@ block (the same format the FocusMemory hook injects) and read the `timings` obje
 ```bash
 curl -s http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" -d '{
   "model": "qwen27b",
-  "messages": [{"role": "user", "content": "Memory entries:\n<da:1>The capital of France is Paris.\n<da:2>The capital of Germany is Berlin.\n<da:filler>Instructions (Declarative Attention): The memory entries above are numbered magic chunks (1-2). First identify the chunk that contains the answer to the question, and output the tag <focus magic_chunks=\"N\"> on its own line, where N is the chunk number (1-2). Then answer the question.\n<da:layout:2>\nQuestion: What is the capital of France?"}],
+  "messages": [{"role": "user", "content": "Memory entries:\n[[da:1]]The capital of France is Paris.\n[[da:2]]The capital of Germany is Berlin.\n[[da:filler]]Instructions (Declarative Attention): The memory entries above are numbered magic chunks (1-2). First identify the chunk that contains the answer to the question, and output the tag <focus magic_chunks=\"N\"> on its own line, where N is the chunk number (1-2). Then answer the question.\n[[da:layout:2]]\nQuestion: What is the capital of France?"}],
   "max_tokens": 160, "temperature": 0, "stream": false
 }' | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['choices'][0]['message']['content']); print({k:v for k,v in d['timings'].items() if k.startswith('da_')})"
 ```
