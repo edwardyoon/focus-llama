@@ -1069,6 +1069,9 @@ private:
 
     llama_context * ctx_tgt = nullptr;
 
+    // DA (W2): the n_kv_max value last pushed to ctx_tgt, for the change log
+    int64_t da_n_kv_max_last = 0;
+
     server_batch batch;
 
     llama_model   * model_dft = nullptr;
@@ -4055,6 +4058,10 @@ private:
             has_output |= batch.tokens[i].output;
         }
 
+        // DA: push the n_kv_max bound for this window before the decode
+        // (no-op while the value is unchanged; 0 = dense)
+        update_da_n_kv_max(off, batch_view.n_tokens);
+
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
@@ -4159,6 +4166,97 @@ private:
         }
 
         return true;
+    }
+
+    // Declarative Attention (W2 physical reduction): the per-batch n_kv_max
+    // bound pushed to the target context before each decode. Backends with a
+    // sparse flash-attention path (CUDA MMA_F16, Metal, Vulkan) use it to
+    // gather only the finite (attended) KV cells of each mask row, so the DA
+    // holes - physically still in the stream (A: cells untagged from the
+    // sequence, B: cells still tagged on the original sequence) - are skipped
+    // instead of read.
+    //
+    // A mask row's finite set grows monotonically with the token position
+    // (each row attends to a superset of the previous row's cells), so the
+    // last token of the batch carries the maximum count. Per slot it is the
+    // logical read set the DA logs already track:
+    //   A path: n_full - n_da_removed
+    //   B path: da_keep_count + (n_full - da_bound)
+    //   plain:  n_full (no holes, the whole causal row is finite)
+    // where n_full = slot.prompt.n_tokens() already includes this batch's
+    // tokens (handle_last_sampled_token adds them before decode() runs).
+    // The bound is set only when at least one slot has holes: for plain
+    // traffic it stays 0, so the flash-attn nodes (and the cached graphs)
+    // are untouched. When holes are present, every processing slot must be
+    // counted - the bound must never under-estimate any row's finite count,
+    // or the excess cells are silently dropped. The value is bucketed to 512
+    // because it is baked into the flash-attn nodes: a change rebuilds the
+    // cached graph, and 512 bounds that to ~1 rebuild per 512 generated
+    // tokens. Prefill batches stay dense (0): the bound must never be set
+    // while prompt tokens are being written, and one tile per query row is
+    // not worth it there.
+    void update_da_n_kv_max(int32_t off, int32_t n_tokens) {
+        // FOCUS_DA_DENSE=1: keep the dense path even with DA holes (A/B
+        // verification of the sparse kernel against the dense reference)
+        static const bool dense_override = []() {
+            const char * e = getenv("FOCUS_DA_DENSE");
+            return e && atoi(e) != 0;
+        }();
+        if (dense_override) {
+            return;
+        }
+
+        int64_t n_kv_max = 0;
+
+        bool prefill = false;
+        for (int32_t i = off; i < off + n_tokens; ++i) {
+            if (batch.tokens[i].is_prompt) {
+                prefill = true;
+                break;
+            }
+        }
+
+        if (!prefill) {
+            bool any_holes = false;
+            for (auto & slot : slots) {
+                if (slot.is_processing() && (slot.da_seq >= 0 || slot.da_removed_a)) {
+                    any_holes = true;
+                    break;
+                }
+            }
+            if (any_holes) {
+                for (auto & slot : slots) {
+                    if (!slot.is_processing()) {
+                        continue;
+                    }
+                    const int32_t n_full = (int32_t) slot.prompt.n_tokens();
+                    int32_t n_read;
+                    if (slot.da_seq >= 0) {
+                        // B: the slot decodes on da_seq - the compact
+                        // sequence (kept prefix + generated tail), every
+                        // cell finite
+                        n_read = (int32_t) slot.da_keep_count + (n_full - slot.da_bound);
+                    } else if (slot.da_removed_a) {
+                        // A: holes in the original sequence, finite = the rest
+                        n_read = std::max(0, n_full - (int32_t) slot.n_da_removed);
+                    } else {
+                        // plain co-tenant: the whole causal row is finite
+                        n_read = n_full;
+                    }
+                    n_kv_max = std::max(n_kv_max, ((int64_t) n_read + 511) / 512 * 512);
+                }
+            }
+        }
+
+        if (n_kv_max != da_n_kv_max_last) {
+            SRV_INF("da: n_kv_max %lld -> %lld%s\n", (long long) da_n_kv_max_last, (long long) n_kv_max, prefill ? " (prefill, dense)" : "");
+            da_n_kv_max_last = n_kv_max;
+        }
+        llama_set_n_kv_max(ctx_tgt, n_kv_max);
+        // the draft context is intentionally left dense: its prompt length is
+        // not exposed by common_speculative, and the bound must never under-
+        // estimate a row's finite count (the excess cells would be silently
+        // dropped)
     }
 
     // The removal boundary for the static (client-supplied da_rm) path: the
@@ -4426,6 +4524,13 @@ private:
         slot.da_seq        = da_seq;
         slot.da_bound      = bound;
         slot.da_keep_count = n_keep;
+        // Mark the removal as applied so release() takes the B-restore
+        // branch (copy the generated tail back to the original sequence and
+        // free da_seq). Without it, a B response that ends mid-FOCUS
+        // (max_tokens hit, no </focus>) leaves da_seq's KV cells in place;
+        // the next request reuses that sequence id and llama_decode rejects
+        // the non-contiguous append ("Invalid input batch").
+        slot.da_applied    = true;
 
         SLT_INF(slot, "da_b: switched decode to seq %d (%s) - logical read set now %zu of %d prefix token(s) (%zu removed, -%.1f%%)\n",
                 da_seq, when, n_keep, bound, n_remove, 100.0 * (double) n_remove / (double) bound);
@@ -4469,12 +4574,22 @@ private:
     // A tag must start at the beginning of the text or right after
     // whitespace: the model emits it as a standalone token, and a literal
     // "<local>" inside a tool-call JSON string (preceded by '"' or ':') is
-    // data, not a control tag.
-    static da_tag_t scan_da_tag(const std::string & text, size_t from) {
+    // data, not a control tag. Exception: a return tag (</focus>/</local>)
+    // is control even when glued to the answer ("CODE</focus>", no space)
+    // while the machine is in a restricted mode - that is the model's
+    // natural output shape, and a misread in GLOBAL mode is harmless (the
+    // close handler is a no-op without a pending removal).
+    static da_tag_t scan_da_tag(const std::string & text, size_t from, da_mode_t mode) {
         da_tag_t best;
         for (size_t lt = text.find('<', from); lt != std::string::npos; lt = text.find('<', lt + 1)) {
             if (lt > 0 && !std::isspace((unsigned char) text[lt - 1])) {
-                continue;
+                const bool glued_return =
+                        (mode != DA_MODE_GLOBAL) &&
+                        (text.compare(lt, 8, "</focus>") == 0 ||
+                         text.compare(lt, 9, "</local>") == 0);
+                if (!glued_return) {
+                    continue;
+                }
             }
             da_tag_t cand;
             cand.start = lt;
@@ -4557,7 +4672,7 @@ private:
         const bool   is_b   = slot.task->params.da_b;
 
         for (;;) {
-            da_tag_t tag = scan_da_tag(slot.generated_text, slot.da_tag_scan_pos);
+            da_tag_t tag = scan_da_tag(slot.generated_text, slot.da_tag_scan_pos, slot.da_mode);
             if (tag.type < 0) {
                 break;  // no more complete tags
             }
@@ -4990,7 +5105,7 @@ private:
                     // a tag may start in the held-back tail of generated_text
                     // (process_token holds back partial tag openers) and close
                     // inside this batch; only the closing position matters
-                    const da_tag_t tag = scan_da_tag(slot.generated_text + preview, slot.da_tag_scan_pos);
+                    const da_tag_t tag = scan_da_tag(slot.generated_text + preview, slot.da_tag_scan_pos, slot.da_mode);
                     if (tag.type >= 0 && tag.end > gen_len) {
                         const size_t cut = tag.end - gen_len;  // offset into the preview
                         size_t off = 0;

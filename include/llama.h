@@ -1019,6 +1019,14 @@ extern "C" {
     // If set to true, the model will only attend to the past tokens
     LLAMA_API void llama_set_causal_attn(struct llama_context * ctx, bool causal_attn);
 
+    // Set a runtime upper bound on the number of finite (attended) KV cells per attention
+    // mask row. Backends with a sparse flash-attention path (CUDA MMA_F16, Metal, Vulkan)
+    // gather only those cells instead of reading the whole KV cache; 0 (the default) keeps
+    // the dense behavior. The value must be >= the actual number of finite cells per row,
+    // otherwise the excess cells are silently dropped from the attention.
+    // Changing the value invalidates the cached compute graphs (rebuilt on the next batch).
+    LLAMA_API void llama_set_n_kv_max(struct llama_context * ctx, int64_t n_kv_max);
+
     // Set whether the model is in warmup mode or not
     // If true, all model tensors are activated during llama_decode() to load and cache their weights.
     //

@@ -806,6 +806,12 @@ struct llm_graph_params {
 
     uint32_t n_outputs;
 
+    // runtime upper bound on the finite (attended) KV cells per mask row,
+    // baked into the flash-attn node as n_kv_max (0 = dense, the default).
+    // backends with a sparse path (CUDA MMA_F16 / Metal / Vulkan) gather only
+    // those cells; a change forces a graph rebuild (see allow_reuse)
+    int64_t n_kv_max = 0;
+
     llm_graph_cb cb;
 
     llm_graph_result * res;
@@ -880,7 +886,10 @@ struct llm_graph_params {
             gtype == other.gtype &&
             cvec  == other.cvec  &&
             loras == other.loras &&
-            cross == other.cross;
+            cross == other.cross &&
+            // n_kv_max is baked into the flash-attn node, so a different
+            // read-set bound needs a rebuilt graph
+            n_kv_max == other.n_kv_max;
     }
 };
 
@@ -1013,6 +1022,7 @@ struct llm_graph_context {
 
     const int64_t n_tokens;
     const int64_t n_outputs;
+    const int64_t n_kv_max; // upper bound on finite (attended) KV cells per mask row, 0 = dense
     const int32_t n_ctx_orig; // yarn
 
     const enum llama_pooling_type pooling_type;

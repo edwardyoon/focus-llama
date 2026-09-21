@@ -1211,6 +1211,20 @@ void llama_context::set_causal_attn(bool value) {
     sched_need_reserve = true;
 }
 
+void llama_context::set_n_kv_max(int64_t value) {
+    LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, (int) value);
+
+    if (n_kv_max == value) {
+        return;
+    }
+
+    n_kv_max = value;
+
+    // no sched_reserve() here: the value is baked into the flash-attn nodes, so a
+    // different bound is picked up by llm_graph_params::allow_reuse and the cached
+    // graph is rebuilt in place (at the current ubatch size) on the next ubatch
+}
+
 void llama_context::set_warmup(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
@@ -2512,6 +2526,7 @@ llm_graph_params llama_context::graph_params(
         /*.cross       =*/ &cross,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
+        /*.n_kv_max    =*/ n_kv_max,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
     };
@@ -3874,6 +3889,10 @@ void llama_set_embeddings(llama_context * ctx, bool embeddings) {
 
 void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {
     ctx->set_causal_attn(causal_attn);
+}
+
+void llama_set_n_kv_max(llama_context * ctx, int64_t n_kv_max) {
+    ctx->set_n_kv_max(n_kv_max);
 }
 
 void llama_set_warmup(llama_context * ctx, bool warmup) {
