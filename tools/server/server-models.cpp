@@ -283,6 +283,7 @@ static std::map<std::string, std::string> child_request_headers(const std::map<s
 }
 
 static void unset_reserved_args(common_preset & preset, bool unset_model_args) {
+    preset.unset_option("LLAMA_ARG_LOG_FILE");
     preset.unset_option("LLAMA_ARG_SSL_KEY_FILE");
     preset.unset_option("LLAMA_ARG_SSL_CERT_FILE");
     preset.unset_option("LLAMA_API_KEY");
