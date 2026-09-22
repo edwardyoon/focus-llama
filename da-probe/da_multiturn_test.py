@@ -154,11 +154,22 @@ def run_conversation(base, model, filler_paras, temperature, max_tokens, verbose
             where = "content" if in_content else ("reasoning" if in_reason else "ABSENT")
             state = ("CORRECT" if in_content
                      else ("ANSWER-FAIL" if in_reason else "LOST"))
-            print("turn %-5s expect=%-8s %s n_prompt=%s tps=%s  fact in %s"
+            print("turn %-5s expect=%-8s %s n_prompt=%s n_gen=%s tps=%s  fact in %s"
                   % (name, codeword, state,
-                     r["n_prompt"], "%.1f" % r["tps"] if r["tps"] else "?", where))
-            print("          content: %r" % r["text"][:120])
-            print("          reason : %r" % r["reason"][:120])
+                     r["n_prompt"], r["n_gen"], "%.1f" % r["tps"] if r["tps"] else "?", where))
+            if in_content:
+                print("          content: %r" % r["text"][:200])
+            else:
+                # failing turn: dump the output to diagnose where the answer
+                # went (thinking loop / batch cut / budget). n_gen == max_tokens
+                # means the budget was hit; the reasoning TAIL shows where the
+                # model stopped (the answer comes after the thinking).
+                print("          content (%d chars): %r" % (len(r["text"]), r["text"]))
+                rn = r["reason"]
+                tail = rn[-2000:] if len(rn) > 2000 else rn
+                print("          reasoning (%d chars, showing last %d):" % (len(rn), len(tail)))
+                for ln in (tail if tail else "<empty>").splitlines():
+                    print("          | " + ln)
     return turns
 
 
@@ -181,6 +192,16 @@ def analyze_journal(lines):
     da_tag = [l for l in lines if "da_tag:" in l and ("focus magic_chunks" in l
                or "A removal" in l or "monotonic" in l)]
     n_kv = [l for l in lines if "n_kv_max" in l]
+    # full DA lifecycle trace (in log order): chunking, tag switches, B/A
+    # removals, batch cuts, n_kv_max pushes, the per-request completion log
+    # (mode/keep/removed + the full tag-erased generated_text), and the cache
+    # policy (returned / prompt_clear). This is what reveals a beta-style
+    # answer-generation failure.
+    trace_pat = ("da_auto:", "da_tag:", "da_b:", "da: request complete",
+                 "da: generated_text", "set_n_kv_max", "batch cut",
+                 "returned to GLOBAL", "prompt_clear", "falling back",
+                 "staying VANILLA", "Invalid input batch")
+    da_trace = [l for l in lines if any(p in l for p in trace_pat)]
     slot_ids = []
     for l in lines:
         m = re.search(r"\|\s*task\s+(\d+)\s*\|", l)
@@ -188,6 +209,7 @@ def analyze_journal(lines):
             slot_ids.append(m.group(1))
     # 슬롯 재사용: da 관련 라인의 slot id가 몇 개인지 (1개 = 같은 슬롯 지속)
     return {"da_auto": da_auto, "da_tag": da_tag, "n_kv": n_kv,
+            "da_trace": da_trace,
             "n_da_auto": len(da_auto), "n_da_tag": len(da_tag),
             "n_nkv": len(n_kv), "n_distinct_task": len(set(slot_ids))}
 
@@ -242,6 +264,10 @@ def main():
                     help="섹션당 filler 단락 수 (setup을 da-min-ctx 초과로 만들)")
     ap.add_argument("--server-log", default=None,
                     help="서버 stdout 로그 (tee) 경로 — da_* 저널 증거용")
+    ap.add_argument("--dump-json", default=None,
+                    help="턴별 전체 content+reasoning을 JSON로 저장 — 답 생성 실패(beta)가 "
+                         "정확히 어디서/왜 답을 내뱉지 못하는지(태그 위치, FOCUS 후 행동, "
+                         "중단 지점) 분석용")
     args = ap.parse_args()
 
     print("=" * 72)
@@ -252,25 +278,27 @@ def main():
 
     turns = run_conversation(args.server, args.model, args.filler_paras,
                              args.temperature, args.max_tokens)
+    if args.dump_json:
+        with open(args.dump_json, "w") as f:
+            json.dump(turns, f, ensure_ascii=False, indent=2)
+        print("전체 응답(content+reasoning) 저장: %s" % args.dump_json)
     lines = read_journal(args.server_log)
     j = analyze_journal(lines)
 
     print("-" * 72)
     if j:
-        print("저널 증거:")
-        print("  da_auto 라인      : %d" % j["n_da_auto"])
-        print("  da_tag(focus) 라인: %d" % j["n_da_tag"])
-        print("  n_kv_max 라인     : %d" % j["n_nkv"])
-        print("  da 관련 distinct task(슬롯) 수: %d (1 = 같은 슬롯 재사용 확인)"
-              % j["n_distinct_task"])
-        for l in j["da_auto"][-2:]:
-            print("    | %s" % l.strip()[:150])
-        for l in j["da_tag"][-3:]:
-            print("    | %s" % l.strip()[:150])
-        for l in j["n_kv"][-3:]:
-            print("    | %s" % l.strip()[:150])
+        print("저널 증거: da_auto=%d da_tag=%d n_kv_max=%d distinct_task=%d (1 = 같은 슬롯 재사용)"
+              % (j["n_da_auto"], j["n_da_tag"], j["n_nkv"], j["n_distinct_task"]))
+        print("DA 라이프사이클 트레이스 (%d 줄):" % len(j["da_trace"]))
+        for l in j["da_trace"]:
+            s = l.strip()
+            # keep the full generation text + the completion state; trim the
+            # rest for readability
+            keep = s if ("generated_text" in s or "request complete" in s) else s[:200]
+            print("    | " + keep)
     else:
         print("저널 없음 (--server-log 미지정 또는 읽기 실패) — 판정은 답변 기준만")
+        print("  (서버가 tee 중인 로그 파일 경로를 --server-log에 주어야 DA 트레이스가 나옴)")
 
     status, reason = verdict(turns, j)
     print("-" * 72)

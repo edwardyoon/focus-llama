@@ -2349,6 +2349,34 @@ private:
             slot.debug_generated_text = slot.generated_text;
         }
 
+        // DA: log the full (tag-erased) generation + final DA state so the
+        // server log is self-documenting for diagnosing answer-generation
+        // failures. The client never sees the focus tags (they are erased from
+        // generated_text before being sent), so this is the only place the raw
+        // output and the DA end-state (mode / da_seq / keep / removed) are
+        // captured together for a request.
+        if (!slot.task->params.da_chunks.empty() || slot.da_applied) {
+            SLT_INF(slot, "da: request complete - n_gen=%d, mode=%s, da_seq=%d, da_bound=%d, keep=%zu, removed=%u, n_full=%d\n",
+                    (int) slot.stats.n_gen,
+                    slot.da_mode == DA_MODE_GLOBAL ? "GLOBAL"
+                        : (slot.da_mode == DA_MODE_FOCUS ? "FOCUS" : "LOCAL"),
+                    (int) slot.da_seq, (int) slot.da_bound,
+                    slot.da_keep_count, slot.n_da_removed,
+                    (int) slot.prompt.n_tokens());
+            // single line (newlines escaped) so a line-based journal filter can
+            // capture the whole generation in one record
+            std::string gtext = slot.generated_text;
+            std::string escaped;
+            escaped.reserve(gtext.size());
+            for (char c : gtext) {
+                if (c == '\n')      escaped += "\\n";
+                else if (c == '\r') escaped += "\\r";
+                else                escaped += c;
+            }
+            SLT_INF(slot, "da: generated_text (%zu chars): %s\n",
+                    gtext.size(), escaped.c_str());
+        }
+
         // in stream mode, content and tokens are already in last partial chunk
         if (slot.task->params.stream) {
             res->content     = "";
