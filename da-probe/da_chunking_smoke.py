@@ -6,13 +6,14 @@ Verifies the three new chunking behaviors via the server journal line
 
   packing     - many tiny messages are packed across message boundaries
                 into target-sized chunks (300 x ~15-token messages must NOT
-                become 300 one-message chunks; expect ~3 chunks)
+                become 300 one-message chunks; expect >= 2 chunks, avg
+                <= hard cap)
   hard_cap    - a single boundary-free message over the hard cap
                 (2048*5/4 = 2560) is force-cut into pieces <= the cap
                 (a ~5K-token whitespace-free blob must become >= 2 chunks;
                 the pre-fix code kept it as one 5K-token chunk)
-  prose       - a single ~4.5K-token prose message is split at sentence
-                boundaries and packed into ~2-3 target-sized chunks
+  prose       - a single ~25K-token prose message (140 paras) is split at
+                sentence boundaries and packed into target-sized chunks
                 (regression guard for the existing levels 0-2)
   perf_50k    - a ~50K-token single message: report the chunking wall time
                 (task start -> da_auto journal line) as the performance
@@ -20,9 +21,11 @@ Verifies the three new chunking behaviors via the server journal line
 
 Usage:
   python3 da_chunking_smoke.py [BASE_URL] --log /path/to/server.log
+      [--target 2048]
 
   BASE_URL  default: http://127.0.0.1:8087
   --log     server log file (required: the verdict is journal-based)
+  --target  the server's --da-chunk-tokens value (hard cap = 5/4 x target)
 
 Server launch (local, B path, default chunk target 2048 / cap 2560):
   ./build/bin/llama-server -m <model>.gguf --port 8087 --parallel 1 \
@@ -72,6 +75,24 @@ def log_new_lines():
         data = f.read()
         log_new_lines.offset = f.tell()
     return data
+
+
+def wait_for_journal(timeout=20.0):
+    """Log lines, polled until the da_auto line lands (or timeout).
+
+    The server log may pass through `tee` (8KB block buffering): for a small
+    request the journal line can lag the HTTP response by seconds. A single
+    read right after the response misses it and the case fails even though
+    the chunking happened (verified on 123: all 4 da_auto lines existed in
+    the log, yet the single-read smoke reported none)."""
+    seg = log_new_lines() or ""
+    t0 = time.time()
+    while chunk_info(seg) is None and time.time() - t0 < timeout:
+        time.sleep(0.25)
+        more = log_new_lines() or ""
+        if more:
+            seg += more
+    return seg
 
 
 def ts_seconds(line):
@@ -169,19 +190,34 @@ def main():
         {"role": "user", "content": "Question: Summarize in one word."},
     ]
 
+    # hard cap = 5/4 of the chunk target (default target 2048 -> cap 2560).
+    # The server flag is --da-chunk-tokens; pass --target to match a custom
+    # server (e.g. the local 8086 smoke server runs target 4096 -> cap 5120).
+    target = 2048
+    if "--target" in [a for a in sys.argv[1:]]:
+        i = sys.argv.index("--target")
+        target = int(sys.argv[i + 1])
+    cap = int(target * 5 / 4)
+
     cases = [
         ("packing",  msgs_packing,
-         lambda n_c, n_m, n_t, dt: 2 <= n_c <= 6 and n_m == 300,
-         "2..6 packed chunks from 300 messages (pre-fix: 300 chunks)"),
+         lambda n_c, n_m, n_t, dt: n_c >= 2 and n_m == 300
+         and n_t // n_c <= cap,
+         ">=2 packed chunks from 300 messages, avg <= cap %d (pre-fix: 300)"
+         % cap),
         ("hard_cap", msgs_blob,
-         lambda n_c, n_m, n_t, dt: n_c >= 2 and n_m == 1,
-         ">=2 chunks from 1 boundary-free message (pre-fix: 1 uncapped chunk)"),
+         lambda n_c, n_m, n_t, dt: n_c >= 2 and n_m == 1
+         and n_t // n_c <= cap,
+         ">=2 chunks from 1 boundary-free message, avg <= cap %d"
+         " (pre-fix: 1 uncapped chunk)" % cap),
         ("prose",    msgs_prose,
-         lambda n_c, n_m, n_t, dt: 2 <= n_c <= 5 and n_m == 1,
-         "2..5 sentence-packed chunks from 1 prose message"),
+         lambda n_c, n_m, n_t, dt: n_c >= 2 and n_m == 1
+         and n_t // n_c <= cap,
+         ">=2 sentence-packed chunks from 1 ~25K-token prose message, "
+         "avg <= cap %d" % cap),
         ("perf_50k", msgs_50k,
-         lambda n_c, n_m, n_t, dt: True,
-         "report chunking wall time (baseline)"),
+         lambda n_c, n_m, n_t, dt: n_c >= 2 and n_t // n_c <= cap,
+         ">=2 chunks, avg <= cap %d; report chunking wall time" % cap),
     ]
 
     all_ok = True
@@ -193,7 +229,7 @@ def main():
             print("%-10s: HTTP ERROR %s" % (name, e))
             all_ok = False
             continue
-        seg = log_new_lines() or ""
+        seg = wait_for_journal()
         info = chunk_info(seg)
         n_prompt = (res.get("timings") or {}).get("prompt_n")
         if info is None:
