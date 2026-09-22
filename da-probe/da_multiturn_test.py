@@ -84,7 +84,7 @@ def post(base, path, body, timeout=600):
         return json.loads(r.read())
 
 
-def chat(base, model, messages, temperature, max_tokens):
+def chat(base, model, messages, temperature, max_tokens, no_thinking=False):
     # NO stop=["\n"]: the model is a thinking model (generation starts inside an
     # open <thinking> block) and the DA protocol needs newlines (the
     # <focus magic_chunks> tag sits on its own line). A "\n" stop halts on the
@@ -94,6 +94,13 @@ def chat(base, model, messages, temperature, max_tokens):
     # to think + emit the tag + answer.
     body = {"model": model, "messages": messages, "temperature": temperature,
             "max_tokens": max_tokens, "stream": False}
+    if no_thinking:
+        # thinking off = the 123:8080 production configuration (the FocusMemory
+        # DA hook assumes thinking off). A thinking model burns the whole
+        # max_tokens budget on reasoning and is cut off before the answer
+        # (verified on 123: alpha/beta n_gen=256, codeword only in the
+        # truncated reasoning).
+        body["chat_template_kwargs"] = {"enable_thinking": False}
     t0 = time.time()
     res = post(base, "/v1/chat/completions", body)
     wall = time.time() - t0
@@ -120,7 +127,8 @@ def question_text(name):
             "Reply with the codeword only, nothing else." % name)
 
 
-def run_conversation(base, model, filler_paras, temperature, max_tokens, verbose=True):
+def run_conversation(base, model, filler_paras, temperature, max_tokens,
+                     no_thinking=False, verbose=True):
     """setup + 3 질문 턴을 같은 세션(접두어 확장 → 슬롯 재사용)으로 실행."""
     messages = [{"role": "system", "content": SYSTEM}]
     for role, content in build_setup(filler_paras):
@@ -129,7 +137,7 @@ def run_conversation(base, model, filler_paras, temperature, max_tokens, verbose
     turns = []
     for name, codeword, _ in FACTS:
         messages.append({"role": "user", "content": question_text(name)})
-        r = chat(base, model, messages, temperature, max_tokens)
+        r = chat(base, model, messages, temperature, max_tokens, no_thinking)
         # Three-way fact state per turn (the fix for the false-PASS):
         #   correct     : codeword in the VISIBLE answer (content) -> right answer
         #   seen        : codeword in content OR reasoning -> the model "saw" it
@@ -260,6 +268,10 @@ def main():
                     help="결정성을 위해 기본 0 (모델의 focus 발화를 고정)")
     ap.add_argument("--max-tokens", type=int, default=256,
                     help="생각(thinking) 모델이 생각+focus 태그+답안까지 생성할 예산")
+    ap.add_argument("--no-thinking", action="store_true",
+                    help="chat_template_kwargs enable_thinking=false — 123:8080 production "
+                         "설정. thinking 모델이 thinking에 max_tokens 예산을 다 쓰면 답안 "
+                         "전에 잘림 (123 27B에서 확인)")
     ap.add_argument("--filler-paras", type=int, default=30,
                     help="섹션당 filler 단락 수 (setup을 da-min-ctx 초과로 만들)")
     ap.add_argument("--server-log", default=None,
@@ -277,7 +289,8 @@ def main():
     print("=" * 72)
 
     turns = run_conversation(args.server, args.model, args.filler_paras,
-                             args.temperature, args.max_tokens)
+                             args.temperature, args.max_tokens,
+                             args.no_thinking)
     if args.dump_json:
         with open(args.dump_json, "w") as f:
             json.dump(turns, f, ensure_ascii=False, indent=2)
