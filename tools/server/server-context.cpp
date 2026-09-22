@@ -341,6 +341,12 @@ struct server_slot {
     // already been scanned for complete tags (each tag is consumed exactly
     // once; a tag may span several generated tokens).
     size_t da_tag_scan_pos = 0;
+    // DA tag gate (P6): set by apply_da_tag() when a control tag closed -
+    // the next draft step is skipped so the first token after the mode
+    // transition follows the single-token trajectory (a batch-verified token
+    // at the transition can diverge numerically and drop the answer).
+    // Consumed by the draft decision.
+    bool da_skip_draft = false;
     // P2: true once a DA removal has actually been applied to this slot's KV
     // (A path: holes cut into the original sequence; B path: switched to
     // da_seq). Drives the release() cache policy - a tag request that never
@@ -487,6 +493,7 @@ struct server_slot {
         da_mode          = DA_MODE_GLOBAL;
         da_keep_chunks.clear();
         da_tag_scan_pos  = 0;
+        da_skip_draft    = false;
         da_applied       = false;
         da_removed_a     = false;
         n_da_removed     = 0;
@@ -3307,7 +3314,35 @@ private:
 
                 const int n_draft_max = slot.get_n_draft_max();
 
-                if (n_draft_max > 0) {
+                // DA tag gate (P6): while a control tag could still close
+                // (the generated tail is a tag prefix) or for the first step
+                // right after a tag closed (da_skip_draft, set by
+                // apply_da_tag()), decode without a new draft. The tag tokens
+                // and the first post-switch token then follow the
+                // single-token trajectory (identical to spec-off) instead of
+                // being batch-verified: a verification batch that closes the
+                // tag carries post-tag tokens the batch cut discards, and a
+                // batch-computed token at the mode transition can diverge
+                // numerically from the single-token one and drop the answer.
+                // The replay branch below is exempt - its leftover draft was
+                // already cut and carries no post-tag tokens.
+                bool da_draft_gate = false;
+                if (n_draft_max > 0 && slot.spec_draft.empty() &&
+                    !slot.task->params.da_chunks.empty()) {
+                    const bool da_just_closed = slot.da_skip_draft;
+                    da_draft_gate = da_just_closed ||
+                            da_tag_inflight(slot.generated_text, slot.da_mode);
+                    slot.da_skip_draft = false;
+                    if (da_draft_gate) {
+                        if (da_just_closed) {
+                            SLT_INF(slot, "%s", "da_tag: draft skipped (first step after tag close)\n");
+                        } else {
+                            SLT_DBG(slot, "%s", "da_tag: draft skipped (tag in flight)\n");
+                        }
+                    }
+                }
+
+                if (n_draft_max > 0 && !da_draft_gate) {
                     GGML_ASSERT(slot.can_speculate());
 
                     if (!slot.spec_draft.empty()) {
@@ -4692,6 +4727,63 @@ private:
         return hold;
     }
 
+    // True while the candidate fragment (a suffix of the generated text
+    // starting at a tag-start '<') could still grow into a complete DA tag:
+    // a proper prefix of a fixed tag, or the <focus magic_chunks="N"> head
+    // plus a digit run that is not closed yet. A complete tag returns false
+    // (apply_da_tag() has consumed it).
+    static bool da_tag_prefix(const std::string & s) {
+        static const char * const fixed[] = { "<local>", "</focus>", "</local>" };
+        for (const char * t : fixed) {
+            const size_t tl = std::strlen(t);
+            if (s.size() < tl && s.compare(0, s.size(), t, s.size()) == 0) {
+                return true;
+            }
+        }
+        static const char head[] = "<focus magic_chunks=";
+        const size_t hl = sizeof(head) - 1;
+        if (s.size() < hl && s.compare(0, s.size(), head, s.size()) == 0) {
+            return true;
+        }
+        if (s.size() >= hl && s.compare(0, hl, head) == 0) {
+            size_t i = hl;
+            if (i < s.size() && s[i] == '"') {
+                i++;
+            }
+            if (i == s.size()) {
+                return true;  // attribute name done, waiting for the number
+            }
+            for (; i < s.size(); i++) {
+                if (!std::isdigit((unsigned char) s[i])) {
+                    return false;  // a '>' (complete) or any other character
+                }
+            }
+            return true;  // number run open, the tag may still close
+        }
+        return false;
+    }
+
+    // True while the generated tail could still grow into a complete DA tag:
+    // the last tag-start '<' (same start rule as scan_da_tag) opens a
+    // fragment that is a proper tag prefix. Used by the DA tag gate to hold
+    // speculative drafting back for as long as a tag is being emitted.
+    static bool da_tag_inflight(const std::string & text, da_mode_t mode) {
+        size_t lt = std::string::npos;
+        for (size_t i = text.find('<'); i != std::string::npos; i = text.find('<', i + 1)) {
+            if (i > 0 && !std::isspace((unsigned char) text[i - 1])) {
+                const bool glued_return =
+                        (mode != DA_MODE_GLOBAL) &&
+                        (text.compare(i, 8, "</focus>") == 0 ||
+                         text.compare(i, 9, "</local>") == 0);
+                if (!glued_return) {
+                    continue;
+                }
+            }
+            lt = i;
+        }
+        return lt != std::string::npos && da_tag_prefix(text.substr(lt));
+    }
+
     // DA tag state machine (P3): process every control tag that has closed
     // since the last call and apply the mode transition to the KV cache.
     // Called from process_token() after each generated token is appended to
@@ -4737,6 +4829,11 @@ private:
                         : tag.start;
             }
             slot.da_tag_scan_pos = tag.start;
+
+            // The first token after a mode transition must follow the
+            // single-token trajectory (see the DA tag gate in the draft
+            // decision) - the next draft step of this slot is skipped.
+            slot.da_skip_draft = true;
 
             // Phase 0 (g measurement): remember where the first restriction
             // tag (<focus>/<local>) closed. release() combines this with the
