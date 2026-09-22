@@ -17,6 +17,37 @@ The dense path stays bit-identical (constexpr folding), so sparse never changes 
 
 ---
 
+## Verified: DA survives auto-compaction (GPU, 2026-09-23)
+
+The production failure mode - an agent session that ran DA for several turns gets
+auto-compacted (the conversation is replaced by a summary) and then behaves as if it lost
+all memory - is fixed and verified end to end on the production model (qwen3.8-27B, RTX 5090).
+
+Root cause: the summarizer reproduces the DA marker text verbatim inside the summary, and
+the old "last footer wins" scanner then pinned attention to that dead block. The fix is
+**tail anchoring**: the marker scanner only accepts a block that sits after the last
+user-message boundary of the rendered prompt, so a dead block copied into a summary is never
+a candidate and the request fails open to the live block instead.
+
+`da-probe/da_e2e_compaction.py` reproduces the failure mode on the marker path
+(`--da-prompt-scan`, the production path) with the real FocusMemory hook block shape and a
+simulated compaction:
+
+| Phase | Scenario | Result |
+|---|---|---|
+| A | 3 turns, live `[[da:N]]` blocks (1-5 / 6-10 / 11-15) | ✅ 3/3 CORRECT |
+| B | Summary carries a **dead** block (1-5) + a new live block (16-20) | ✅ CORRECT - dead block ignored |
+| C | Post-compact turn, live block (21-25) | ✅ CORRECT |
+
+Journal: 5/5 `da_scan:` lines with the expected chunk ranges (1..5 → 21..25), 0 fail-open
+lines. Supporting engine work verified on the same box: P1 dead-marker smoke 3/3, P2a
+multi-turn reversibility + instruction placement 3/3, P2b paper-aligned chunking 4/4
+(packing / hard-cap / prose / 50K - all mean chunk sizes ≤ the 2560-token cap).
+
+**Status: verified on the GPU box; the production node deploy is a separate step.**
+
+---
+
 ## What this is
 
 `focus-llama` is a research fork of `llama.cpp` for experimenting with **Declarative Attention (DA)**, a protocol from
@@ -228,6 +259,27 @@ closed thinking block (`
 tag instead of answering straight. On a larger model with the proper chat template this priming should
 not be needed.
 
+### 4. DA survives auto-compaction (`da_e2e_compaction`)
+
+The end-to-end check for the production failure mode: a DA session that gets
+auto-compacted (the conversation replaced by a summary) must keep retrieving.
+The driver sends the real FocusMemory hook block shape (a verbatim port of
+`buildDaBlock`) and simulates a compaction by replacing the history with a
+summary that carries a **dead** marker block, then a new turn with a **live**
+block. The marker scanner must tail-anchor to the last user message, ignore
+the dead block, and validate the live one.
+
+```bash
+./build/bin/llama-server -m <model>.gguf --da-prompt-scan --parallel 1 -c 8192 -v
+python3 da-probe/da_e2e_compaction.py http://127.0.0.1:8086 --log /tmp/da_e2e.log
+```
+
+Three phases (A: 3 live-block turns, B: summary with a dead block + a new live
+block, C: a post-compact turn). PASS requires all five answers CORRECT, 5/5
+`da_scan:` journal lines with chunk ranges 1..5 → 21..25, and 0 fail-open
+lines. The Phase B line is the money check: the compacted prompt was scanned
+(not failed open) and the live block won over the dead summary block.
+
 ### Reading the server log
 
 ```bash
@@ -262,10 +314,15 @@ There are two ways to get a chunk layout onto the wire:
    server scans the rendered prompt, maps the markers to token ranges, and the model's
    `<focus magic_chunks="N">` tag decides which chunk the next tokens attend to. The marker block
    sits at the prompt tail, so DA only touches the injected memory index - the rest of the
-   conversation is untouched. This is the path that works reliably with live agent sessions.
+   conversation is untouched. The scanner **tail-anchors** to the last user-message boundary, so a
+   marker block that a compaction summary reproduces in the history is ignored (fail-open) and a DA
+   session keeps working after auto-compaction - see *Verified: DA survives auto-compaction*. This
+   is the path that works reliably with live agent sessions.
 2. **Auto-chunking (`--da-auto`, experimental - do not run on live agent sessions).** The server
-   splits the rendered chat prompt itself at message boundaries into 2K-token magic chunks, so the
-   client sends a plain request with nothing extra. Known limitations, observed in production:
+   splits the rendered chat prompt itself into ~2048-token magic chunks (hard cap 2560 = 5/4 ×
+   target), packing across message boundaries and falling back paragraph → line → sentence →
+   clause → word when a message has too few boundaries, so the client sends a plain request with
+   nothing extra. Known limitations, observed in production:
    - **Output corruption on agent sessions.** Auto-chunking re-chunks the *entire* conversation
      (history + tool I/O) on every turn once the prompt passes `--da-min-ctx`. The DA tag
      state machine (tail hold-back + spec batch cut) then operates on the model's whole output
