@@ -15,6 +15,11 @@
 # block-buffered stdout (8KB) hides the da_scan:/da_auto: lines until the
 # buffer flushes -> false "no journal line" failures.
 #
+# The server log is streamed live to the terminal (tail -f) and progress is
+# printed every 10s while the model loads, so startup is never silent. A
+# dead server process is detected immediately instead of polling 240s.
+# Ctrl-C cleans up the server + tail (trap).
+#
 # Prereq: git pull + cmake --build build --target llama-server (on 123)
 #
 # Usage (123, anywhere):
@@ -36,6 +41,14 @@ LOG1=/tmp/da_verify_p1_$TS.log
 LOG2A=/tmp/da_verify_p2a_$TS.log
 LOG2B=/tmp/da_verify_p2b_$TS.log
 SPEC_ARGS=${SPEC_ARGS:-}
+SRV=
+TAIL=
+
+cleanup() {
+    [ -n "${TAIL:-}" ] && kill "$TAIL" 2>/dev/null
+    [ -n "${SRV:-}" ] && kill "$SRV" 2>/dev/null
+}
+trap cleanup INT TERM
 
 if [ ! -x ./build/bin/llama-server ]; then
     echo "FATAL: ./build/bin/llama-server not found - build first:"
@@ -48,29 +61,45 @@ if [ ! -f "$MODEL" ]; then
 fi
 
 start_server() {  # $1 = log, rest = extra args
+    echo "  killing any existing server on port $PORT, then starting..."
     pkill -f "llama-server .*--port $PORT" 2>/dev/null || true
     sleep 3
     stdbuf -o0 -e0 ./build/bin/llama-server -m "$MODEL" -ctk q4_0 -ctv q4_0 \
         --port "$PORT" $SPEC_ARGS "$@" > "$1" 2>&1 &
     SRV=$!
+    tail -f "$1" &
+    TAIL=$!
     local code
     for i in $(seq 1 240); do
+        if ! kill -0 "$SRV" 2>/dev/null; then
+            kill "$TAIL" 2>/dev/null; TAIL=
+            echo "FATAL: server process died during startup - last log lines:"
+            tail -20 "$1"
+            return 1
+        fi
         code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$PORT/health" 2>/dev/null)
-        [ "$code" = "200" ] && { echo "server pid=$SRV READY after ${i}s  log=$1"; return 0; }
+        if [ "$code" = "200" ]; then
+            echo "server pid=$SRV READY after ${i}s  log=$1"
+            return 0
+        fi
+        [ $((i % 10 == 0)) ] && echo "  ... still loading model (${i}s)"
         sleep 1
     done
-    echo "SERVER FAILED TO START - last log lines:"
+    echo "TIMEOUT: server not healthy after 240s - last log lines:"
     tail -20 "$1"
     return 1
 }
 
 stop_server() {
+    [ -n "${TAIL:-}" ] && kill "$TAIL" 2>/dev/null
+    TAIL=
     [ -n "${SRV:-}" ] && kill "$SRV" 2>/dev/null
     [ -n "${SRV:-}" ] && wait "$SRV" 2>/dev/null
     SRV=
 }
 
 echo "===================================================================="
+echo "repo head: $(git log --oneline -1 2>/dev/null || echo '(not a git repo)')"
 echo "model : $MODEL"
 echo "port  : $PORT   spec args: ${SPEC_ARGS:-(none)}"
 echo "===================================================================="
