@@ -6086,7 +6086,10 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                                 ok = false;
                                 break;
                             }
-                            chunks.push_back({ (int32_t) (c + 1), hi - lo });
+                            // (start, end) token range, per the da_chunks contract
+                            // (server-task.h) and the P1 hook path: apply_da_b/
+                            // apply_da_rm consume these as [lo, hi) removal ranges.
+                            chunks.push_back({ lo, hi });
                         }
                     }
                     std::pair<int32_t, int32_t> filler = { -1, -1 };
@@ -6096,7 +6099,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                         if (lo < 0 || hi < 0 || hi <= lo) {
                             ok = false;
                         } else {
-                            filler = { lo, hi - lo };
+                            filler = { lo, hi };
                         }
                     }
                     if (!ok) {
