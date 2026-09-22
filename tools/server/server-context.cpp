@@ -1477,7 +1477,16 @@ private:
         // try speculative decoding
         if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
             try {
-                spec.reset(common_speculative_init(params_base.speculative, params_base.n_parallel));
+                // In --kv-unified mode the 2-stream (B) DA path reserves one extra
+                // sequence id (n_slots, see apply_da_b) that both ctxs already accept
+                // (n_seq_max = n_parallel + 1, bumped above). The speculative per-seq
+                // state (dparams + each impl's per-seq vectors) must cover that id too,
+                // or a B slot drafting on da_seq hits the `seq_id < dparams.size()`
+                // assert. The extra id stays idle (drafting=false) until a B slot uses
+                // it, so non-B / non-unified paths are unaffected.
+                const uint32_t n_seq_spec =
+                        (uint32_t) params_base.n_parallel + (params_base.kv_unified ? 1u : 0u);
+                spec.reset(common_speculative_init(params_base.speculative, n_seq_spec));
             } catch (const std::exception & e) {
                 SRV_ERR("failed to initialize speculative decoding context: %s\n", e.what());
                 if (params_base.speculative.has_synth()) {
