@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Smoke test for the da_auto_chunk paper alignment (P2).
 
-Verifies the three new chunking behaviors via the server journal line
+Verifies the chunking behaviors via the server journal line
 "da_auto: N chunk(s) from M source message(s), T token(s) - B path":
 
   packing     - many tiny messages are packed across message boundaries
@@ -10,21 +10,35 @@ Verifies the three new chunking behaviors via the server journal line
                 <= hard cap)
   hard_cap    - a single boundary-free message over the hard cap
                 (2048*5/4 = 2560) is force-cut into pieces <= the cap
-                (a ~5K-token whitespace-free blob must become >= 2 chunks;
-                the pre-fix code kept it as one 5K-token chunk)
+                (a ~12K-token whitespace-free blob must become >= 2 chunks;
+                the pre-fix code kept it as one uncapped chunk)
   prose       - a single ~25K-token prose message (140 paras) is split at
                 sentence boundaries and packed into target-sized chunks
                 (regression guard for the existing levels 0-2)
   perf_50k    - a ~50K-token single message: report the chunking wall time
-                (task start -> da_auto journal line) as the performance
+                (request start -> da_auto journal line) as the performance
                 baseline (plan section 5)
+
+Journal reading design (robust to stdout buffering):
+  The server log may be block-buffered (through `tee` or the stdio layer),
+  so a da_auto line can reach the file seconds after the HTTP response.
+  Per-request log reads therefore CANNOT be trusted (verified on 123:
+  all 4 journal lines were in the log, yet per-request reads saw none).
+  Instead: run all cases first, then wait until the file contains one
+  da_auto line per case and match them in order. The cases run
+  sequentially on one server and the log is append-only, so the i-th new
+  da_auto line is the i-th case. The chunking wall time pairs each line
+  with the nearest preceding 'Using specialized template' line (the
+  completion handler logs it right before da_auto_chunk runs).
 
 Usage:
   python3 da_chunking_smoke.py [BASE_URL] --log /path/to/server.log
       [--target 2048]
 
   BASE_URL  default: http://127.0.0.1:8087
-  --log     server log file (required: the verdict is journal-based)
+  --log     server log file (required: the verdict is journal-based).
+            Must be the CURRENT server's stdout target - the server should
+            have been (re)started with `> /path/to/server.log 2>&1`.
   --target  the server's --da-chunk-tokens value (hard cap = 5/4 x target)
 
 Server launch (local, B path, default chunk target 2048 / cap 2560):
@@ -48,6 +62,8 @@ SYSTEM = ("You are a precise retrieval assistant. Answer using only the "
 DA_AUTO_RE = re.compile(
     r"da_auto: (\d+) chunk\(s\) from (\d+) source message\(s\), (\d+) token\(s\)")
 
+REQ_START_MARKER = "Using specialized template"
+
 
 def post(path, body, timeout=600):
     req = urllib.request.Request(BASE + path, data=json.dumps(body).encode(),
@@ -64,35 +80,9 @@ def chat(messages, max_tokens=16):
     return res, time.time() - t0
 
 
-def log_new_lines():
-    """New server-log lines since the previous call (or start of file)."""
-    global LOG
-    if not LOG or not os.path.exists(LOG):
-        return None
-    prev = getattr(log_new_lines, "offset", 0)
+def read_lines():
     with open(LOG, "r", errors="replace") as f:
-        f.seek(prev)
-        data = f.read()
-        log_new_lines.offset = f.tell()
-    return data
-
-
-def wait_for_journal(timeout=20.0):
-    """Log lines, polled until the da_auto line lands (or timeout).
-
-    The server log may pass through `tee` (8KB block buffering): for a small
-    request the journal line can lag the HTTP response by seconds. A single
-    read right after the response misses it and the case fails even though
-    the chunking happened (verified on 123: all 4 da_auto lines existed in
-    the log, yet the single-read smoke reported none)."""
-    seg = log_new_lines() or ""
-    t0 = time.time()
-    while chunk_info(seg) is None and time.time() - t0 < timeout:
-        time.sleep(0.25)
-        more = log_new_lines() or ""
-        if more:
-            seg += more
-    return seg
+        return f.read().splitlines()
 
 
 def ts_seconds(line):
@@ -104,23 +94,30 @@ def ts_seconds(line):
         + int(m.group(4)) / 1e6
 
 
-def chunk_info(seg):
-    """Parse the da_auto journal line from a log segment; also the chunking
-    wall time (first 'processing task' line -> da_auto line)."""
-    m = None
-    t_start = None
-    for line in seg.splitlines():
-        if t_start is None and "processing task" in line:
-            t_start = ts_seconds(line)
+def chunking_times(lines, base):
+    """The da_auto lines after the first `base`, in log order. Each is
+    paired with its chunking wall time (nearest preceding request-start
+    marker). Returns [(n_chunks, n_msgs, n_tokens, dt_or_None), ...]."""
+    out = []
+    seen = 0
+    for i, line in enumerate(lines):
         m = DA_AUTO_RE.search(line)
-        if m and t_start is not None:
-            t_auto = ts_seconds(line)
-            if t_auto is not None:
-                return (int(m.group(1)), int(m.group(2)), int(m.group(3)),
-                        t_auto - t_start)
-    if m:
-        return (int(m.group(1)), int(m.group(2)), int(m.group(3)), None)
-    return None
+        if not m:
+            continue
+        seen += 1
+        if seen <= base:
+            continue
+        t_auto = ts_seconds(line)
+        dt = None
+        if t_auto is not None:
+            for j in range(i - 1, max(i - 20, -1), -1):
+                if REQ_START_MARKER in lines[j]:
+                    t_start = ts_seconds(lines[j])
+                    if t_start is not None:
+                        dt = t_auto - t_start
+                    break
+        out.append((int(m.group(1)), int(m.group(2)), int(m.group(3)), dt))
+    return out
 
 
 def make_blob(n_chars):
@@ -152,15 +149,15 @@ def main():
     print("-" * 72)
 
     # case 1: packing - 300 tiny user messages (~15 tokens each)
-    tiny = [("Note %03d: the valve pressure reading is %.1f bar nominal."
-             % (i, 10 + (i % 50) / 4.0)) for i in range(300)]
+    tiny = ["Note %03d: the valve pressure reading is %.1f bar nominal."
+            % (i, 10 + (i % 50) / 4.0) for i in range(300)]
     msgs_packing = [{"role": "system", "content": SYSTEM}]
     for t in tiny:
         msgs_packing.append({"role": "user", "content": t})
     msgs_packing.append({"role": "user", "content":
                          "Question: How many notes were listed?"})
 
-    # case 2: hard cap - one ~5K-token boundary-free blob
+    # case 2: hard cap - one ~12K-token boundary-free blob
     blob = make_blob(15000)
     msgs_blob = [
         {"role": "system", "content": SYSTEM},
@@ -168,7 +165,7 @@ def main():
         {"role": "user", "content": "Question: How long is the payload?"},
     ]
 
-    # case 3: prose - one ~4.5K-token sentence-rich message
+    # case 3: prose - one ~25K-token sentence-rich message (140 paras)
     sentence = ("The relay unit in sector %02d reports a nominal temperature "
                 "of 41 degrees and a current draw of 12 amps. ")
     prose = "\n\n".join(" ".join(sentence % (i * 10 + j)
@@ -192,9 +189,9 @@ def main():
 
     # hard cap = 5/4 of the chunk target (default target 2048 -> cap 2560).
     # The server flag is --da-chunk-tokens; pass --target to match a custom
-    # server (e.g. the local 8086 smoke server runs target 4096 -> cap 5120).
+    # server (e.g. a smoke server running target 4096 -> cap 5120).
     target = 2048
-    if "--target" in [a for a in sys.argv[1:]]:
+    if "--target" in sys.argv[1:]:
         i = sys.argv.index("--target")
         target = int(sys.argv[i + 1])
     cap = int(target * 5 / 4)
@@ -220,24 +217,43 @@ def main():
          ">=2 chunks, avg <= cap %d; report chunking wall time" % cap),
     ]
 
-    all_ok = True
+    # Baseline: da_auto lines already in the log (0 for a fresh server log -
+    # the server truncates it at startup).
+    base = sum(1 for l in read_lines() if DA_AUTO_RE.search(l))
+    if base:
+        print("note   : %d pre-existing da_auto line(s) in the log - "
+              "restart the server (fresh log) for a clean run" % base)
+    print("(running %d cases...)" % len(cases))
+
+    results = []
     for name, messages, check, expect in cases:
-        log_new_lines()  # reset the offset before this request
         try:
             res, wall = chat(messages)
         except (urllib.error.HTTPError, urllib.error.URLError) as e:
             print("%-10s: HTTP ERROR %s" % (name, e))
-            all_ok = False
+            results.append((wall, None))
             continue
-        seg = wait_for_journal()
-        info = chunk_info(seg)
         n_prompt = (res.get("timings") or {}).get("prompt_n")
-        if info is None:
-            print("%-10s: FAIL  (no da_auto journal line - check the log)" % name)
-            print("          NOTE: is the server running with --da-auto --kv-unified?")
+        results.append((wall, n_prompt))
+
+    # Wait until every case has a journal line (buffered stdout can delay
+    # them well past the HTTP response), then match in order.
+    deadline = time.time() + 60.0
+    times = chunking_times(read_lines(), base)
+    while len(times) < len(cases) and time.time() < deadline:
+        time.sleep(1.0)
+        times = chunking_times(read_lines(), base)
+
+    all_ok = True
+    for idx, (name, messages, check, expect) in enumerate(cases):
+        wall, n_prompt = results[idx]
+        if idx >= len(times):
+            print("%-10s: FAIL  (no da_auto journal line after 60s wait)" % name)
+            print("          NOTE: is the running server writing to %s?" % LOG)
+            print("          check: readlink /proc/$(pgrep -f llama-server)/fd/1")
             all_ok = False
             continue
-        n_c, n_m, n_t, dt = info
+        n_c, n_m, n_t, dt = times[idx]
         ok = check(n_c, n_m, n_t, dt)
         all_ok = all_ok and ok
         dt_s = ("chunking=%.3fs" % dt) if dt is not None else "chunking=n/a"
