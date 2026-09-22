@@ -79,14 +79,24 @@ def post(base, path, body, timeout=600):
 
 
 def chat(base, model, messages, temperature, max_tokens):
+    # NO stop=["\n"]: the model is a thinking model (generation starts inside an
+    # open <thinking> block) and the DA protocol needs newlines (the
+    # <focus magic_chunks> tag sits on its own line). A "\n" stop halts on the
+    # very first generated newline -> empty content, no tag ever emitted
+    # (verified on 123: 3 turns, each "eval 0.00 ms / 1 token", generated "").
+    # Bound length with max_tokens instead; a thinking model needs enough budget
+    # to think + emit the tag + answer.
     body = {"model": model, "messages": messages, "temperature": temperature,
-            "max_tokens": max_tokens, "stop": ["\n"], "stream": False}
+            "max_tokens": max_tokens, "stream": False}
     t0 = time.time()
     res = post(base, "/v1/chat/completions", body)
     wall = time.time() - t0
-    text = res["choices"][0]["message"]["content"]
+    msg = res["choices"][0]["message"]
+    text = msg.get("content") or ""
+    reason = msg.get("reasoning_content") or ""
     tim = res.get("timings", {})
-    return {"text": text, "wall": wall, "tps": tim.get("predicted_per_second"),
+    return {"text": text, "reason": reason, "wall": wall,
+            "tps": tim.get("predicted_per_second"),
             "n_gen": tim.get("predicted_n"), "n_prompt": tim.get("prompt_n")}
 
 
@@ -114,14 +124,24 @@ def run_conversation(base, model, filler_paras, temperature, max_tokens, verbose
     for name, codeword, _ in FACTS:
         messages.append({"role": "user", "content": question_text(name)})
         r = chat(base, model, messages, temperature, max_tokens)
-        ok = codeword in r["text"]
-        turns.append({"name": name, "codeword": codeword, "ok": ok, **r})
+        # "fact accessible" = codeword appears anywhere the model generated
+        # (content answer OR reasoning). A physically-removed KV chunk cannot be
+        # reproduced in either, so absence from both = the fact is gone.
+        ok = codeword in (r["text"] + r["reason"])
+        in_content = codeword in r["text"]
+        in_reason = (not in_content) and (codeword in r["reason"])
+        turns.append({"name": name, "codeword": codeword, "ok": ok,
+                      "in_content": in_content, "in_reason": in_reason, **r})
+        # feed back only the visible answer (content) so the next turn's prompt
+        # matches what a real client would send (reasoning is not echoed)
         messages.append({"role": "assistant", "content": r["text"]})
         if verbose:
-            print("turn %-5s expect=%-8s ok=%-5s n_prompt=%s tps=%s"
+            where = "content" if in_content else ("reasoning" if in_reason else "ABSENT")
+            print("turn %-5s expect=%-8s ok=%-5s n_prompt=%s tps=%s  fact in %s"
                   % (name, codeword, "PASS" if ok else "FAIL",
-                     r["n_prompt"], "%.1f" % r["tps"] if r["tps"] else "?"))
-            print("          reply: %r" % r["text"][:120])
+                     r["n_prompt"], "%.1f" % r["tps"] if r["tps"] else "?", where))
+            print("          content: %r" % r["text"][:120])
+            print("          reason : %r" % r["reason"][:120])
     return turns
 
 
@@ -186,7 +206,8 @@ def main():
     ap.add_argument("--model", default="qwen27b")
     ap.add_argument("--temperature", type=float, default=0.0,
                     help="결정성을 위해 기본 0 (모델의 focus 발화를 고정)")
-    ap.add_argument("--max-tokens", type=int, default=48)
+    ap.add_argument("--max-tokens", type=int, default=256,
+                    help="생각(thinking) 모델이 생각+focus 태그+답안까지 생성할 예산")
     ap.add_argument("--filler-paras", type=int, default=30,
                     help="섹션당 filler 단락 수 (setup을 da-min-ctx 초과로 만들)")
     ap.add_argument("--server-log", default=None,
