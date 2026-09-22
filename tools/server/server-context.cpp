@@ -2119,7 +2119,8 @@ private:
                     // clamp like the stop-word path above: a stop-word erase
                     // can truncate generated_text past n_sent_text
                     da_hold = da_tag_hold_len(slot.generated_text.substr(
-                            std::min(slot.n_sent_text, slot.generated_text.size())));
+                            std::min(slot.n_sent_text, slot.generated_text.size())),
+                            slot.da_mode);
                 }
                 const size_t send_end = slot.generated_text.size() - da_hold;
                 result.text_to_send = slot.generated_text.substr(pos, send_end - pos);
@@ -4707,26 +4708,6 @@ private:
         return best;
     }
 
-    // Longest suffix of `unsent` that is a prefix of a DA tag opener - the
-    // number of trailing characters process_token() must hold back from the
-    // output stream while the fragment could still grow into a control tag.
-    static size_t da_tag_hold_len(const std::string & unsent) {
-        static const char * const openers[] = {
-            "<focus magic_chunks=", "<local>", "</focus>", "</local>",
-        };
-        size_t hold = 0;
-        for (const char * opener : openers) {
-            const size_t olen = std::strlen(opener);
-            for (size_t l = std::min(unsent.size(), olen); l > hold; l--) {
-                if (unsent.compare(unsent.size() - l, l, opener, l) == 0) {
-                    hold = l;
-                    break;
-                }
-            }
-        }
-        return hold;
-    }
-
     // True while the candidate fragment (a suffix of the generated text
     // starting at a tag-start '<') could still grow into a complete DA tag:
     // a proper prefix of a fixed tag, or the <focus magic_chunks="N"> head
@@ -4761,6 +4742,34 @@ private:
             return true;  // number run open, the tag may still close
         }
         return false;
+    }
+
+    // Number of trailing characters of `unsent` that process_token() must
+    // hold back from the output stream while the tail could still grow into
+    // a complete DA tag. Holds from the last tag-start '<' (same start rule
+    // as scan_da_tag) through the in-progress fragment (da_tag_prefix). This
+    // covers the full <focus magic_chunks="N> prefix, not just the fixed
+    // opener: the old opener-only hold dropped to 0 the moment the model
+    // wrote the opening quote, flushing the tag head + chunk number to the
+    // client before the closing '>' completed and erased the tag (leaving a
+    // visible "<focus magic_chunks=\"N" stub). A complete tag is not held
+    // (apply_da_tag has already consumed it).
+    static size_t da_tag_hold_len(const std::string & unsent, da_mode_t mode) {
+        size_t lt = std::string::npos;
+        for (size_t i = unsent.find('<'); i != std::string::npos; i = unsent.find('<', i + 1)) {
+            if (i > 0 && !std::isspace((unsigned char) unsent[i - 1])) {
+                const bool glued_return =
+                        (mode != DA_MODE_GLOBAL) &&
+                        (unsent.compare(i, 8, "</focus>") == 0 ||
+                         unsent.compare(i, 9, "</local>") == 0);
+                if (!glued_return) {
+                    continue;
+                }
+            }
+            lt = i;
+        }
+        return (lt != std::string::npos && da_tag_prefix(unsent.substr(lt)))
+                ? (unsent.size() - lt) : 0;
     }
 
     // True while the generated tail could still grow into a complete DA tag:
@@ -4815,14 +4824,15 @@ private:
             // before it - the scanner returns the earliest tag)
             const size_t da_erased = tag.end - tag.start;
             slot.generated_text.erase(tag.start, da_erased);
-            // The tag may already be counted in n_sent_text: the holdback
-            // only covers the exact opener prefix, so once the model writes
-            // the attribute (e.g. "1"), the tag characters leak into the
-            // sent text before the closing '>' completes the tag. Reconcile
-            // the pointer so the send path (substr(n_sent_text)) stays in
-            // range: fully sent - shift back by the tag length (the tag
-            // stays visible in the client's output, v1-accepted); partially
-            // sent - clamp to the tag start.
+            // The in-progress tag is held back from the output stream by
+            // da_tag_hold_len() (the whole <focus magic_chunks="N> prefix,
+            // not just the opener), so by the time the tag closes it has
+            // normally NOT been sent: n_sent_text == tag.start and the
+            // branch below is a no-op. It remains as a safety net for the
+            // edge where part of the tag leaked (e.g. a literal tag the
+            // model emitted as data) - reconcile the pointer so the send
+            // path (substr(n_sent_text)) stays in range: fully sent - shift
+            // back by the tag length; partially sent - clamp to the start.
             if (slot.n_sent_text > tag.start) {
                 slot.n_sent_text = (slot.n_sent_text >= tag.end)
                         ? slot.n_sent_text - da_erased
@@ -6024,15 +6034,28 @@ static da_auto_layout da_auto_chunk(const llama_vocab * vocab, const std::string
         total_header_len += header.size();
     }
 
-    // the DA instruction (paper Appendix F, thinking off) - appended at the
-    // prompt tail, where the P1 hook places it too (recency + prefix-cache
-    // safe). It is the removable filler.
+    // the DA instruction (paper Appendix F) - appended at the prompt tail,
+    // where the P1 hook places it too (recency + prefix-cache safe). It is
+    // the removable filler. All three modes must be exposed: the pre-fix
+    // text knew only <focus> and assumed the answer sits in a chunk, so a
+    // question answerable from the model's own derived values had no escape
+    // route - the model focused an unrelated chunk and re-derived the same
+    // reasoning in a loop (plans/focus-llama-da-rederivation.md). The two
+    // Appendix F constraints are kept conditionally, not dropped: focus
+    // stays mandatory for unconfirmed values (hallucination guard + the
+    // focus/local switch that W2 read reduction relies on), and <local>
+    // stays for synthesis of already-confirmed values (re-derivation guard).
     const std::string instruction =
         "\n\nInstructions (Declarative Attention):\n"
         "The context above is split into numbered magic chunks marked by [Magic Chunk N] lines.\n"
-        "1. First identify the chunk that contains the answer to the question, and output the tag <focus magic_chunks=\"N\"> on its own line, where N is the chunk number (1-" +
-        std::to_string(n_chunks) + ").\n"
-        "2. Then answer the question.";
+        "Reason using three attention modes:\n"
+        "- <global> (default): all chunks visible. Use it only to identify which chunk to focus on next, briefly noting why.\n"
+        "- <focus magic_chunks=\"N\">: only chunk N visible (N is 1-" +
+        std::to_string(n_chunks) + "). Use it to extract or re-confirm the value(s) from chunk N. Close it with </focus>.\n"
+        "- <local>: no chunks visible, only the scaffold and your own response so far. Use it to reason over and synthesize values you have already extracted or derived, instead of re-reading chunks. Close it with </local>.\n"
+        "1. If you need a value you have not yet confirmed, focus the chunk that holds it - do not guess from memory.\n"
+        "2. If you can already answer from values you have confirmed or derived, use <local> to synthesize the answer instead of focusing on an unrelated chunk.\n"
+        "3. Then answer the question.";
     out.filler = { modified.size(), modified.size() + instruction.size() };
     modified += instruction;
 
