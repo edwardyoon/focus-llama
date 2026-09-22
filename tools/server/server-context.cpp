@@ -6011,9 +6011,25 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             // enough - split the rendered chat prompt into magic chunks
             // ourselves, re-tokenize, and map the layout to token ranges.
             // Any mapping failure leaves the original tokens untouched.
+            //
+            // da-auto is only safe with the reversible B-path (--kv-unified):
+            // the A-path (seq_rm) is irreversible, so a wrong-focus permanently
+            // deletes the answer chunk with no return (the "ZEBRA" incident).
+            // Without --kv-unified, stay vanilla rather than risk that.
             if (params.da_auto && prompt.is_string() && !da_media &&
                     task.params.da_chunks.empty() &&
-                    (int32_t) task.tokens.size() >= params.da_min_ctx) {
+                    (int32_t) task.tokens.size() >= params.da_min_ctx &&
+                    !params.kv_unified) {
+                static bool da_auto_needs_kvunified_warned = false;
+                if (!da_auto_needs_kvunified_warned) {
+                    da_auto_needs_kvunified_warned = true;
+                    SRV_WRN("%s", "da_auto: requires --kv-unified (reversible B-path) - staying VANILLA to avoid irreversible seq_rm deletion. Add --kv-unified to enable da-auto.\n");
+                }
+            }
+            if (params.da_auto && prompt.is_string() && !da_media &&
+                    task.params.da_chunks.empty() &&
+                    (int32_t) task.tokens.size() >= params.da_min_ctx &&
+                    params.kv_unified) {
                 const da_auto_layout layout =
                         da_auto_chunk(ctx_server.vocab, prompt.get<std::string>(), params.da_chunk_tokens);
                 if (layout.ok) {
