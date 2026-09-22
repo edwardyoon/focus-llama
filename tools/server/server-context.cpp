@@ -5750,89 +5750,196 @@ static bool da_scan_prompt(
     int32_t base = -1;
     bool accepted = false;
 
-    for (int fi = (int) footers.size() - 1; fi >= 0 && !accepted; --fi) {
-        const marker_t * footer  = footers[fi];
-        const size_t win_start   = fi >= 1 ? footers[fi - 1]->end : 0;
-
-        std::vector<marker_t> cand;
+    // k-anchor validation: the block is the LAST k chunk markers before the
+    // last filler before the footer, all within [from, footer); k comes from
+    // the footer's layout:N. Consecutive numbering (base >= 1) and the
+    // hook's filler signature must hold.
+    auto validate_block = [&](const marker_t * footer, size_t from, int32_t & out_base) {
+        const int32_t k = footer->num;
+        if (k < 1) {
+            return false;
+        }
         const marker_t * filler = nullptr;
-        bool multi_filler      = false;
         for (const auto & m : markers) {
-            if (m.start < win_start || m.start >= footer->start) {
-                continue;
+            if (m.kind == 1 && m.start >= from && m.start < footer->start) {
+                filler = &m;  // last filler before the footer
             }
-            if (m.kind == 1) {
-                if (filler != nullptr) {
-                    multi_filler = true;
-                } else {
-                    filler = &m;
+        }
+        if (filler == nullptr) {
+            return false;
+        }
+        std::vector<const marker_t *> chunks;
+        for (const auto & m : markers) {
+            if (m.kind == 0 && m.start >= from && m.start < filler->start) {
+                chunks.push_back(&m);
+            }
+        }
+        if ((int32_t) chunks.size() < k) {
+            return false;
+        }
+        int32_t b = -1;
+        for (int i = 0; i < k; i++) {
+            const marker_t * c = chunks[chunks.size() - k + i];
+            if (b < 0) {
+                b = c->num;
+                if (b < 1) {
+                    return false;
                 }
             }
-            cand.push_back(m);
-        }
-        if (multi_filler) {
-            continue;
-        }
-
-        const size_t n_chunks = std::count_if(cand.begin(), cand.end(),
-                [](const marker_t & m) { return m.kind == 0; });
-        if (n_chunks == 0 || footer->num != (int32_t) n_chunks) {
-            continue;  // junk footer (e.g. a "<da:layout:N>" template, atoi -> 0)
-        }
-
-        // chunk markers must be consecutive (k, k+1, ...); the session
-        // counter lets the block start at k > 1; the filler must follow
-        // all chunks
-        int32_t chunk_ordinal = 0;
-        int32_t cand_base     = -1;
-        bool ok = true;
-        for (const auto & m : cand) {
-            if (m.kind != 0) {
-                continue;
-            }
-            if (cand_base < 0) {
-                cand_base = m.num;
-                if (cand_base < 1) {
-                    ok = false;
-                    break;
-                }
-            }
-            chunk_ordinal++;
-            if (m.num != cand_base + (chunk_ordinal - 1)) {
-                ok = false;
-                break;
-            }
-            if (filler != nullptr && filler->start < m.start) {
-                ok = false;
-                break;
+            if (c->num != b + i) {
+                return false;
             }
         }
-        if (!ok || filler == nullptr) {
-            continue;
-        }
-
         // filler signature: the hook's fixed instruction names this block's
         // exact chunk range. Two substrings that bracket the <focus ...>
-        // tag (whose escaping may vary in the rendered prompt).
+        // tag (whose escaping may vary in the rendered prompt). (see
+        // buildDaBlock in FocusMemory/index.js - keep the two in sync)
         const std::string filler_text = text.substr(filler->end, footer->start - filler->end);
         char sig[160];
         snprintf(sig, sizeof(sig),
                  "Instructions (Declarative Attention): The memory entries above are numbered magic chunks (%d-%d). First identify",
-                 cand_base, cand_base + (int) n_chunks - 1);
+                 b, b + k - 1);
         if (filler_text.find(sig) == std::string::npos) {
-            continue;
+            return false;
         }
         snprintf(sig, sizeof(sig),
                  "on its own line, where N is the chunk number (%d-%d). Then answer the question.",
-                 cand_base, cand_base + (int) n_chunks - 1);
+                 b, b + k - 1);
         if (filler_text.find(sig) == std::string::npos) {
-            continue;
+            return false;
         }
+        block.clear();
+        for (int i = 0; i < k; i++) {
+            block.push_back(*chunks[chunks.size() - k + i]);
+        }
+        block.push_back(*filler);
+        block.push_back(*footer);  // footer as the final range boundary
+        out_base = b;
+        return true;
+    };
 
-        cand.push_back(*footer);  // footer as the final range boundary
-        block = std::move(cand);
-        base  = cand_base;
-        accepted = true;
+    // Tail anchoring (post-compaction dead-marker defense): the client hook
+    // appends the live block to the CURRENT user prompt - the last user
+    // message of the rendered prompt. Everything before it is history:
+    // previous turns' blocks, and a native compaction summary that may have
+    // copied old marker text verbatim. Only a footer after the last user
+    // boundary can be live, so a dead block always fails open instead of
+    // hijacking the layout (attention pinned to summary fragments).
+    //
+    // Anchor = end of the last "<|im_start|>user\n" boundary (qwen-family
+    // template; da_auto_chunk relies on the same shape). Tool results
+    // render as "<|im_start|>tool" (OpenAI role "tool"), so tool turns do
+    // not move the anchor. A prompt without any user boundary (non-qwen
+    // template) falls back to the legacy last-footer walk below.
+    size_t anchor = std::string::npos;
+    {
+        static const std::string user_bnd = "<|im_start|>user\n";
+        size_t p = text.find(user_bnd);
+        while (p != std::string::npos) {
+            anchor = p + user_bnd.size();
+            p = text.find(user_bnd, p + user_bnd.size());
+        }
+    }
+
+    if (anchor != std::string::npos) {
+        // strict path: footers are ascending, so stop at the first one
+        // before the anchor; try candidates from the last (a model-echoed
+        // junk footer after the live one simply fails the signature and the
+        // real footer is tried next)
+        for (int fi = (int) footers.size() - 1; fi >= 0 && !accepted; --fi) {
+            const marker_t * footer = footers[fi];
+            if (footer->start < anchor) {
+                break;
+            }
+            if (validate_block(footer, anchor, base)) {
+                accepted = true;
+            }
+        }
+    }
+    if (!accepted && anchor == std::string::npos) {
+        // legacy path (no user boundary - non-qwen template): last footer
+        // whose window [previous footer, footer) validates
+        for (int fi = (int) footers.size() - 1; fi >= 0 && !accepted; --fi) {
+            const marker_t * footer  = footers[fi];
+            const size_t win_start   = fi >= 1 ? footers[fi - 1]->end : 0;
+
+            std::vector<marker_t> cand;
+            const marker_t * filler = nullptr;
+            bool multi_filler      = false;
+            for (const auto & m : markers) {
+                if (m.start < win_start || m.start >= footer->start) {
+                    continue;
+                }
+                if (m.kind == 1) {
+                    if (filler != nullptr) {
+                        multi_filler = true;
+                    } else {
+                        filler = &m;
+                    }
+                }
+                cand.push_back(m);
+            }
+            if (multi_filler) {
+                continue;
+            }
+
+            const size_t n_chunks = std::count_if(cand.begin(), cand.end(),
+                    [](const marker_t & m) { return m.kind == 0; });
+            if (n_chunks == 0 || footer->num != (int32_t) n_chunks) {
+                continue;  // junk footer (e.g. a "<da:layout:N>" template, atoi -> 0)
+            }
+
+            // chunk markers must be consecutive (k, k+1, ...); the session
+            // counter lets the block start at k > 1; the filler must follow
+            // all chunks
+            int32_t chunk_ordinal = 0;
+            int32_t cand_base     = -1;
+            bool ok = true;
+            for (const auto & m : cand) {
+                if (m.kind != 0) {
+                    continue;
+                }
+                if (cand_base < 0) {
+                    cand_base = m.num;
+                    if (cand_base < 1) {
+                        ok = false;
+                        break;
+                    }
+                }
+                chunk_ordinal++;
+                if (m.num != cand_base + (chunk_ordinal - 1)) {
+                    ok = false;
+                    break;
+                }
+                if (filler != nullptr && filler->start < m.start) {
+                    ok = false;
+                    break;
+                }
+            }
+            if (!ok || filler == nullptr) {
+                continue;
+            }
+
+            const std::string filler_text = text.substr(filler->end, footer->start - filler->end);
+            char sig[160];
+            snprintf(sig, sizeof(sig),
+                     "Instructions (Declarative Attention): The memory entries above are numbered magic chunks (%d-%d). First identify",
+                     cand_base, cand_base + (int) n_chunks - 1);
+            if (filler_text.find(sig) == std::string::npos) {
+                continue;
+            }
+            snprintf(sig, sizeof(sig),
+                     "on its own line, where N is the chunk number (%d-%d). Then answer the question.",
+                     cand_base, cand_base + (int) n_chunks - 1);
+            if (filler_text.find(sig) == std::string::npos) {
+                continue;
+            }
+
+            cand.push_back(*footer);  // footer as the final range boundary
+            block = std::move(cand);
+            base  = cand_base;
+            accepted = true;
+        }
     }
 
     if (!accepted) {
@@ -5898,11 +6005,15 @@ static bool da_scan_prompt(
 // (qwen family template) into magic chunks itself:
 //   scaffold : system + the last user message + trailing assistant prefill
 //   chunks   : the middle messages, each headed by a [Magic Chunk N] line
-// A middle message longer than --da-chunk-tokens is split paragraph ->
-// line -> sentence into several chunks. The DA instruction is appended at
-// the prompt tail (the removable filler, mirroring the P1 hook layout).
-// The caller re-tokenizes the modified string and maps the returned char
-// positions to exact token ranges (strict walk, fail-open).
+// Consecutive middle messages are packed across message boundaries into
+// target-sized chunks (paper §2.1: 2048 target / 2560 hard cap), so a run
+// of small tool messages becomes one chunk instead of one chunk each. A
+// single message over the hard cap is split paragraph -> line -> sentence
+// -> clause -> word, force-cut at the cap when boundary-free. The DA
+// instruction is appended at the prompt tail (the removable filler,
+// mirroring the P1 hook layout). The caller re-tokenizes the modified
+// string and maps the returned char positions to exact token ranges
+// (lenient walk, fail-open).
 struct da_auto_layout {
     bool   ok = false;
     std::string modified;
@@ -5948,11 +6059,41 @@ static da_auto_layout da_auto_chunk(const llama_vocab * vocab, const std::string
         return (int32_t) common_tokenize(vocab, s, true, true).size();
     };
 
+    // hard cap (paper §F): the target is the packing budget; a segment may
+    // stand alone up to the hard cap, anything beyond is force-cut
+    const int32_t hard_cap = da_chunk_tokens * 5 / 4;  // 2048 -> 2560
+
+    // last-resort cut for boundary-free ranges (e.g. a base64 blob):
+    // binary-search the largest prefix within the hard cap
+    auto force_cut = [&](size_t lo, size_t hi) {
+        std::vector<std::pair<size_t, size_t>> out;
+        size_t cur = lo;
+        while (n_tok(text.substr(cur, hi - cur)) > hard_cap) {
+            size_t a = 1, b = hi - cur;
+            while (b - a > 1) {
+                const size_t mid = a + (b - a) / 2;
+                if (n_tok(text.substr(cur, mid)) <= hard_cap) {
+                    a = mid;
+                } else {
+                    b = mid;
+                }
+            }
+            out.push_back({ cur, a });
+            cur += a;
+        }
+        if (hi - cur > 0) {
+            out.push_back({ cur, hi - cur });
+        }
+        return out;
+    };
+
     // split [lo, hi) into offset ranges of at most da_chunk_tokens tokens,
-    // trying the separators in order: paragraph (blank line), line, sentence
+    // trying the separators in order (paper §2.1): paragraph (blank line),
+    // line, sentence, clause, word. A range between the target and the hard
+    // cap stands alone; beyond the hard cap it is force-cut.
     std::function<std::vector<std::pair<size_t, size_t>>(size_t, size_t, int)> split_range;
     split_range = [&](size_t lo, size_t hi, int level) -> std::vector<std::pair<size_t, size_t>> {
-        if (da_chunk_tokens <= 0 || hi - lo < 2 || n_tok(text.substr(lo, hi - lo)) <= da_chunk_tokens) {
+        if (da_chunk_tokens <= 0 || hi - lo < 2 || n_tok(text.substr(lo, hi - lo)) <= hard_cap) {
             return { { lo, hi - lo } };
         }
         std::vector<size_t> bounds = { lo };
@@ -5966,17 +6107,31 @@ static da_auto_layout da_auto_chunk(const llama_vocab * vocab, const std::string
                 bounds.push_back(p + 1);
                 p += 1;
             }
-        } else {
+        } else if (level == 2) {
             static const std::regex sent_re(R"([.!?．！？][ \t]*)");
             for (std::sregex_iterator it(text.cbegin() + lo, text.cbegin() + hi, sent_re), end; it != end; ++it) {
                 bounds.push_back(lo + (size_t) it->position(0) + (size_t) it->length(0));
             }
+        } else if (level == 3) {
+            // clause: ASCII : ; , require following whitespace (paper),
+            // fullwidth ；：，、 stand alone (CJK)
+            static const std::regex clause_re(R"(([:;,][ \t])|([；：，、]))");
+            for (std::sregex_iterator it(text.cbegin() + lo, text.cbegin() + hi, clause_re), end; it != end; ++it) {
+                bounds.push_back(lo + (size_t) it->position(0) + (size_t) it->length(0));
+            }
+        } else {
+            // word: any whitespace
+            for (size_t p = lo; p + 1 < hi; p++) {
+                if (text[p] == ' ' || text[p] == '\t') {
+                    bounds.push_back(p + 1);
+                }
+            }
         }
         if (bounds.size() < 3) {
-            if (level < 2) {
+            if (level < 4) {
                 return split_range(lo, hi, level + 1);
             }
-            return { { lo, hi - lo } };  // unsplittable: keep whole
+            return force_cut(lo, hi);  // no boundary at all: force-cut at the cap
         }
         if (bounds.back() != hi) {
             bounds.push_back(hi);
@@ -5984,7 +6139,7 @@ static da_auto_layout da_auto_chunk(const llama_vocab * vocab, const std::string
 
         // greedily pack the segments between the cut points: extend the
         // current range over consecutive segments until it would exceed the
-        // budget, then close it at the previous cut
+        // target, then close it at the previous cut
         std::vector<std::pair<size_t, size_t>> ranges;
         size_t cur_lo = bounds[0];
         for (size_t b = 1; b < bounds.size(); b++) {
@@ -5994,10 +6149,10 @@ static da_auto_layout da_auto_chunk(const llama_vocab * vocab, const std::string
             }
         }
         ranges.push_back({ cur_lo, bounds.back() - cur_lo });
-        // recurse on any range still too long
+        // recurse on any range still over the hard cap
         std::vector<std::pair<size_t, size_t>> result;
         for (auto & r : ranges) {
-            if (level < 2 && n_tok(text.substr(r.first, r.second)) > da_chunk_tokens) {
+            if (n_tok(text.substr(r.first, r.second)) > hard_cap) {
                 auto sub = split_range(r.first, r.first + r.second, level + 1);
                 result.insert(result.end(), sub.begin(), sub.end());
             } else {
@@ -6007,20 +6162,52 @@ static da_auto_layout da_auto_chunk(const llama_vocab * vocab, const std::string
         return result;
     };
 
-    // one [Magic Chunk N] header per piece, inserted right before the piece
+    // one [Magic Chunk N] header per chunk, inserted right before the chunk
     // (original-text positions; applied descending so earlier positions are
-    // not shifted)
-    std::vector<std::pair<size_t, int32_t>> ins;  // (original pos, chunk number)
-    int32_t n_chunks = 0;
+    // not shifted). Consecutive small messages are packed across message
+    // boundaries into target-sized chunks (a 17-token tool message joins a
+    // ~2048-token chunk instead of becoming a chunk of its own); a single
+    // message over the hard cap is split hierarchically.
+    std::vector<std::pair<size_t, size_t>> pieces;  // content range per middle message
     for (size_t i = 1; i < last_user; i++) {
         const size_t content_lo = msgs[i].role_end;
         const size_t content_hi = (i + 1 < msgs.size()) ? msgs[i + 1].start : text.size();
         out.n_source_msgs++;
-        for (auto & r : split_range(content_lo, content_hi, 0)) {
-            n_chunks++;
-            ins.push_back({ r.first, n_chunks });
+        if (content_hi > content_lo) {
+            pieces.push_back({ content_lo, content_hi });
         }
     }
+
+    std::vector<std::pair<size_t, int32_t>> ins;  // (original pos, chunk number)
+    int32_t n_chunks = 0;
+    size_t cur_lo = 0;
+    bool cur_open = false;
+    auto close_cur = [&]() {
+        if (cur_open) {
+            n_chunks++;
+            ins.push_back({ cur_lo, n_chunks });
+            cur_open = false;
+        }
+    };
+    for (const auto & pc : pieces) {
+        const size_t lo = pc.first, hi = pc.second;
+        if (cur_open && n_tok(text.substr(cur_lo, hi - cur_lo)) <= da_chunk_tokens) {
+            continue;  // fits: extend the open chunk over the message boundary
+        }
+        close_cur();
+        if (n_tok(text.substr(lo, hi - lo)) <= hard_cap) {
+            cur_lo   = lo;  // opens a chunk (may absorb following small pieces)
+            cur_open = true;
+        } else {
+            // one piece alone over the hard cap: split hierarchically, each
+            // resulting piece is a chunk of its own
+            for (auto & r : split_range(lo, hi, 0)) {
+                n_chunks++;
+                ins.push_back({ r.first, n_chunks });
+            }
+        }
+    }
+    close_cur();
     if (ins.empty()) {
         return out;
     }
@@ -6034,8 +6221,14 @@ static da_auto_layout da_auto_chunk(const llama_vocab * vocab, const std::string
         total_header_len += header.size();
     }
 
-    // the DA instruction (paper Appendix F) - appended at the prompt tail,
-    // where the P1 hook places it too (recency + prefix-cache safe). It is
+    // the DA instruction (paper Appendix F). Placement: at the end of the
+    // LAST USER MESSAGE (before its im_start/think terminator), exactly
+    // where the P1 marker path puts its block - the rendered prompt then
+    // still ends with the template's assistant opener and generation starts
+    // from the model's normal turn position. Appending after the opener
+    // instead (the pre-fix layout) makes the model treat its own turn as
+    // already started and emit EOS immediately (A/B verified on Bonsai-8B:
+    // n_gen=1 vs n_gen=64, same prompt, only the placement differs). It is
     // the removable filler. All three modes must be exposed: the pre-fix
     // text knew only <focus> and assumed the answer sits in a chunk, so a
     // question answerable from the model's own derived values had no escape
@@ -6056,8 +6249,36 @@ static da_auto_layout da_auto_chunk(const llama_vocab * vocab, const std::string
         "1. If you need a value you have not yet confirmed, focus the chunk that holds it - do not guess from memory.\n"
         "2. If you can already answer from values you have confirmed or derived, use <local> to synthesize the answer instead of focusing on an unrelated chunk.\n"
         "3. Then answer the question.";
-    out.filler = { modified.size(), modified.size() + instruction.size() };
-    modified += instruction;
+    // find the end of the last user message. The rendered qwen prompt
+    // ends with the final assistant opener (im_start assistant + LF),
+    // optionally followed by the thinking openers, preceded by the last
+    // message's terminator (im_start im_end + LF). Insert the
+    // instruction right before that terminator - at the end of the user
+    // content - so the rendered prompt continues with exactly the
+    // template tail and generation starts from the model's normal turn
+    // position. Appending after the opener instead makes the model emit
+    // EOS immediately (A/B verified on Bonsai-8B: n_gen=1 vs n_gen=64).
+    // Non-qwen shapes keep the legacy tail append. The tags are assembled
+    // from parts because the full tokens do not survive inline editing.
+    // Logic verified by da-probe/da_placement_test.cpp (7/7 PASS).
+    const std::string user_term = std::string("<") + "|im_end|" + ">";
+    const std::string asst_open = std::string("<") + "|im_start|>assistant\n";
+    // instr_pos is in the post-header-insertion coordinate space
+    // (modified carries the headers at this point)
+    size_t instr_pos = modified.size();
+    const size_t opener = modified.rfind(asst_open);
+    if (opener != std::string::npos) {
+        // the terminator must end at or before the opener start
+        const size_t limit = opener >= user_term.size() ? opener - user_term.size() : 0;
+        const size_t term = modified.rfind(user_term, limit);
+        if (term != std::string::npos) {
+            instr_pos = term;
+        }
+    }
+    out.filler = { instr_pos, instr_pos + instruction.size() };
+    modified.insert(instr_pos, instruction);
+
+
 
     // all header insertions sit before the last user message, so its start
     // shifts by the total header length
