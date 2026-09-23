@@ -4420,8 +4420,9 @@ private:
     // da_rm in [0, bound)) to a second sequence via llama_memory_seq_cp and
     // switch the slot's decode to that sequence. The original sequence is left
     // intact - B's unique value over the logical removal (A): a global return
-    // (attending the full prompt again) can reuse the original sequence
-    // without a re-prefill (the return function is not implemented yet).
+    // (attending the full prompt again) reuses the original sequence without
+    // a re-prefill - the close-tag handler (apply_da_tag case 2-5) copies the
+    // generated tail back and frees da_seq. A's removals stay irreversible.
     //
     // Read-reduction semantics: in the unified KV pool, seq_cp only retags
     // cell metadata - the cells are not moved and the attention scan range
