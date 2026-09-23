@@ -2604,7 +2604,7 @@ private:
                     (int) slot.prompt.n_tokens());
             // single line (newlines escaped) so a line-based journal filter can
             // capture the whole generation in one record
-            std::string gtext = slot.generated_text;
+            std::string gtext = slot.generated.text;
             std::string escaped;
             escaped.reserve(gtext.size());
             for (char c : gtext) {
@@ -4100,7 +4100,7 @@ private:
                     !slot.task->params.da_chunks.empty()) {
                     const bool da_just_closed = slot.da_skip_draft;
                     da_draft_gate = da_just_closed ||
-                            da_tag_inflight(slot.generated_text, slot.da_mode);
+                            da_tag_inflight(slot.generated.text, slot.da_mode);
                     slot.da_skip_draft = false;
                     if (da_draft_gate) {
                         if (da_just_closed) {

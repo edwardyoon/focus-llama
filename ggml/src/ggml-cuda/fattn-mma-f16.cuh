@@ -2133,7 +2133,9 @@ static __global__ void flash_attn_ext_f16(
 #endif // defined(FLASH_ATTN_AVAILABLE) && (defined(VOLTA_MMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE) || defined(AMD_MFMA_AVAILABLE))
 }
 
-bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_tensor * dst, const int ncols1, const int ncols2);
+bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+const char * ggml_cuda_flash_attn_ext_mma_f16_sparse_fail(ggml_backend_cuda_context & ctx, const ggml_tensor * dst);
+void ggml_cuda_fattn_sparse_gate_log(const char * path, bool use_sparse, ggml_tensor * dst, const char * fail);
 
 template <int DKQ, int DV, int ncols1, int ncols2>
 void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -2188,7 +2190,9 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
         constexpr bool use_logit_softcap = false;
 #if !defined(GGML_USE_MUSA)
         if constexpr (ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(DKQ, DV, ncols1, ncols2)) {
-            if (ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(cc, dst, ncols1, ncols2)) {
+            const bool sparse_ok = ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ctx, dst);
+            ggml_cuda_fattn_sparse_gate_log("MMA", sparse_ok, dst, sparse_ok ? nullptr : ggml_cuda_flash_attn_ext_mma_f16_sparse_fail(ctx, dst));
+            if (sparse_ok) {
                 constexpr bool use_sparse_kernel = true;
                 fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, use_sparse_kernel>;
                 use_sparse = true;
@@ -2211,6 +2215,7 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
         } else
 #endif // !defined(GGML_USE_MUSA)
         {
+            ggml_cuda_fattn_sparse_gate_log("MMA", false, dst, "no sparse kernel variant");
             constexpr bool use_sparse_kernel = false;
             fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, use_sparse_kernel>;
 
@@ -2221,6 +2226,7 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
             }
         }
     } else {
+        ggml_cuda_fattn_sparse_gate_log("MMA", false, dst, "logit_softcap!=0");
         constexpr bool use_logit_softcap = true;
         constexpr bool use_sparse_kernel = false;
         fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, use_sparse_kernel>;
