@@ -2372,6 +2372,9 @@ private:
                     (int) slot.da_seq, (int) slot.da_bound,
                     slot.da_keep_count, slot.n_da_removed,
                     (int) slot.prompt.n_tokens());
+#if 0  // disabled: re-logged the entire (17K+ char) generation on every DA request,
+      // flooding the journal. The compact "da: request complete" state line above
+      // stays. Re-enable for one-off answer-generation diagnosis only.
             // single line (newlines escaped) so a line-based journal filter can
             // capture the whole generation in one record
             std::string gtext = slot.generated_text;
@@ -2384,6 +2387,7 @@ private:
             }
             SLT_INF(slot, "da: generated_text (%zu chars): %s\n",
                     gtext.size(), escaped.c_str());
+#endif
         }
 
         // in stream mode, content and tokens are already in last partial chunk

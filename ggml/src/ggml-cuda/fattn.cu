@@ -197,7 +197,7 @@ const char * ggml_cuda_flash_attn_ext_mma_f16_sparse_fail(ggml_backend_cuda_cont
         return "mask->ne[2]!=1";
     }
     if (K->ne[1] < std::max<int64_t>(4096, 2LL * n_kv_max)) {
-        static thread_local char buf[64];
+        static thread_local char buf[128];
         snprintf(buf, sizeof(buf), "K->ne[1]=%lld < max(4096, 2*%d) (finite >= 50%%)",
                  (long long) K->ne[1], n_kv_max);
         return buf;
@@ -241,7 +241,7 @@ const char * ggml_cuda_flash_attn_ext_vec_sparse_fail(const ggml_tensor * dst) {
         return "logit_softcap!=0";
     }
     if (Q->ne[1] != 1) {
-        static thread_local char buf[64];
+        static thread_local char buf[128];
         snprintf(buf, sizeof(buf), "Q->ne[1]=%lld (multi-token batch)", (long long) Q->ne[1]);
         return buf;
     }
@@ -258,7 +258,7 @@ const char * ggml_cuda_flash_attn_ext_vec_sparse_fail(const ggml_tensor * dst) {
         return "mask->ne[2]!=1";
     }
     if (K->ne[1] < 2LL * n_kv_max) {
-        static thread_local char buf[64];
+        static thread_local char buf[128];
         snprintf(buf, sizeof(buf), "K->ne[1]=%lld < 2*n_kv_max=%d (finite >= 50%%)",
                  (long long) K->ne[1], 2 * n_kv_max);
         return buf;
