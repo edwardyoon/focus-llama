@@ -245,6 +245,7 @@ struct server_batch {
 //   <focus magic_chunks="N">  GLOBAL/LOCAL -> FOCUS (keep N)
 //   <local>                   GLOBAL/FOCUS -> LOCAL
 //   </focus> / </local>       FOCUS/LOCAL  -> GLOBAL (return)
+//   <global> / </global>      any          -> GLOBAL (explicit, no-op if there)
 enum da_mode_t { DA_MODE_GLOBAL = 0, DA_MODE_FOCUS, DA_MODE_LOCAL };
 
 struct server_slot {
@@ -4620,7 +4621,8 @@ private:
     // matching attention scope mid-decode:
     //   <focus magic_chunks="N">   enter FOCUS: keep chunk N (1-based) + scaffold
     //   <local>                   enter LOCAL: scaffold + generated only
-    //   </focus> / </local>        return to GLOBAL (full attention)
+    //   </focus> / </local>       return to GLOBAL (full attention)
+    //   <global> / </global>      (re)enter GLOBAL - no-op when already there
     // where scaffold = every prompt token outside the chunk/filler ranges
     // (system, the question, the injected instruction); the generated tail
     // is always attended.
@@ -4635,7 +4637,7 @@ private:
     // user); a trailing fragment that could still grow into a tag is held
     // back from the output stream by process_token() via da_tag_hold_len().
     struct da_tag_t {
-        int                  type      = -1; // 0=<focus N>, 1=<local>, 2=</focus>, 3=</local>
+        int                  type      = -1; // 0=<focus N>, 1=<local>, 2=</focus>, 3=</local>, 4=<global>, 5=</global>
         std::vector<int32_t> keep_nums;      // chunk numbers (type 0 only), as emitted
         size_t               start     = 0;  // char offset in the scanned text
         size_t               end       = 0;  // char offset just past the closing '>'
@@ -4647,7 +4649,7 @@ private:
     // A tag must start at the beginning of the text or right after
     // whitespace: the model emits it as a standalone token, and a literal
     // "<local>" inside a tool-call JSON string (preceded by '"' or ':') is
-    // data, not a control tag. Exception: a return tag (</focus>/</local>)
+    // data, not a control tag. Exception: a return tag (</focus>/</local>/</global>)
     // is control even when glued to the answer ("CODE</focus>", no space)
     // while the machine is in a restricted mode - that is the model's
     // natural output shape, and a misread in GLOBAL mode is harmless (the
@@ -4659,7 +4661,8 @@ private:
                 const bool glued_return =
                         (mode != DA_MODE_GLOBAL) &&
                         (text.compare(lt, 8, "</focus>") == 0 ||
-                         text.compare(lt, 9, "</local>") == 0);
+                         text.compare(lt, 8, "</local>") == 0 ||
+                         text.compare(lt, 9, "</global>") == 0);
                 if (!glued_return) {
                     continue;
                 }
@@ -4669,9 +4672,15 @@ private:
             if (text.compare(lt, 8, "</focus>") == 0) {
                 cand.type = 2;
                 cand.end  = lt + 8;
-            } else if (text.compare(lt, 9, "</local>") == 0) {
+            } else if (text.compare(lt, 8, "</local>") == 0) {
                 cand.type = 3;
+                cand.end  = lt + 8;
+            } else if (text.compare(lt, 9, "</global>") == 0) {
+                cand.type = 5;
                 cand.end  = lt + 9;
+            } else if (text.compare(lt, 8, "<global>") == 0) {
+                cand.type = 4;
+                cand.end  = lt + 8;
             } else if (text.compare(lt, 7, "<local>") == 0) {
                 cand.type = 1;
                 cand.end  = lt + 7;
@@ -4714,7 +4723,7 @@ private:
     // plus a digit run that is not closed yet. A complete tag returns false
     // (apply_da_tag() has consumed it).
     static bool da_tag_prefix(const std::string & s) {
-        static const char * const fixed[] = { "<local>", "</focus>", "</local>" };
+        static const char * const fixed[] = { "<local>", "</focus>", "</local>", "<global>", "</global>" };
         for (const char * t : fixed) {
             const size_t tl = std::strlen(t);
             if (s.size() < tl && s.compare(0, s.size(), t, s.size()) == 0) {
@@ -4761,7 +4770,8 @@ private:
                 const bool glued_return =
                         (mode != DA_MODE_GLOBAL) &&
                         (unsent.compare(i, 8, "</focus>") == 0 ||
-                         unsent.compare(i, 9, "</local>") == 0);
+                         unsent.compare(i, 8, "</local>") == 0 ||
+                         unsent.compare(i, 9, "</global>") == 0);
                 if (!glued_return) {
                     continue;
                 }
@@ -4783,7 +4793,8 @@ private:
                 const bool glued_return =
                         (mode != DA_MODE_GLOBAL) &&
                         (text.compare(i, 8, "</focus>") == 0 ||
-                         text.compare(i, 9, "</local>") == 0);
+                         text.compare(i, 8, "</local>") == 0 ||
+                         text.compare(i, 9, "</global>") == 0);
                 if (!glued_return) {
                     continue;
                 }
@@ -4848,9 +4859,9 @@ private:
             // Phase 0 (g measurement): remember where the first restriction
             // tag (<focus>/<local>) closed. release() combines this with the
             // total n_gen to report g = first_tag / total, the global-step
-            // share before the attention restriction kicked in. The return
-            // tags (</focus>/</local>, type 2/3) do not start the restricted
-            // phase, so they are not recorded here.
+            // share before the attention restriction kicked in. The non-restriction
+            // tags (</focus>/</local>/<global>/</global>, type 2-5) do not start
+            // the restricted phase, so they are not recorded here.
             if ((tag.type == 0 || tag.type == 1) && slot.da_first_tag_gen < 0) {
                 slot.da_first_tag_gen = (int32_t) slot.stats.n_gen;
             }
@@ -5035,7 +5046,9 @@ private:
                     break;
                 }
                 case 2:
-                case 3: { // </focus> / </local> : return to GLOBAL
+                case 3:
+                case 4:
+                case 5: { // </focus> / </local> / <global> / </global> : return to GLOBAL
                     if (in_local && tag.type == 2) {
                         SLT_WRN(slot, "%s", "da_tag: </focus> while in LOCAL - treating as </local>\n");
                     }
