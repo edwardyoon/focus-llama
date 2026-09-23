@@ -11,9 +11,24 @@ Declarative attention now reduces the **physical** KV read volume during decode 
 | **VEC sparse - f16 KV** | ✅ 3/3 byte-identical output, max\|Δlogprob\| = 0.000e+00, journal `n_kv_max 0→512` |
 | **VEC sparse - q4_0 KV** (production config) | ✅ 3/3 byte-identical output, max\|Δlogprob\| = 0.000e+00, journal `n_kv_max 0→512` |
 
-The dense path stays bit-identical (constexpr folding), so sparse never changes results when no ranges are removed. The MMA sparse path (f16 KV, K ≥ 8192) shares the same gate and is expected to fire first at 64K+ depth.
+The dense path stays bit-identical (constexpr folding), so sparse never changes results when no ranges are removed.
 
-**Status: experimental / work in progress.**
+**Measured in production traffic (123, 09-23).** The sparse-gate journal (`da_sparse[VEC|MMA]:`, one line per ~512-token gather-bound step while sparse, plus the dense fallback with its reason) was captured from live `qwen3.8-focus` traffic, 15:48–21:10:
+
+| Path | Sparse decisions | Mean read | Mean reduction | Range |
+|---|---|---|---|---|
+| VEC (q4_0 KV, production) | 91 | 34.0% | 66.0% | 8–50% |
+| MMA (f16 KV) | 255 | 36.5% | 63.5% | 8–50% |
+| **all** | **346** | **35.9%** | **64.1%** | **8–50%** |
+
+The 50% top of the range is the gate's own bound: the sparse path is only active while it
+reads at most half the KV (`K >= 2*n_kv_max`). Dense fallbacks (108) carry their reason:
+`no sparse kernel variant` (68, MMA head-dim not yet covered) and the 50% decay
+(`K < 2*n_kv_max`, 40). No multi-token-batch fallbacks were observed: spec decode is paused
+while a slot is in DA mode, so DA decode is single-token.
+
+**Status: v1.0** - physical read reduction verified in production traffic (above); tag-quote
+hijack fixed (line-start-only entry tags, `632e31c20`).
 
 ---
 
@@ -43,7 +58,7 @@ lines. Supporting engine work verified on the same box: P1 dead-marker smoke 3/3
 multi-turn reversibility + instruction placement 3/3, P2b paper-aligned chunking 4/4
 (packing / hard-cap / prose / 50K - all mean chunk sizes ≤ the 2560-token cap).
 
-**Status: verified on the GPU box; the production node deploy is a separate step.**
+**Status: verified on the GPU box and running in production (123 `qwen3.8-focus`, 09-23).**
 
 ---
 
@@ -332,7 +347,8 @@ There are two ways to get a chunk layout onto the wire:
    - **Tag-quote hijack.** The tag state machine operates on the model's whole output stream; when
      the model *quotes* a DA tag in its reasoning (debugging DA, quoting a commit message), the
      parser can consume the quote as a control tag, causing an unintended mode switch and a gap in
-     the output text. Fix (line-start-only tag start) is pending.
+     the output text. Fixed in v1.0 (line-start-only entry tags, `632e31c20`): a tag quoted
+     mid-line is data, not a control tag.
    - **Bigger blast radius than the marker path.** A misfired tag restricts the session's own
      conversation, not just the injected index.
 
@@ -361,8 +377,8 @@ llama-server \
 (`--da-auto` is the production path: it re-chunks the whole rendered prompt, so DA restricts
 attention over the *entire* conversation - which is what makes the physical KV read reduction
 real (see *Scope of the effect* below). It requires `--kv-unified` (backend B): the A path is
-irreversible, so a wrong focus would permanently delete the answer chunk. Known limitations
-under stabilization - tag-quote hijack and post-compaction drift - are tracked in
+irreversible, so a wrong focus would permanently delete the answer chunk. Known limitation
+under stabilization - post-compaction drift (tag-quote hijack fixed in v1.0) - is tracked in
 `plans/focus-llama-da-stabilization.md`. A client that also injects FocusMemory markers can add
 `--da-prompt-scan`; the marker layout then wins per request when present.)
 
