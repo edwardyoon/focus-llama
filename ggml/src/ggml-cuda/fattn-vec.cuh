@@ -565,6 +565,8 @@ void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggm
 }
 
 bool ggml_cuda_flash_attn_ext_vec_shall_use_sparse(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+const char * ggml_cuda_flash_attn_ext_vec_sparse_fail(const ggml_tensor * dst);
+void ggml_cuda_fattn_sparse_gate_log(const char * path, bool use_sparse, ggml_tensor * dst, const char * fail);
 
 template <int D, ggml_type type_K, ggml_type type_V>
 void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -580,7 +582,9 @@ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_ten
             constexpr bool use_logit_softcap = false;
             // Sparse (n_kv_max) gather: only single-token decode with no softcap; the runtime
             // gate decides per-op. Both variants are compiled (use_sparse is runtime here).
-            if (ggml_cuda_flash_attn_ext_vec_shall_use_sparse(ctx, dst)) {
+            const bool sparse_ok = ggml_cuda_flash_attn_ext_vec_shall_use_sparse(ctx, dst);
+            ggml_cuda_fattn_sparse_gate_log("VEC", sparse_ok, dst, sparse_ok ? nullptr : ggml_cuda_flash_attn_ext_vec_sparse_fail(dst));
+            if (sparse_ok) {
                 constexpr bool use_sparse = true;
                 ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V, use_logit_softcap, use_sparse>(ctx, dst);
             } else {
@@ -590,10 +594,16 @@ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_ten
         } else {
             constexpr bool use_logit_softcap = true;
             constexpr bool use_sparse = false;
+            ggml_cuda_fattn_sparse_gate_log("VEC", false, dst, ggml_cuda_flash_attn_ext_vec_sparse_fail(dst));
             ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, type_K, type_V, use_logit_softcap, use_sparse>(ctx, dst);
         }
         return;
     }
+
+    // Multi-token batch (e.g. speculative verify): the VEC sparse gate needs a
+    // single query row, so a pushed n_kv_max bound stays dense - the journal
+    // logs the reason instead of failing silently.
+    ggml_cuda_fattn_sparse_gate_log("VEC", false, dst, ggml_cuda_flash_attn_ext_vec_sparse_fail(dst));
 
     constexpr int cols_per_block = 2;
     constexpr bool use_sparse = false;
