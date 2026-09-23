@@ -30,8 +30,7 @@ user-message boundary of the rendered prompt, so a dead block copied into a summ
 a candidate and the request fails open to the live block instead.
 
 `da-probe/da_e2e_compaction.py` reproduces the failure mode on the marker path
-(`--da-prompt-scan`, the production path) with the real FocusMemory hook block shape and a
-simulated compaction:
+(`--da-prompt-scan`) with the real FocusMemory hook block shape and a simulated compaction:
 
 | Phase | Scenario | Result |
 |---|---|---|
@@ -307,7 +306,7 @@ speed-up. Measuring real speed is still open.
 
 There are two ways to get a chunk layout onto the wire:
 
-1. **Marker path (`--da-prompt-scan` + client markers, recommended).** FocusMemory assembles the
+1. **Marker path (`--da-prompt-scan` + client markers).** FocusMemory assembles the
    prompt from its own chunks and wraps them in `[[da:N]]` ... `[[da:layout:N]]` markers (the
    legacy `<da:N>` form is accepted as well; the hook emits the bracket form because angle
    brackets get mangled by markdown/HTML escaping between the hook and the rendered prompt). The
@@ -316,22 +315,26 @@ There are two ways to get a chunk layout onto the wire:
    sits at the prompt tail, so DA only touches the injected memory index - the rest of the
    conversation is untouched. The scanner **tail-anchors** to the last user-message boundary, so a
    marker block that a compaction summary reproduces in the history is ignored (fail-open) and a DA
-   session keeps working after auto-compaction - see *Verified: DA survives auto-compaction*. This
-   is the path that works reliably with live agent sessions.
-2. **Auto-chunking (`--da-auto`, experimental - do not run on live agent sessions).** The server
-   splits the rendered chat prompt itself into ~2048-token magic chunks (hard cap 2560 = 5/4 ×
-   target), packing across message boundaries and falling back paragraph → line → sentence →
-   clause → word when a message has too few boundaries, so the client sends a plain request with
-   nothing extra. Known limitations, observed in production:
-   - **Output corruption on agent sessions.** Auto-chunking re-chunks the *entire* conversation
-     (history + tool I/O) on every turn once the prompt passes `--da-min-ctx`. The DA tag
-     state machine (tail hold-back + spec batch cut) then operates on the model's whole output
-     stream, and when a tag boundary lands inside a structured block (e.g. a tool call) the
-     block is cut mid-stream and raw tag text leaks into the response.
-   - **Bigger blast radius.** A wrong layout or a misfired tag corrupts the session's own
+   session keeps working after auto-compaction - see *Verified: DA survives auto-compaction*.
+   Because it never touches the conversation (only the injected index), it cannot corrupt the
+   session - but it also cannot reduce the conversation's KV, so it is an index-scoped
+   complement to the auto path, not a replacement for it.
+2. **Auto-chunking (`--da-auto`, the production path for physical reduction).** The server
+   splits the rendered chat prompt itself into ~`--da-chunk-tokens` magic chunks (hard cap
+   5/4 × target), packing across message boundaries and falling back paragraph → line → sentence
+   → clause → word when a message has too few boundaries, so the client sends a plain request
+   with nothing extra. Because it re-chunks the *entire* conversation (system + history + tool
+   I/O) on every turn once the prompt passes `--da-min-ctx`, it is the path that produces
+   conversation-level, physical KV read reduction - the marker path only ever scopes the injected
+   index. It requires `--kv-unified` (backend B) since the A path is irreversible. Known
+   limitations, observed in production and under stabilization (see
+   `plans/focus-llama-da-stabilization.md`):
+   - **Tag-quote hijack.** The tag state machine operates on the model's whole output stream; when
+     the model *quotes* a DA tag in its reasoning (debugging DA, quoting a commit message), the
+     parser can consume the quote as a control tag, causing an unintended mode switch and a gap in
+     the output text. Fix (line-start-only tag start) is pending.
+   - **Bigger blast radius than the marker path.** A misfired tag restricts the session's own
      conversation, not just the injected index.
-   Use `--da-auto` only for headless batch/bench traffic where the output is not consumed by an
-   agent.
 
 The two paths coexist (marker layout wins when present; auto takes over otherwise - see
 Production launch). Without either, requests run with full attention - the two projects remain
@@ -346,25 +349,45 @@ FocusMemory backend. The recommended `llama-server` launch line is:
 llama-server \
   --parallel 1 \
   --metrics \
-  --da-prompt-scan \
+  --da-auto \
+  --kv-unified \
+  --da-min-ctx 2048 \
+  --da-chunk-tokens 4096 \
   --spec-type draft-mtp \
   --spec-draft-n-max 4 \
   --spec-draft-ngl all
 ```
 
-(`--da-auto` is deliberately off: it corrupts live agent sessions - see *Relationship to
-FocusMemory*. Headless batch/bench nodes may add it back with `--da-min-ctx` /
-`--da-chunk-tokens`.)
+(`--da-auto` is the production path: it re-chunks the whole rendered prompt, so DA restricts
+attention over the *entire* conversation - which is what makes the physical KV read reduction
+real (see *Scope of the effect* below). It requires `--kv-unified` (backend B): the A path is
+irreversible, so a wrong focus would permanently delete the answer chunk. Known limitations
+under stabilization - tag-quote hijack and post-compaction drift - are tracked in
+`plans/focus-llama-da-stabilization.md`. A client that also injects FocusMemory markers can add
+`--da-prompt-scan`; the marker layout then wins per request when present.)
 
-(`--parallel 1` keeps the single-tenant node on backend A - see Backend A vs B below.)
+(`--parallel 1` keeps the node single-tenant; with `--kv-unified` present it runs backend B - see
+Backend A vs B below.)
 
 | Option | What it does | Why it is on |
 |--------|--------------|--------------|
 | `--metrics` | Exposes Prometheus metrics on the server port | Observability for a long-running service |
-| `--da-prompt-scan` | **Prompt scanning** (marker path): on each request the prompt is scanned for `[[da:N]]` (or legacy `<da:N>`) chunk markers and their token ranges are pre-computed, so DA tags / static `da_rm` ranges resolve to real KV positions | Lets a client (e.g. the FocusMemory hook) declare the exact chunk layout it assembled. A prompt with no markers runs with full attention (fail-open) |
+| `--da-auto` | **Auto-chunking**: when a rendered prompt has no client layout markers and is at least `--da-min-ctx` tokens, the server splits it into magic chunks by message boundaries so the model's `<focus magic_chunks="N">` tags can restrict attention over the whole conversation | Production path for **physical** KV read reduction - re-chunks system + history + tool I/O, not just an injected index |
+| `--kv-unified` | Enables backend B (reversible two-stream KV) | Required by `--da-auto`: the A path (`seq_rm`) is irreversible, a wrong focus permanently deletes the answer chunk |
+| `--da-min-ctx 2048` | Minimum prompt length (tokens) before auto-chunking engages | Short prompts stay full-attention (no DA overhead); default is 0 (always) |
+| `--da-chunk-tokens 4096` | Target magic-chunk size (tokens); hard cap 5/4 × target | Production chunk size (default 2048); larger = fewer, coarser spans |
 | `--spec-type draft-mtp` | **Speculative decoding** with the model's MTP draft head | Speed-up on top of DA. Since P6, spec and DA **coexist**: while a slot is in DA mode (`da_seq` active) spec is paused automatically and resumes on the return to global attention - so spec stays ON without breaking DA |
 | `--spec-draft-n-max 4` | Up to 4 draft tokens per step | Enough to overlap decode with drafting, without so many that rejections waste work |
 | `--spec-draft-ngl all` | Puts the whole draft model on the GPU | The draft model is small; keeping it fully on-GPU avoids CPU round-trips that would erase the spec gain |
+
+**Scope of the effect.** The two paths are not two settings of the same effect. The marker
+path restricts attention only over the client-declared marker region (the FocusMemory index
+at the prompt tail); the rest of the conversation - system, history, tool I/O - is scaffold
+and always keeps full attention. Its read reduction is therefore bounded by the size of the
+injected index, and a prompt with no markers gets no DA at all (fail-open, full attention).
+`--da-auto` is the opposite: it re-chunks the *whole* rendered prompt (system + history + tool
+I/O) and can attend to a single chunk of it - which is why the recommended line above runs it,
+and why it is the path that produces conversation-level, physical KV read reduction.
 
 **Two layout paths, one priority.** `--da-prompt-scan` (marker path) and `--da-auto` (server path)
 are independent and can both be on. Per request the server first scans for a client-provided marker
@@ -393,12 +416,13 @@ request used from the scan log: `da_scan: ... - A path` vs `da_scan: ... - B pat
 journalctl -u qwen3.8-focus --since "10 min ago" | grep -E 'da_scan:|da_auto:|da_tag:'
 ```
 
-- `da_scan:` - the prompt scanner found the `[[da:N]]`/`<da:N>` markers and built the chunk-to-range map
-- `da_auto:` - auto-chunking split the prompt (only when `--da-auto` is on; off in the recommended production line)
+- `da_scan:` - the prompt scanner found the `[[da:N]]`/`<da:N>` markers and built the chunk-to-range map (marker path)
+- `da_auto:` - auto-chunking split the prompt (the recommended production line runs `--da-auto`)
 - `da_tag:` - a `<focus>`/`<local>` tag was parsed and the attention restriction applied
 
-A plain chat (no markers) produces no `da_scan:`/`da_auto:` line and runs with full attention -
-that is the intended fail-open behavior.
+A chat with no markers and a prompt below `--da-min-ctx` produces no `da_scan:`/`da_auto:` line
+and runs with full attention - that is the intended fail-open behavior. On a node running
+`--da-auto`, a markerless prompt at or above `--da-min-ctx` produces a `da_auto:` line instead.
 
 **Verifying DA end-to-end with curl.** Send a chat whose user message carries a well-formed marker
 block (the same format the FocusMemory hook injects) and read the `timings` object of the response:
