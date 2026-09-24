@@ -356,6 +356,39 @@ The two paths coexist (marker layout wins when present; auto takes over otherwis
 Production launch). Without either, requests run with full attention - the two projects remain
 independently usable.
 
+## kv-offload (auto-compact replacement)
+
+`--fm-offload` replaces the client's lossy auto-compaction with a lossless evict/refill cycle
+backed by an external store (the [FocusMemory](https://github.com/edwardyoon/FocusMemory) dumb
+KV store). When a rendered prompt exceeds `--kv-offload-threshold` tokens, the engine evicts the
+oldest *middle* messages (never the system message or the last user message) before
+`--da-auto` re-chunks: each evicted message's text is PUT to the store, the range is removed
+from the prompt, and the segment becomes a **virtual chunk** numbered `M+1..M+K` (after the
+`M` active chunks) that is listed in the DA instruction. When the model later emits
+`<focus magic_chunks="N">` for an offloaded chunk, the engine GETs its text back and re-prefills
+it at the tail of the sequence (get-on-focus) so the model reads the original content - not a
+compaction summary. Any store error fails open (the segment stays in the prompt), so a downed
+store degrades to a normal DA session, never to data loss.
+
+This is complementary to both layout paths: it decides *which* middle messages leave the prompt
+and *how* to bring one back on demand; `--da-auto` still owns the re-chunking of what remains.
+It requires `--da-auto` + `--kv-unified` (the eviction runs inside the auto-chunk gate) and a
+store reachable at `--focus-memory-host`.
+
+**Status: work in progress.** The evict/refill cycle is implemented and the store
+round-trips were verified, but it is not enabled on the production node (123 runs
+without `--fm-offload`) and the get-on-focus recall path has not yet been observed in
+production traffic. Each eviction that changes the prompt shape costs a one-time
+re-prefill of the shifted tail; on multi-axis-RoPE (MROPE/IMROPE) models the
+`--cache-reuse` chunk-shift that would amortize it is unsupported
+(`llama_kv_cache::get_can_shift()` is false), so it is accepted as a one-time cost per
+eviction event.
+
+> **Flag naming.** The engine flag is `--fm-offload` (env `LLAMA_ARG_FM_OFFLOAD`), not
+> `--kv-offload`: the stock llama.cpp `-kvo/--kv-offload` flag (KV-cache offloading) already
+> owns that name and the `LLAMA_ARG_KV_OFFLOAD` env var, so a `--kv-offload` here would be
+> silently consumed by the stock flag and eviction would never engage.
+
 ## Production launch (recommended options)
 
 The production node runs the DA inference service - qwen3.8, multimodal - behind the
@@ -371,7 +404,12 @@ llama-server \
   --da-chunk-tokens 4096 \
   --spec-type draft-mtp \
   --spec-draft-n-max 4 \
-  --spec-draft-ngl all
+  --spec-draft-ngl all \
+  # kv-offload (auto-compact replacement) - optional, needs a reachable store:
+  --fm-offload \
+  --kv-offload-threshold 130000 \
+  --focus-memory-host http://<store-host>:3900 \
+  --focus-memory-token <CONTEXT_API_TOKEN>
 ```
 
 (`--da-auto` is the production path: it re-chunks the whole rendered prompt, so DA restricts
@@ -395,6 +433,10 @@ Backend A vs B below.)
 | `--spec-type draft-mtp` | **Speculative decoding** with the model's MTP draft head | Speed-up on top of DA. Since P6, spec and DA **coexist**: while a slot is in DA mode (`da_seq` active) spec is paused automatically and resumes on the return to global attention - so spec stays ON without breaking DA |
 | `--spec-draft-n-max 4` | Up to 4 draft tokens per step | Enough to overlap decode with drafting, without so many that rejections waste work |
 | `--spec-draft-ngl all` | Puts the whole draft model on the GPU | The draft model is small; keeping it fully on-GPU avoids CPU round-trips that would erase the spec gain |
+| `--fm-offload` | **kv-offload**: evict the oldest middle messages to the FocusMemory store once the prompt exceeds `--kv-offload-threshold`, and re-prefill them on demand when the model focuses an offloaded chunk | Replaces lossy auto-compaction with a lossless evict/refill cycle (see *kv-offload* above). Optional - off by default |
+| `--kv-offload-threshold 130000` | Token count at which kv-offload eviction engages | Below this the prompt is kept whole; the threshold should sit under the client's auto-compact point (e.g. 70% of a 200K window) |
+| `--focus-memory-host` | Base URL of the FocusMemory KV store (`PUT`/`GET` `/v1/kv-offload/chunk`) | Empty = kv-offload disabled even with `--fm-offload` on (fail-open) |
+| `--focus-memory-token` | Bearer token for the store API (`CONTEXT_API_TOKEN`) | Empty = no auth header; set it to match the store |
 
 **Scope of the effect.** The two paths are not two settings of the same effect. The marker
 path restricts attention only over the client-declared marker region (the FocusMemory index
@@ -429,12 +471,16 @@ request used from the scan log: `da_scan: ... - A path` vs `da_scan: ... - B pat
 **Verifying DA in the journal.** After a chat that carries DA markers, confirm the DA path ran:
 
 ```bash
-journalctl -u qwen3.8-focus --since "10 min ago" | grep -E 'da_scan:|da_auto:|da_tag:'
+journalctl -u qwen3.8-focus --since "10 min ago" | grep -E 'da_scan:|da_auto:|da_tag:|kv_offload:'
 ```
 
 - `da_scan:` - the prompt scanner found the `[[da:N]]`/`<da:N>` markers and built the chunk-to-range map (marker path)
 - `da_auto:` - auto-chunking split the prompt (the recommended production line runs `--da-auto`)
 - `da_tag:` - a `<focus>`/`<local>` tag was parsed and the attention restriction applied
+- `kv_offload: gate` - kv-offload engaged for the request: logs the threshold, store host, current token count, and session
+- `kv_offload: evict plan` / `PUT ok` / `evicted N segment(s)` - the eviction sequence: the plan, each successful store PUT, and the prompt shrink
+- `kv_offload: get-on-focus` / `GET ok ... re-prefilling` - the model focused an offloaded chunk and it was fetched + re-prefilled at the tail
+- `kv_offload: disabled` (one-time warning) - `--fm-offload` was not parsed or `--focus-memory-host` is empty, so eviction can never engage
 
 A chat with no markers and a prompt below `--da-min-ctx` produces no `da_scan:`/`da_auto:` line
 and runs with full attention - that is the intended fail-open behavior. On a node running
