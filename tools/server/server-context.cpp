@@ -6678,13 +6678,18 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         // DA injection guard (code-level opt-out, plans/bug.md "scaffold
         // re-reflection"): a request may opt out of ALL DA scaffold
         // injection - via the "da_disable" JSON field (passed through by
-        // oaicompat_chat_params_parse on the chat path) or a "[DA-DISABLE]"
-        // marker in the prompt text (e.g. injected by a client hook for
-        // coding-agent sessions). The marker is stripped before
-        // tokenization so it never reaches the model. When disabled, both
-        // DA paths (marker scan + auto-chunking incl. kv-offload) are
-        // skipped for this request and it stays vanilla.
-        static const std::string da_disable_marker = "[DA-DISABLE]";
+        // oaicompat_chat_params_parse on the chat path) or a control-
+        // character-fenced marker (U+001C FILE SEPARATOR around
+        // "DA-DISABLE") in the prompt text (injected by a client hook).
+        // The marker is stripped before tokenization so it never reaches
+        // the model. When disabled, both DA paths (marker scan +
+        // auto-chunking incl. kv-offload) are skipped for this request and
+        // it stays vanilla.
+        // NOTE: the marker must stay control-char fenced. A plain text
+        // marker self-triggers: a session that discusses this feature has
+        // the literal string in its (re-sent) history and silently loses
+        // DA for the rest of the session (observed 2026-09-24 on 123).
+        static const std::string da_disable_marker = "\x1c" "DA-DISABLE" "\x1c";
         const json j_da_disable = json_value(data, "da_disable", json());
         bool da_disable = !j_da_disable.is_null() && j_da_disable != false; // lenient: "true" strings count
         json da_guard_prompt = prompt;
