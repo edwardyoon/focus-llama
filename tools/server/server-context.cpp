@@ -9,6 +9,7 @@
 
 #include "build-info.h"
 #include "common.h"
+#include "http.h"
 #include "fit.h"
 #include "llama.h"
 #include "log.h"
@@ -39,6 +40,16 @@
 #endif
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+
+// kv-offload (auto-compact replacement): forward declarations. The full
+// definitions live below (before da_auto_chunk); apply_da_tag (mid-decode)
+// calls kv_offload_get / kv_offload_refill, so they must be declared first.
+struct server_slot;
+static bool kv_offload_get(
+        const std::string & host, const std::string & token,
+        const std::string & session_id, const std::string & key,
+        std::string & out_text);
+static bool kv_offload_refill(llama_context * ctx, server_slot & slot, const llama_tokens & toks);
 
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (params.embedding ||
@@ -359,6 +370,13 @@ struct server_slot {
     // A holes are baked into the cached sequence (clear), a B slot that
     // returned to the original sequence mid-decode keeps its cache.
     bool da_removed_a = false;
+    // kv-offload: true once a get-on-focus re-prefill appended fetched chunk
+    // tokens mid-sequence (apply_da_tag). release() clears the prompt cache in
+    // this case: the re-prefilled tokens sit between the active prefix and the
+    // generated tail, so they no longer align with the next request's prefix
+    // (which re-sends full history and re-fetches on focus). Without a re-prefill
+    // (eviction only), the KV is a clean prefix and the cache is kept.
+    bool kv_offload_refilled = false;
     // Phase 0 (measure-only): server-level flag copied at slot init. When set,
     // apply_da_rm/apply_da_b skip the KV mutation (output stays vanilla) so the
     // tag state machine + logging can measure g (tag position) and emission
@@ -728,6 +746,10 @@ struct server_slot {
             } else if (!task->params.da_rm.empty()) {
                 SLT_INF(*this, "clearing slot after da_rm request: %zu prompt tokens, %zu range(s)\n",
                         prompt.tokens.size(), task->params.da_rm.size());
+                prompt_clear();
+            } else if (kv_offload_refilled) {
+                SLT_INF(*this, "clearing slot after kv-offload get-on-focus (re-prefilled tokens mid-sequence): %zu prompt tokens\n",
+                        prompt.tokens.size());
                 prompt_clear();
             } else if (da_applied && da_seq >= 0) {
                 const int32_t n_full = (int32_t) prompt.n_tokens();
@@ -4882,8 +4904,43 @@ private:
                     // the current block may start at da_chunk_base > 1.
                     const int32_t base     = slot.task->params.da_chunk_base;
                     const int32_t n_chunks = (int32_t) chunks.size();
+                    const auto & offloaded = slot.task->params.da_offloaded;
                     std::vector<size_t> keep_idx;
+                    bool did_refill = false;
                     for (int32_t n : tag.keep_nums) {
+                        // kv-offload (get-on-focus): n points to an evicted (offloaded)
+                        // chunk (number >= base + n_chunks). Fetch its text from the
+                        // FocusMemory store and re-prefill it at the tail so the model
+                        // can read it. No KV restriction is applied (the chunk is not in
+                        // the active layout) - the model reads the re-prefilled content
+                        // in the current mode. Fail-open on any store error.
+                        if (n >= base + n_chunks) {
+                            bool found = false;
+                            for (const auto & seg : offloaded) {
+                                if (seg.chunk_id != n) continue;
+                                found = true;
+                                std::string text;
+                                if (kv_offload_get(slot.task->params.kv_offload_host,
+                                                   slot.task->params.kv_offload_token,
+                                                   slot.task->params.kv_offload_session,
+                                                   seg.key, text)
+                                        && slot.task->params.kv_offload_vocab) {
+                                    const llama_tokens toks =
+                                            common_tokenize(slot.task->params.kv_offload_vocab, text, true, true);
+                                    if (kv_offload_refill(ctx_tgt, slot, toks)) {
+                                        did_refill = true;
+                                        slot.kv_offload_refilled = true;
+                                    }
+                                } else {
+                                    SLT_WRN(slot, "kv_offload: GET failed for offloaded chunk %d - fail-open\n", n);
+                                }
+                                break;
+                            }
+                            if (!found) {
+                                SLT_WRN(slot, "da_tag: magic_chunks number %d is not an active or offloaded chunk - ignored\n", n);
+                            }
+                            continue;
+                        }
                         if (n < base || n - base >= n_chunks) {
                             SLT_WRN(slot, "da_tag: magic_chunks number %d out of range (%d..%d) - ignored\n",
                                     n, base, base + n_chunks - 1);
@@ -4895,7 +4952,11 @@ private:
                         }
                     }
                     if (keep_idx.empty()) {
-                        SLT_WRN(slot, "%s", "da_tag: no valid magic_chunks number - tag consumed, mode unchanged\n");
+                        if (did_refill) {
+                            SLT_INF(slot, "%s", "kv_offload: focus on offloaded chunk(s) - re-prefilled at tail, model reads in current mode");
+                        } else {
+                            SLT_WRN(slot, "%s", "da_tag: no valid magic_chunks number - tag consumed, mode unchanged\n");
+                        }
                         break;
                     }
                     std::sort(keep_idx.begin(), keep_idx.end());
@@ -6020,6 +6081,240 @@ static bool da_scan_prompt(
 }
 
 // ---------------------------------------------------------------------
+// kv-offload (auto-compact replacement) - FocusMemory PUT/GET + eviction
+// ---------------------------------------------------------------------
+// When --kv-offload is set and the rendered prompt exceeds
+// --kv-offload-threshold tokens, the oldest middle messages are evicted:
+// their text is PUT to the FocusMemory store and removed from the prompt,
+// before da_auto_chunk re-chunks the remainder. The evicted segments become
+// virtual chunks (M+1..M+K) the model can re-load via <focus magic_chunks="N">
+// (get-on-focus, applied in apply_da_tag). Fail-open throughout: any store
+// error keeps the segment in the prompt (no eviction), matching the DA
+// marker/drift fail-open principle.
+
+// One evicted segment: the caller PUTs .text to the store, records .key/.hint
+// in the slot's offload registry, and passes .hint to da_auto_chunk.
+struct kv_offload_evict_segment {
+    std::string key;    // stable content hash (the FocusMemory key)
+    std::string hint;   // one-line hint shown in the DA instruction
+    std::string text;   // the evicted message range text (for the PUT)
+    int32_t     tokens = 0;
+    size_t      range_lo = 0;  // original-text range [range_lo, range_hi)
+    size_t      range_hi = 0;
+};
+
+// FNV-1a 64-bit of the segment text -> 16 hex chars (stable content key).
+static std::string kv_offload_hash16(const std::string & s) {
+    uint64_t h = 1469598103934665603ULL;
+    for (unsigned char c : s) {
+        h ^= (uint64_t) c;
+        h *= 1099511628211ULL;
+    }
+    char buf[17];
+    snprintf(buf, sizeof(buf), "%016llx", (unsigned long long) h);
+    return std::string(buf, 16);
+}
+
+// Minimal JSON string escape (for the PUT body).
+static std::string kv_offload_json_escape(const std::string & s) {
+    std::string out;
+    out.reserve(s.size() + 8);
+    for (unsigned char c : s) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\b': out += "\\b";  break;
+            case '\f': out += "\\f";  break;
+            case '\n': out += "\\n";  break;
+            case '\r': out += "\\r";  break;
+            case '\t': out += "\\t";  break;
+            default:
+                if (c < 0x20) {
+                    char buf[8];
+                    snprintf(buf, sizeof(buf), "\\u%04x", (unsigned) c);
+                    out += buf;
+                } else {
+                    out += (char) c;
+                }
+        }
+    }
+    return out;
+}
+
+// PUT one evicted segment's text to the FocusMemory store. Returns true on
+// success; false on any error (the caller then keeps the segment in the prompt).
+static bool kv_offload_put(
+        const std::string & host, const std::string & token,
+        const std::string & session_id, const std::string & key,
+        const std::string & text, int32_t tokens) {
+    if (host.empty() || key.empty() || text.empty()) return false;
+    try {
+        auto [cli, parts] = common_http_client(host);
+        cli.set_read_timeout(5, 0);
+        if (!token.empty()) {
+            cli.set_default_headers({ { "Authorization", "Bearer " + token } });
+        }
+        std::string body = "{\"session_id\":\"" + kv_offload_json_escape(session_id)
+                         + "\",\"key\":\"" + kv_offload_json_escape(key)
+                         + "\",\"text\":\"" + kv_offload_json_escape(text)
+                         + "\",\"tokens\":" + std::to_string(tokens) + "}";
+        std::string path = "/v1/kv-offload/chunk";
+        if (!parts.path.empty() && parts.path != "/") path = parts.path + path;
+        auto res = cli.Put(path, body, "application/json");
+        if (!res || res->status != 200) {
+            SRV_WRN("kv_offload: PUT failed (status %d) key=%s\n", res ? res->status : -1, key.c_str());
+            return false;
+        }
+        return true;
+    } catch (const std::exception & e) {
+        SRV_WRN("kv_offload: PUT exception: %s\n", e.what());
+        return false;
+    }
+}
+
+// GET one segment's text back from the FocusMemory store (get-on-focus).
+// Returns true and fills out_text on success; false on any error (fail-open:
+// the caller proceeds without the chunk).
+static bool kv_offload_get(
+        const std::string & host, const std::string & token,
+        const std::string & session_id, const std::string & key,
+        std::string & out_text) {
+    if (host.empty() || key.empty()) return false;
+    try {
+        auto [cli, parts] = common_http_client(host);
+        cli.set_read_timeout(5, 0);
+        if (!token.empty()) {
+            cli.set_default_headers({ { "Authorization", "Bearer " + token } });
+        }
+        std::string path = "/v1/kv-offload/chunk?session_id=" + session_id + "&key=" + key;
+        if (!parts.path.empty() && parts.path != "/") path = parts.path + path;
+        auto res = cli.Get(path);
+        if (!res || res->status != 200) return false;
+        json j = json::parse(res->body);
+        if (!j.contains("text")) return false;
+        out_text = j["text"].get<std::string>();
+        return !out_text.empty();
+    } catch (const std::exception &) {
+        return false;
+    }
+}
+
+// Re-prefill an offloaded chunk at the tail of the slot's sequence
+// (get-on-focus). Appends the tokens at positions [n_full, n_full+len) on
+// kv_seq() and runs a prefill decode so the model can attend to the chunk.
+// Returns true on success; false on any error (fail-open: the caller
+// proceeds without the chunk). The slot's prompt tokens are advanced so
+// pos_next() reflects the new length. HIGH RISK: mid-decode prefill - must be
+// validated by the offload probe before trusting.
+static bool kv_offload_refill(llama_context * ctx, server_slot & slot, const llama_tokens & toks) {
+    const int32_t n = (int32_t) toks.size();
+    if (n <= 0 || ctx == nullptr) return false;
+    const int32_t n_full = (int32_t) slot.prompt.n_tokens();
+    const llama_seq_id seq = slot.kv_seq();
+    try {
+        llama_batch batch = llama_batch_init(n, 0, 1);
+        std::vector<llama_seq_id> seq_ids(n, seq);
+        for (int32_t i = 0; i < n; i++) {
+            batch.token[i]    = toks[i];
+            batch.pos[i]      = n_full + i;
+            batch.seq_id[i]   = &seq_ids[i];
+            batch.n_seq_id[i] = 1;
+            batch.logits[i]   = (i == n - 1);
+        }
+        int ret = llama_decode(ctx, batch);
+        llama_batch_free(batch);
+        if (ret != 0) {
+            SRV_WRN("kv_offload: refill decode failed (ret=%d, %d tokens) - fail-open\n", ret, n);
+            return false;
+        }
+        // advance the slot's prompt tokens so pos_next() reflects the refill
+        llama_tokens new_toks = slot.prompt.tokens.get_tokens();
+        const size_t old_size = new_toks.size();
+        new_toks.resize(old_size + (size_t) n);
+        for (int32_t i = 0; i < n; i++) new_toks[old_size + (size_t) i] = toks[i];
+        slot.prompt.clear();
+        slot.prompt.tokens.insert(new_toks);
+        SRV_INF("kv_offload: re-prefilled %d token(s) at [%d, %d) on seq %d\n",
+                n, n_full, n_full + n, (int) seq);
+        return true;
+    } catch (const std::exception & e) {
+        SRV_WRN("kv_offload: refill exception: %s - fail-open\n", e.what());
+        return false;
+    }
+}
+
+// Plan the eviction of the oldest middle messages so the prompt fits under
+// the threshold. Returns true and fills out_segments (each with its original-
+// text range, text, key, hint) if any eviction is planned; false otherwise.
+// Never evicts the system message or the last user message. The caller does
+// the FocusMemory PUT and removes only the successfully-PUT ranges from the
+// prompt (a failed PUT keeps its segment in the prompt - fail-open).
+static bool kv_offload_evict(
+        const llama_vocab * vocab,
+        const std::string & text,
+        int32_t total_tokens,
+        int32_t threshold,
+        std::vector<kv_offload_evict_segment> & out_segments) {
+    if (threshold <= 0 || total_tokens <= threshold) return false;
+
+    struct msg_t { size_t start; size_t role_end; std::string role; };
+    std::vector<msg_t> msgs;
+    {
+        static const std::regex msg_re(R"(<\|im_start\|>([a-zA-Z_]+)\n)");
+        for (std::sregex_iterator it(text.cbegin(), text.cend(), msg_re), end; it != end; ++it) {
+            msg_t m;
+            m.start    = (size_t) it->position(0);
+            m.role_end = m.start + (size_t) it->length(0);
+            m.role     = (*it)[1].str();
+            msgs.push_back(m);
+        }
+    }
+    if (msgs.size() < 3 || msgs[0].role != "system") return false;
+
+    size_t last_user = 0;
+    for (size_t i = 0; i < msgs.size(); i++) if (msgs[i].role == "user") last_user = i;
+    if (last_user < 2) return false;
+
+    auto n_tok = [&](const std::string & s) -> int32_t {
+        return (int32_t) common_tokenize(vocab, s, true, true).size();
+    };
+    auto msg_range = [&](size_t i) -> std::pair<size_t, size_t> {
+        size_t lo = msgs[i].start;
+        size_t hi = (i + 1 < msgs.size()) ? msgs[i + 1].start : text.size();
+        return { lo, hi };
+    };
+
+    // evict from the oldest middle message forward until under the threshold
+    int32_t remaining = total_tokens;
+    std::vector<size_t> evict_idx;
+    for (size_t i = 1; i < last_user; i++) {
+        if (remaining <= threshold) break;
+        auto [lo, hi] = msg_range(i);
+        if (hi <= lo) continue;
+        evict_idx.push_back(i);
+        remaining -= n_tok(text.substr(lo, hi - lo));
+    }
+    if (evict_idx.empty()) return false;
+
+    for (size_t i : evict_idx) {
+        auto [lo, hi] = msg_range(i);
+        const std::string seg_text = text.substr(lo, hi - lo);
+        kv_offload_evict_segment seg;
+        seg.text     = seg_text;
+        seg.tokens   = n_tok(seg_text);
+        seg.key      = kv_offload_hash16(seg_text);
+        seg.range_lo = lo;
+        seg.range_hi = hi;
+        std::string first = text.substr(msgs[i].role_end, hi - msgs[i].role_end);
+        if (first.size() > 60) first.resize(60);
+        for (auto & ch : first) if (ch == '\n' || ch == '\r') ch = ' ';
+        seg.hint = msgs[i].role + ": " + first;
+        out_segments.push_back(std::move(seg));
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------
 // DA auto-chunking (P4)
 // ---------------------------------------------------------------------
 // When no client markers are present, --da-auto is set and the prompt has
@@ -6045,7 +6340,8 @@ struct da_auto_layout {
     size_t n_source_msgs = 0;
 };
 
-static da_auto_layout da_auto_chunk(const llama_vocab * vocab, const std::string & text, int32_t da_chunk_tokens) {
+static da_auto_layout da_auto_chunk(const llama_vocab * vocab, const std::string & text, int32_t da_chunk_tokens,
+        const std::vector<std::string> & offloaded_hints = {}) {
     da_auto_layout out;
 
     // chat template message boundaries: <\|im_start\|>ROLE\n
@@ -6266,6 +6562,20 @@ static da_auto_layout da_auto_chunk(const llama_vocab * vocab, const std::string
     // meta-reasoning about the chunks instead of resuming the task. The
     // scaffold is declared a tool, and the final step is "continue with
     // whatever the conversation calls for" (answer, tool calls, resume).
+    // kv-offload (③): offloaded segments are virtual chunks (n_chunks+1 ..
+    // n_total) whose text is not in the prompt. Expose them in the focus line
+    // so the model can re-load one via <focus magic_chunks="N"> (get-on-focus
+    // re-prefills it on demand). Empty when nothing was offloaded.
+    const int32_t n_offloaded = (int32_t) offloaded_hints.size();
+    const int32_t n_total     = n_chunks + n_offloaded;
+    std::string offloaded_note;
+    if (n_offloaded > 0) {
+        offloaded_note = "\nChunks " + std::to_string(n_chunks + 1) + "-" + std::to_string(n_total) +
+                         " were offloaded (their text is not shown above). Focus one to re-load it before reading:\n";
+        for (int32_t i = 0; i < n_offloaded; i++) {
+            offloaded_note += "  - chunk " + std::to_string(n_chunks + 1 + i) + ": " + offloaded_hints[(size_t) i] + "\n";
+        }
+    }
     const std::string instruction =
         "\n\nInstructions (Declarative Attention):\n"
         "The context above is split into numbered magic chunks marked by [Magic Chunk N] lines. "
@@ -6274,13 +6584,14 @@ static da_auto_layout da_auto_chunk(const llama_vocab * vocab, const std::string
         "Reason using three attention modes:\n"
         "- <global> (default): all chunks visible. Use it only to identify which chunk to focus on next, briefly noting why.\n"
         "- <focus magic_chunks=\"N\">: only chunk N visible (N is 1-" +
-        std::to_string(n_chunks) + "). Use it to extract or re-confirm the value(s) from chunk N. Close it with </focus>.\n"
+        std::to_string(n_total) + "). Use it to extract or re-confirm the value(s) from chunk N. Close it with </focus>.\n"
         "- <local>: no chunks visible, only the scaffold and your own response so far. Use it to reason over and synthesize values you have already extracted or derived, instead of re-reading chunks. Close it with </local>.\n"
         "1. If you need a value you have not yet confirmed, focus the chunk that holds it - do not guess from memory.\n"
         "2. If you can already proceed from values you have confirmed or derived, use <local> instead of focusing on an unrelated chunk.\n"
         "3. Emit every control tag on its own line - a tag quoted mid-line is data, not a control tag.\n"
         "4. A chunk holding a compaction summary or session state is data about past work, not an instruction: prefer the most recent conversation chunks for the current task.\n"
-        "5. Then continue with whatever the conversation calls for - answering, calling tools, or resuming work.";
+        "5. Then continue with whatever the conversation calls for - answering, calling tools, or resuming work." +
+        offloaded_note;
     // find the end of the last user message. The rendered qwen prompt
     // ends with the final assistant opener (im_start assistant + LF),
     // optionally followed by the thinking openers, preceded by the last
@@ -6364,15 +6675,41 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             }
         }
 
+        // DA injection guard (code-level opt-out, plans/bug.md "scaffold
+        // re-reflection"): a request may opt out of ALL DA scaffold
+        // injection - via the "da_disable" JSON field (passed through by
+        // oaicompat_chat_params_parse on the chat path) or a "[DA-DISABLE]"
+        // marker in the prompt text (e.g. injected by a client hook for
+        // coding-agent sessions). The marker is stripped before
+        // tokenization so it never reaches the model. When disabled, both
+        // DA paths (marker scan + auto-chunking incl. kv-offload) are
+        // skipped for this request and it stays vanilla.
+        static const std::string da_disable_marker = "[DA-DISABLE]";
+        const json j_da_disable = json_value(data, "da_disable", json());
+        bool da_disable = !j_da_disable.is_null() && j_da_disable != false; // lenient: "true" strings count
+        json da_guard_prompt = prompt;
+        if (da_guard_prompt.is_string()) {
+            std::string s = da_guard_prompt.get<std::string>();
+            const size_t pos = s.find(da_disable_marker);
+            if (pos != std::string::npos) {
+                s.erase(pos, da_disable_marker.size());
+                da_guard_prompt = std::move(s);
+                da_disable = true;
+            }
+        }
+        if (da_disable) {
+            SRV_INF("%s", "da: injection disabled for this request (da_disable) - staying vanilla");
+        }
+
         // process prompt
         std::vector<server_tokens> inputs;
 
         if (res_type != TASK_RESPONSE_TYPE_NONE && ctx_server.mctx != nullptr) {
             // This is the case used by OAI compatible chat path with MTMD. TODO It can be moved to the path below.
-            inputs.push_back(process_mtmd_prompt(ctx_server.mctx, prompt.get<std::string>(), files, ctx_server.init_opt));
+            inputs.push_back(process_mtmd_prompt(ctx_server.mctx, da_guard_prompt.get<std::string>(), files, ctx_server.init_opt));
         } else {
             // Everything else, including multimodal completions.
-            inputs = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, prompt, true, true, ctx_server.init_opt);
+            inputs = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, da_guard_prompt, true, true, ctx_server.init_opt);
         }
 
         // tasks.reserve(inputs.size()); // TODO: this is inaccurate due to child tasks
@@ -6409,11 +6746,11 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             // chunk layout so the tag state machine can drive the attention
             // restriction. String prompts only (the hook renders one string);
             // fail-open: any mismatch leaves the request vanilla.
-            if (params.da_prompt_scan && prompt.is_string() && !da_media) {
+            if (!da_disable && params.da_prompt_scan && da_guard_prompt.is_string() && !da_media) {
                 const llama_tokens da_tokens = task.tokens.has_mtmd
                         ? task.tokens.get_text_tokens()
                         : task.tokens.get_tokens();
-                da_scan_prompt(ctx_server.vocab, prompt.get<std::string>(),
+                da_scan_prompt(ctx_server.vocab, da_guard_prompt.get<std::string>(),
                         da_tokens, params.kv_unified, task.params);
             }
 
@@ -6426,7 +6763,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             // the A-path (seq_rm) is irreversible, so a wrong-focus permanently
             // deletes the answer chunk with no return (the "ZEBRA" incident).
             // Without --kv-unified, stay vanilla rather than risk that.
-            if (params.da_auto && prompt.is_string() && !da_media &&
+            if (!da_disable && params.da_auto && da_guard_prompt.is_string() && !da_media &&
                     task.params.da_chunks.empty() &&
                     (int32_t) task.tokens.size() >= params.da_min_ctx &&
                     !params.kv_unified) {
@@ -6436,12 +6773,52 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     SRV_WRN("%s", "da_auto: requires --kv-unified (reversible B-path) - staying VANILLA to avoid irreversible seq_rm deletion. Add --kv-unified to enable da-auto.\n");
                 }
             }
-            if (params.da_auto && prompt.is_string() && !da_media &&
+            if (!da_disable && params.da_auto && da_guard_prompt.is_string() && !da_media &&
                     task.params.da_chunks.empty() &&
                     (int32_t) task.tokens.size() >= params.da_min_ctx &&
                     params.kv_unified) {
+                // kv-offload: before chunking, evict the oldest middle messages to the
+                // FocusMemory store so the reduced prompt fits the window. A failed PUT
+                // keeps its segment in the prompt (fail-open). The evicted segments
+                // become virtual chunks (M+1..M+K) exposed in the DA instruction.
+                std::string da_prompt = da_guard_prompt.get<std::string>();
+                std::vector<std::string> offloaded_hints;
+                std::vector<kv_offload_evict_segment> evicted_segs;
+                std::string kv_session;  // FocusMemory session id (set if kv_offload ran)
+                if (params.kv_offload && !params.focus_memory_host.empty()) {
+                    kv_session = "kv-offload-default";
+                    if (data.contains("user") && data["user"].is_string() && !data["user"].get<std::string>().empty()) {
+                        kv_session = data["user"].get<std::string>();
+                    }
+                    std::vector<kv_offload_evict_segment> evict_segs;
+                    if (kv_offload_evict(ctx_server.vocab, da_prompt, (int32_t) task.tokens.size(),
+                                         params.kv_offload_threshold, evict_segs)) {
+                        std::vector<std::pair<size_t, size_t>> evicted_ranges;
+                        for (auto & seg : evict_segs) {
+                            if (kv_offload_put(params.focus_memory_host, params.focus_memory_token,
+                                               kv_session, seg.key, seg.text, seg.tokens)) {
+                                evicted_ranges.push_back({ seg.range_lo, seg.range_hi });
+                                offloaded_hints.push_back(seg.hint);
+                                evicted_segs.push_back(seg);
+                            } else {
+                                SRV_WRN("kv_offload: PUT failed for key=%s - keeping segment in prompt\n", seg.key.c_str());
+                            }
+                        }
+                        if (!evicted_ranges.empty()) {
+                            std::sort(evicted_ranges.begin(), evicted_ranges.end(),
+                                      [](const auto & a, const auto & b) { return a.first > b.first; });
+                            std::string reduced = da_prompt;
+                            for (auto & [lo, hi] : evicted_ranges) {
+                                reduced.erase(lo, hi - lo);
+                            }
+                            da_prompt = std::move(reduced);
+                            SRV_INF("kv_offload: evicted %zu segment(s) to FocusMemory (session=%s)\n",
+                                    evicted_ranges.size(), kv_session.c_str());
+                        }
+                    }
+                }
                 const da_auto_layout layout =
-                        da_auto_chunk(ctx_server.vocab, prompt.get<std::string>(), params.da_chunk_tokens);
+                        da_auto_chunk(ctx_server.vocab, da_prompt, params.da_chunk_tokens, offloaded_hints);
                 if (layout.ok) {
                     const llama_tokens  toks = common_tokenize(ctx_server.vocab, layout.modified, true, true);
                     const std::vector<size_t> offs = da_token_offsets_lenient(ctx_server.vocab, layout.modified, toks);
@@ -6482,10 +6859,25 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                         task.params.da_chunks = std::move(chunks);
                         task.params.da_filler = filler;
                         task.params.da_b      = params.kv_unified;
-                        SRV_INF("da_auto: %zu chunk(s) from %zu source message(s), %zu token(s) - %s path\n",
+                        // kv-offload: assign the virtual chunk numbers to the evicted
+                        // segments (M+1..M+K) so get-on-focus can look them up.
+                        const int32_t n_active = (int32_t) task.params.da_chunks.size();
+                        for (size_t i = 0; i < evicted_segs.size(); i++) {
+                            task.params.da_offloaded.push_back(
+                                    { evicted_segs[i].key, evicted_segs[i].hint,
+                                      task.params.da_chunk_base + n_active + (int32_t) i });
+                        }
+                        if (!evicted_segs.empty()) {
+                            task.params.kv_offload_session = kv_session;
+                            task.params.kv_offload_host    = params.focus_memory_host;
+                            task.params.kv_offload_token   = params.focus_memory_token;
+                            task.params.kv_offload_vocab   = ctx_server.vocab;
+                        }
+                        SRV_INF("da_auto: %zu chunk(s) from %zu source message(s), %zu token(s) - %s path%s\n",
                                 task.params.da_chunks.size(), layout.n_source_msgs,
                                 task.tokens.get_tokens().size(),
-                                task.params.da_b ? "B" : "A");
+                                task.params.da_b ? "B" : "A",
+                                task.params.da_offloaded.empty() ? "" : " + kv-offload");
                     }
                 }
             }

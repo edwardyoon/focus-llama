@@ -638,6 +638,14 @@ struct common_params {
     int32_t da_chunk_tokens     = 2048;  // da_auto: target size (tokens) of a split long message
     bool    da_measure_only     = false; // run the DA tag state machine + logging but skip all KV removals (apply_da_rm/apply_da_b) - output stays vanilla, for measuring g (tag position) and emission rate without touching the KV
 
+    // kv-offload (auto-compact replacement): evict the oldest magic chunks to the
+    // FocusMemory store once the prompt exceeds the threshold; get-on-focus re-
+    // prefills them on demand. focus_memory_host empty = feature off (fail-open).
+    bool        kv_offload           = false;
+    int32_t     kv_offload_threshold = 150000; // evict oldest chunks at this prompt length (tokens)
+    std::string focus_memory_host    = "";     // FocusMemory base URL (e.g. http://127.0.0.1:3900)
+    std::string focus_memory_token   = "";     // FocusMemory Bearer token for evict/recall (empty = no auth header)
+
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT
     std::string api_prefix    = "";                                                                         // NOLINT

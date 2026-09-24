@@ -1756,6 +1756,35 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_DA_MEASURE_ONLY").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
+        {"--kv-offload"},
+        {"--no-kv-offload"},
+        "evict the oldest magic chunks to the FocusMemory store once the prompt exceeds --kv-offload-threshold (get-on-focus re-prefills them on demand) - replaces auto-compact (default: disabled)",
+        [](common_params & params, bool value) {
+            params.kv_offload = value;
+        }
+    ).set_env("LLAMA_ARG_KV_OFFLOAD").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        {"--kv-offload-threshold"}, "N",
+        "kv_offload: evict oldest chunks when the prompt reaches this many tokens (default: 150000)",
+        [](common_params & params, int value) {
+            params.kv_offload_threshold = value;
+        }
+    ).set_env("LLAMA_ARG_KV_OFFLOAD_THRESHOLD").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        {"--focus-memory-host"}, "URL",
+        "kv_offload: FocusMemory base URL for evict/recall (e.g. http://127.0.0.1:3900); empty disables the feature (default: empty)",
+        [](common_params & params, const std::string & value) {
+            params.focus_memory_host = value;
+        }
+    ).set_env("LLAMA_ARG_FOCUS_MEMORY_HOST").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        {"--focus-memory-token"}, "TOKEN",
+        "kv_offload: Bearer token for the FocusMemory evict/recall API (default: empty = no auth header)",
+        [](common_params & params, const std::string & value) {
+            params.focus_memory_token = value;
+        }
+    ).set_env("LLAMA_ARG_FOCUS_MEMORY_TOKEN").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",

@@ -100,6 +100,27 @@ struct task_params {
     // da_chunks[N - da_chunk_base]. 1 for single-block prompts.
     int32_t da_chunk_base = 1;
 
+    // kv-offload (auto-compact replacement): segments evicted to the
+    // FocusMemory store this request. Each is a virtual chunk (chunk_id =
+    // da_chunk_base + active_count + i) whose text is NOT in the prompt;
+    // get-on-focus re-prefills it on demand. The text was PUT during task
+    // construction; only the key/hint/chunk_id travel with the task.
+    struct kv_offload_segment {
+        std::string key;          // FocusMemory stable key (content hash)
+        std::string hint;         // one-line hint shown in the DA instruction
+        int32_t     chunk_id = 0; // virtual chunk number
+    };
+    std::vector<kv_offload_segment> da_offloaded;
+    // kv-offload: FocusMemory connection for get-on-focus (set when segments were
+    // evicted this request; empty when nothing was offloaded). Carried on the task
+    // so apply_da_tag (mid-decode) can reach them without the request JSON. The
+    // vocab pointer (owned by the model, outlives the task) is used to re-tokenize
+    // fetched chunk text during the mid-decode re-prefill.
+    std::string kv_offload_session;
+    std::string kv_offload_host;
+    std::string kv_offload_token;
+    const llama_vocab * kv_offload_vocab = nullptr;
+
     int64_t t_max_prompt_ms  = -1; // TODO: implement
     int64_t t_max_predict_ms = -1; // if positive, limit the generation phase to this time limit
 
