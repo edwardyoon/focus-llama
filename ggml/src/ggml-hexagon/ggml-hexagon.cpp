@@ -7557,10 +7557,12 @@ static bool ggml_hexagon_supported_cpy(const struct ggml_hexagon_session * sess,
         return false;
     }
 
-    // can handle any shape and any same-type (pretty slow if reshaping is required)
+    // Same-type copies also support I32.
     if (sametype) return true;
 
-    // cannot handle re-shaping and type conversion at the same time
+    // Type conversion is only supported between F32 and F16.
+    if (src0->type == GGML_TYPE_I32 || dst->type == GGML_TYPE_I32) return false;
+
     if (!sameshape) return false;
 
     return true;
