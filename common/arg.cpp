@@ -1755,14 +1755,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.da_measure_only = value;
         }
     ).set_env("LLAMA_ARG_DA_MEASURE_ONLY").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    // NOTE: named --fm-offload (not --kv-offload): the standard llama.cpp
+    // -kvo/--kv-offload flag (KV cache offloading) already owns that name and
+    // the LLAMA_ARG_KV_OFFLOAD env var, so a --kv-offload here was silently
+    // consumed by the standard flag and params.kv_offload never parsed.
     add_opt(common_arg(
-        {"--kv-offload"},
-        {"--no-kv-offload"},
+        {"--fm-offload"},
+        {"--no-fm-offload"},
         "evict the oldest magic chunks to the FocusMemory store once the prompt exceeds --kv-offload-threshold (get-on-focus re-prefills them on demand) - replaces auto-compact (default: disabled)",
         [](common_params & params, bool value) {
             params.kv_offload = value;
         }
-    ).set_env("LLAMA_ARG_KV_OFFLOAD").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    ).set_env("LLAMA_ARG_FM_OFFLOAD").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
         {"--kv-offload-threshold"}, "N",
         "kv_offload: evict oldest chunks when the prompt reaches this many tokens (default: 150000)",

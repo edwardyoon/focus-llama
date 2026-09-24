@@ -4919,17 +4919,25 @@ private:
                             for (const auto & seg : offloaded) {
                                 if (seg.chunk_id != n) continue;
                                 found = true;
+                                // Diagnostic: the model is asking for an evicted
+                                // chunk - log the fetch so get-on-focus is traceable.
+                                SLT_INF(slot, "kv_offload: get-on-focus chunk %d (key=%s) - fetching from FocusMemory\n",
+                                        n, seg.key.c_str());
                                 std::string text;
                                 if (kv_offload_get(slot.task->params.kv_offload_host,
                                                    slot.task->params.kv_offload_token,
                                                    slot.task->params.kv_offload_session,
                                                    seg.key, text)
                                         && slot.task->params.kv_offload_vocab) {
+                                    SLT_INF(slot, "kv_offload: GET ok chunk %d - %zu chars, re-prefilling\n",
+                                            n, text.size());
                                     const llama_tokens toks =
                                             common_tokenize(slot.task->params.kv_offload_vocab, text, true, true);
                                     if (kv_offload_refill(ctx_tgt, slot, toks)) {
                                         did_refill = true;
                                         slot.kv_offload_refilled = true;
+                                    } else {
+                                        SLT_WRN(slot, "kv_offload: refill failed for chunk %d - fail-open\n", n);
                                     }
                                 } else {
                                     SLT_WRN(slot, "kv_offload: GET failed for offloaded chunk %d - fail-open\n", n);
@@ -6083,7 +6091,7 @@ static bool da_scan_prompt(
 // ---------------------------------------------------------------------
 // kv-offload (auto-compact replacement) - FocusMemory PUT/GET + eviction
 // ---------------------------------------------------------------------
-// When --kv-offload is set and the rendered prompt exceeds
+// When --fm-offload is set and the rendered prompt exceeds
 // --kv-offload-threshold tokens, the oldest middle messages are evicted:
 // their text is PUT to the FocusMemory store and removed from the prompt,
 // before da_auto_chunk re-chunks the remainder. The evicted segments become
@@ -6795,9 +6803,22 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     if (data.contains("user") && data["user"].is_string() && !data["user"].get<std::string>().empty()) {
                         kv_session = data["user"].get<std::string>();
                     }
+                    // Diagnostic: config state + current token count vs threshold, so
+                    // the journal shows exactly why eviction does or does not fire
+                    // (was the flag parsed? threshold reached? host set?).
+                    SRV_INF("kv_offload: gate - threshold=%d host=%s tokens=%d session=%s\n",
+                            params.kv_offload_threshold, params.focus_memory_host.c_str(),
+                            (int) task.tokens.size(), kv_session.c_str());
                     std::vector<kv_offload_evict_segment> evict_segs;
                     if (kv_offload_evict(ctx_server.vocab, da_prompt, (int32_t) task.tokens.size(),
                                          params.kv_offload_threshold, evict_segs)) {
+                        // Diagnostic: the eviction plan (n segments, tokens each).
+                        {
+                            int32_t plan_tokens = 0;
+                            for (auto & seg : evict_segs) plan_tokens += seg.tokens;
+                            SRV_INF("kv_offload: evict plan - %zu segment(s), ~%d token(s) to offload\n",
+                                    evict_segs.size(), plan_tokens);
+                        }
                         std::vector<std::pair<size_t, size_t>> evicted_ranges;
                         for (auto & seg : evict_segs) {
                             if (kv_offload_put(params.focus_memory_host, params.focus_memory_token,
@@ -6805,6 +6826,8 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                                 evicted_ranges.push_back({ seg.range_lo, seg.range_hi });
                                 offloaded_hints.push_back(seg.hint);
                                 evicted_segs.push_back(seg);
+                                SRV_INF("kv_offload: PUT ok key=%s tokens=%d (%s)\n",
+                                        seg.key.c_str(), seg.tokens, seg.hint.c_str());
                             } else {
                                 SRV_WRN("kv_offload: PUT failed for key=%s - keeping segment in prompt\n", seg.key.c_str());
                             }
@@ -6812,14 +6835,30 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                         if (!evicted_ranges.empty()) {
                             std::sort(evicted_ranges.begin(), evicted_ranges.end(),
                                       [](const auto & a, const auto & b) { return a.first > b.first; });
+                            const size_t before_chars = da_prompt.size();
                             std::string reduced = da_prompt;
                             for (auto & [lo, hi] : evicted_ranges) {
                                 reduced.erase(lo, hi - lo);
                             }
                             da_prompt = std::move(reduced);
-                            SRV_INF("kv_offload: evicted %zu segment(s) to FocusMemory (session=%s)\n",
-                                    evicted_ranges.size(), kv_session.c_str());
+                            SRV_INF("kv_offload: evicted %zu segment(s) to FocusMemory (session=%s), prompt %zu->%zu chars\n",
+                                    evicted_ranges.size(), kv_session.c_str(), before_chars, da_prompt.size());
                         }
+                    } else {
+                        // Diagnostic: considered but nothing planned (under threshold,
+                        // or no evictable middle messages) - the common steady state.
+                        SRV_INF("kv_offload: no eviction planned (tokens=%d, threshold=%d)\n",
+                                (int) task.tokens.size(), params.kv_offload_threshold);
+                    }
+                } else {
+                    // Diagnostic (one-time): kv-offload configured off - the flag was
+                    // not parsed (was the old --kv-offload collision) or the host is
+                    // empty, so eviction can never fire.
+                    static bool kv_offload_disabled_warned = false;
+                    if (!kv_offload_disabled_warned) {
+                        kv_offload_disabled_warned = true;
+                        SRV_WRN("kv_offload: disabled (flag=%d, host_empty=%d) - add --fm-offload and --focus-memory-host to enable eviction\n",
+                                (int) params.kv_offload, (int) params.focus_memory_host.empty());
                     }
                 }
                 const da_auto_layout layout =
