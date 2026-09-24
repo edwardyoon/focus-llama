@@ -1426,8 +1426,11 @@ private:
             }
 
             if (params_base.n_cache_reuse) {
-                params_base.n_cache_reuse = 0;
-                SRV_WRN("%s\n", "cache_reuse is not supported by multimodal, it will be disabled");
+                // kept (not zeroed): chunk-shift is allowed per-request for
+                // text-only prompts even with an mmproj loaded (the
+                // can_cache_reuse gate tests da_rm_text_only); media-token
+                // requests fall back to strict prefix reuse.
+                SRV_INF("%s\n", "cache_reuse: kept for text-only requests (mmproj loaded)");
             }
         }
 
@@ -3519,15 +3522,20 @@ private:
                         SLT_TRC(slot, "new prompt, n_ctx_slot = %d, n_keep = %d, task.n_tokens = %d\n",
                                 slot.n_ctx, slot.task->params.n_keep, slot.task->n_tokens());
 
+                        // per-request media state, computed for every request:
+                        // has_mtmd is true for the whole slot whenever an mmproj
+                        // is loaded, even for text-only prompts, so the
+                        // mid-prefill guards (da_rm, cache-reuse chunk shift)
+                        // test this instead. get_text_tokens() is O(n), the same
+                        // order as the per-token batch fill that follows.
+                        const size_t n_total = slot.task->tokens.size();
+                        const size_t n_text  = slot.task->tokens.get_text_tokens().size();
+                        slot.da_rm_text_only = (n_text == n_total);
+
                         // da_rm diagnostics: full input state at request start, so the
                         // journal shows whether the fields arrived and whether the
-                        // mid-prefill gate can run. Note: has_mtmd is true for
-                        // text-only prompts too when the server has an mmproj loaded
-                        // (mctx != nullptr), so n_media distinguishes real media.
+                        // mid-prefill gate can run.
                         if (slot.da_rm_pending || slot.task->params.da_rm_at >= 0) {
-                            const size_t n_total = slot.task->tokens.size();
-                            const size_t n_text  = slot.task->tokens.get_text_tokens().size();
-                            slot.da_rm_text_only = (n_text == n_total);
                             SLT_INF(slot, "da_rm: request start - %zu range(s), da_rm_at=%d, da_b=%d, n_tokens=%zu, has_mtmd=%d, n_text=%zu, n_media=%zu\n",
                                     slot.task->params.da_rm.size(), slot.task->params.da_rm_at,
                                     (int) slot.task->params.da_b,
@@ -3635,9 +3643,15 @@ private:
 
                                 const auto n_cache_reuse = slot.task->params.n_cache_reuse;
 
+                                // mmproj loaded no longer disables chunk-shift:
+                                // has_mtmd is true for the whole slot whenever an
+                                // mmproj is loaded, even for text-only prompts, so
+                                // test the per-request media state instead. Without
+                                // this, an eviction shape change (kv-offload) costs
+                                // a full re-prefill of the shifted tail per event.
                                 const bool can_cache_reuse =
                                     llama_memory_can_shift(llama_get_memory(ctx_tgt)) &&
-                                    !slot.prompt.tokens.has_mtmd;
+                                    (slot.mctx == nullptr || slot.da_rm_text_only);
 
                                 if (!can_cache_reuse && n_cache_reuse > 0) {
                                     SLT_WRN(slot, "cache reuse is not supported - ignoring n_cache_reuse = %d\n", n_cache_reuse);
@@ -3645,14 +3659,14 @@ private:
 
                                 // reuse chunks from the cached prompt by shifting their KV cache in the new position
                                 if (can_cache_reuse && n_cache_reuse > 0) {
-                                    GGML_ASSERT(!slot.prompt.tokens.has_mtmd);
+                                    GGML_ASSERT(slot.mctx == nullptr || slot.da_rm_text_only);
 
                                     size_t head_c = n_past; // cache
                                     size_t head_p = n_past; // current prompt
 
-                                    if (mctx) {
+                                    if (slot.mctx && !slot.da_rm_text_only) {
                                         // we should never reach this
-                                        GGML_ABORT("not supported by multimodal");
+                                        GGML_ABORT("chunk reuse with media tokens is not supported");
                                     }
 
                                     SLT_DBG(slot, "trying to reuse chunks with size > %d, n_past = %d\n", n_cache_reuse, n_past);
