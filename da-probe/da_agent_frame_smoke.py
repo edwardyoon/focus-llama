@@ -15,20 +15,30 @@ injects) and A/Bs the instruction wording:
                      whatever the conversation calls for...")
 
 Because the scaffold is built client-side, it works against ANY server -
-including a vanilla llama-server with no --da-auto. Run it right now via
-remote curl (123:8080), locally, or on 123 after a build. The journal /
-da_auto line is NOT required (that is the chunking regression, covered by
-da_chunking_smoke.py / da_123_verify.sh).
+including a vanilla llama-server with no --da-auto. Run it via remote
+curl (123:8080), locally, or on 123 after a build.
 
-Verdict (hard assert): the NEW instruction must produce no scaffold
-meta-reasoning in the visible output. The OLD instruction is reported for
-comparison - a leak there reproduces the incident (clean A/B proof); no
-leak is model variance, not a failure.
+Verdict:
+  FAIL - any run of the NEW instruction treats the DA PROTOCOL as the
+         assignment (incident shape: "Let me organize the current state",
+         "According to the scaffold", "instructed to reason in three
+         attention modes", ...).
+  WARN - the model merely discusses the chunks in prose ("the magic chunks
+         are just a compaction summary ... data about past work"). Rule 4
+         frames the summary as data; this costs tokens but is not the
+         incident. Reported, not failed.
+  PASS - zero protocol leaks in the new arm.
+
+Limitation (read the SUMMARY note): this is an instruction-text test -
+full attention, no real KV restriction, no tool interface, and the
+"resume" prompt is synthetic. If the OLD arm also stays clean, the
+incident does not reproduce in this simplified setup and the A/B cannot
+discriminate: engine-level regression is da_123_verify.sh, and live
+sessions on the DA server are the ground truth.
 
 Usage:
   python3 da_agent_frame_smoke.py --server http://192.168.219.123:8080
-  python3 da_agent_frame_smoke.py --server http://127.0.0.1:8086
-  python3 da_agent_frame_smoke.py --server http://127.0.0.1:8086 --model Bonsai-8B-Q1_0
+  python3 da_agent_frame_smoke.py --server http://127.0.0.1:8086 --runs 5
 """
 import argparse
 import json
@@ -116,18 +126,25 @@ def _instr(n, frame):
     return head + body
 
 
-# visible-output signatures of the 09-24 failure mode: the model treating
-# the DA scaffold as something to reason about instead of a tool
-META_PATTERNS = [
-    r"magic chunk",
-    r"declarative attention",
-    r"attention mode",
-    r"according to the scaffold",
+# HARD-FAIL signatures: the model treats the DA PROTOCOL as its assignment
+# (the 09-24 incident shape).
+PROTOCOL_PATTERNS = [
     r"let me organize the current state",
+    r"according to the scaffold",
+    r"instructed to reason",
+    r"declarative attention",
+    r"three attention modes",
+    r"numbered magic chunks",
     r"the scaffold",
-    r"numbered chunk",
-    r"three attention",
+    r"attention mode",
 ]
+# SOFT signatures: the model discusses the chunk system in prose (e.g.
+# "the magic chunks are just a compaction summary ... data about past
+# work"). Rule 4 frames this as acceptable - reported as WARN, not FAIL.
+MENTION_PATTERNS = [
+    r"magic chunk",
+]
+# informational: is the model engaging with the actual task at all
 TASK_MARKERS = ["rate limiter", "ratelimit", "sliding window", "step 2",
                 "plan"]
 
@@ -155,11 +172,6 @@ def chat(base, model, messages, max_tokens=1024):
             "wall": time.time() - t0}
 
 
-def meta_hits(text):
-    low = text.lower()
-    return [p for p in META_PATTERNS if re.search(p, low)]
-
-
 def build_messages(frame):
     instr = _instr(3, frame)
     return [
@@ -171,17 +183,21 @@ def build_messages(frame):
     ]
 
 
-def run_case(base, model, frame, verbose=True):
+def run_case(base, model, frame, verbose):
     r = chat(base, model, build_messages(frame))
+    low = r["text"].lower()
+    proto = [p for p in PROTOCOL_PATTERNS if re.search(p, low)]
+    mention = [p for p in MENTION_PATTERNS if re.search(p, low)]
+    task = any(m in low for m in TASK_MARKERS)
     if verbose:
-        print(f"\n=== {frame} instructions ===")
-        print(f"wall={r['wall']:.1f}s")
-        print("--- visible content (head) ---")
+        print(f"\n--- {frame} (wall={r['wall']:.1f}s) ---")
         print(r["text"][:900])
-    leaks = meta_hits(r["text"])
-    task = any(m in r["text"].lower() for m in TASK_MARKERS)
-    return {"frame": frame, "leaks": leaks, "task": task,
-            "clean": not leaks, "text": r["text"]}
+        if proto:
+            print(f"PROTOCOL LEAK: {proto}")
+        if mention:
+            print(f"mention (warn): {mention}")
+    return {"frame": frame, "proto": proto, "mention": mention,
+            "task": task, "wall": r["wall"], "text": r["text"]}
 
 
 def main():
@@ -189,6 +205,8 @@ def main():
     ap.add_argument("--server", default="http://127.0.0.1:8086")
     ap.add_argument("--model", default=None,
                     help="model name (default: first /v1/models id)")
+    ap.add_argument("--runs", type=int, default=3,
+                    help="runs per arm (default 3 - n=1 is not an A/B)")
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args()
 
@@ -198,21 +216,45 @@ def main():
             model = http(args.server, "/v1/models")["data"][0]["id"]
         except Exception:
             model = "local"
-    print(f"server={args.server} model={model}")
+    print(f"server={args.server} model={model} runs={args.runs}/arm")
 
-    old = run_case(args.server, model, "old", not args.quiet)
-    new = run_case(args.server, model, "new", not args.quiet)
+    results = {}
+    for frame in ("old", "new"):
+        results[frame] = []
+        for i in range(args.runs):
+            if args.quiet:
+                print(f"[{frame} run {i + 1}/{args.runs}]", flush=True)
+            results[frame].append(
+                run_case(args.server, model, frame, not args.quiet))
 
     print("\n=== SUMMARY ===")
-    print(f"old (QA frame)    : leaks={old['leaks']} task_marker={old['task']}")
-    print(f"new (agent frame) : leaks={new['leaks']} task_marker={new['task']}")
-    ok = new["clean"]
+    for frame in ("old", "new"):
+        rs = results[frame]
+        proto = sum(1 for r in rs if r["proto"])
+        ment = sum(1 for r in rs if r["mention"])
+        task = sum(1 for r in rs if r["task"])
+        print(f"{frame:>3} ({args.runs} runs): protocol-leak {proto}  "
+              f"mention(warn) {ment}  task-marker {task}")
+    new_proto = sum(1 for r in results["new"] if r["proto"])
+    new_ment = sum(1 for r in results["new"] if r["mention"])
+    ok = new_proto == 0
     if ok:
-        print("PASS: new instruction produced no scaffold meta-reasoning")
-        if old["leaks"]:
-            print("(old instruction reproduced the leak - clean A/B proof)")
+        print("PASS: new instruction produced no protocol-level leak")
+        if new_ment:
+            print(f"WARN: {new_ment} new-arm run(s) discussed the chunks in "
+                  f"prose (rule-4 data framing, not the incident)")
+        if not any(r["proto"] for r in results["old"]):
+            print("NOTE: old arm also clean - the incident does not "
+                  "reproduce in this simplified setup (no KV restriction, "
+                  "no tool interface, synthetic resume prompt), so this "
+                  "A/B cannot discriminate. Engine regression: "
+                  "da_123_verify.sh; live DA-server sessions are the "
+                  "ground truth.")
     else:
-        print(f"FAIL: new instruction still leaked: {new['leaks']}")
+        for r in results["new"]:
+            if r["proto"]:
+                print(f"FAIL: new-arm protocol leak: {r['proto']}")
+                print(r["text"][:600])
     sys.exit(0 if ok else 1)
 
 
