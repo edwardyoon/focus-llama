@@ -64,8 +64,10 @@ start_server() {  # $1 = log, rest = extra args
     echo "  killing any existing server on port $PORT, then starting..."
     pkill -f "llama-server .*--port $PORT" 2>/dev/null || true
     sleep 3
+    # ${@:2}: $1 is the log file - passing it to the server aborts startup
+    # ("error: invalid argument: /tmp/da_verify_pN_*.log", observed 2026-09-24)
     stdbuf -o0 -e0 ./build/bin/llama-server -m "$MODEL" -ctk q4_0 -ctv q4_0 \
-        --port "$PORT" $SPEC_ARGS "$@" > "$1" 2>&1 &
+        --port "$PORT" $SPEC_ARGS "${@:2}" > "$1" 2>&1 &
     SRV=$!
     tail -f "$1" &
     TAIL=$!
