@@ -2,35 +2,32 @@
 
 > **A [`llama.cpp`](https://github.com/ggml-org/llama.cpp) fork with two production-verified engines: Declarative Attention (DA) - the model declares, in its own output, which parts of the KV cache the next tokens may attend to, and the engine enforces it at decode time - and kv-offload, a lossless evict/recall context store that makes long-horizon sessions viable: a 1-token re-prefill after eviction, and a ~1–2 s lossless chunk recall instead of a ~5.3 min lossy compaction.**
 
-**Status: v2.0 - production-ready.** Running in production (123, qwen3.8-27B MROPE, RTX 5090) with `--da-auto --fm-offload --kv-offload-holes`. DA physical read reduction, DA survival across auto-compaction, the MROPE mid-hole gate (R1), and the kv-offload evict/hole/recall cycle are all verified end to end (below).
+**Status: v2.0 - production-ready.** Running in production (qwen3.8-27B MROPE on the production GPU node, RTX 5090) with `--da-auto --fm-offload --kv-offload-holes`. DA physical read reduction, DA survival across auto-compaction, the MROPE mid-hole gate (R1), and the kv-offload evict/hole/recall cycle are all verified end to end (below).
 
-## Verified: physical KV read reduction (CUDA, 2026-09-22)
+## Verified: lossless context without compaction (kv-offload, 2026-09-26)
 
-Declarative attention now reduces the **physical** KV read volume during decode on CUDA, not just the logical attention set. The flash-attention VEC kernel was ported to the `n_kv_max` sparse path - it gathers K/V rows by compact index, so the kernel reads only the attended rows instead of the whole cache - and the MMA f16 sparse gate was extended to square MHA head dims. A/B against the dense path (`FOCUS_DA_DENSE=1`) on an RTX 5090, 2655-token prompt with 97% of the KV ranges removed, 3 runs per arm:
+The kv-offload cycle (*kv-offload* section below) replaces lossy auto-compaction with a
+lossless evict/recall cycle. Every number below was measured on 2026-09-26, not modeled:
 
-| Path | Result |
-|---|---|
-| **VEC sparse - f16 KV** | ✅ 3/3 byte-identical output, max\|Δlogprob\| = 0.000e+00, journal `n_kv_max 0→512` |
-| **VEC sparse - q4_0 KV** (production config) | ✅ 3/3 byte-identical output, max\|Δlogprob\| = 0.000e+00, journal `n_kv_max 0→512` |
+| Metric | Measured | Where |
+|---|---|---|
+| MROPE mid-hole gate (R1) | 4/4 checks PASS - kept chunk read through the mid-sequence hole, answer-token Δlogprob **+0.000 nats** vs the full-attention baseline | production GPU node, qwen3.8-27B MROPE |
+| Re-prefill after eviction | **1 token in 26 ms** vs 13.7 s for a full re-prefill (`n_past=3163` → 1-token prefill) | local smoke, Bonsai-8B + stub store |
+| Hole application | 1412-token hole cut from the main sequence, prompt cache kept across `release()`, 0 aborts | local smoke (same run) |
+| One chunk recall (GET + re-prefill) | **~1–2 s, lossless** (the original text, not a summary) | measured |
+| One full compaction (baseline) | **~5.3 min, lossy** | measured |
+| Store round-trip in a live session | 87 chunks (~400 KB) PUT/GET round-tripped; per-hole KV cuts applied turn after turn | production GPU node |
 
-The dense path stays bit-identical (constexpr folding), so sparse never changes results when no ranges are removed.
+A single recall is two to three orders of magnitude cheaper than a compaction and lossless:
+context beyond `--kv-offload-threshold` is parked in the store and brought back verbatim on
+demand, instead of being compressed into a lossy summary. The default Option C mode
+(evict from the prompt) kept its behavior intact in the same smoke (prompt text reduction
+12813 → 6484 tokens, no behavioral change).
 
-**Measured in production traffic (123, 09-23).** The sparse-gate journal (`da_sparse[VEC|MMA]:`, one line per ~512-token gather-bound step while sparse, plus the dense fallback with its reason) was captured from live `qwen3.8-focus` traffic, 15:48–21:10:
-
-| Path | Sparse decisions | Mean read | Mean reduction | Range |
-|---|---|---|---|---|
-| VEC (q4_0 KV, production) | 91 | 34.0% | 66.0% | 8–50% |
-| MMA (f16 KV) | 255 | 36.5% | 63.5% | 8–50% |
-| **all** | **346** | **35.9%** | **64.1%** | **8–50%** |
-
-The 50% top of the range is the gate's own bound: the sparse path is only active while it
-reads at most half the KV (`K >= 2*n_kv_max`). Dense fallbacks (108) carry their reason:
-`no sparse kernel variant` (68, MMA head-dim not yet covered) and the 50% decay
-(`K < 2*n_kv_max`, 40). No multi-token-batch fallbacks were observed: spec decode is paused
-while a slot is in DA mode, so DA decode is single-token.
-
-**Status: v1.0** - physical read reduction verified in production traffic (above); tag-quote
-hijack fixed (line-start-only entry tags, `632e31c20`).
+**Status: verified (v2.0)** - running in production since 2026-09-26 (`-c 180000
+--kv-offload-threshold 160000 --kv-offload-holes`). Intentionally out of scope for v2.0:
+the sparse `n_kv_max` path with holes (R3) - v1 forces the dense path, the same physical
+state the R1 gate and the DA A path already run in production.
 
 ---
 
@@ -60,34 +57,37 @@ lines. Supporting engine work verified on the same box: P1 dead-marker smoke 3/3
 multi-turn reversibility + instruction placement 3/3, P2b paper-aligned chunking 4/4
 (packing / hard-cap / prose / 50K - all mean chunk sizes ≤ the 2560-token cap).
 
-**Status: verified on the GPU box and running in production (123 `qwen3.8-focus`, 09-23).**
+**Status: verified on the production GPU node and running in production (`qwen3.8-focus`, 09-23).**
 
 ---
 
-## Verified: lossless context without compaction (kv-offload, 2026-09-26)
+## Verified: physical KV read reduction (CUDA, 2026-09-22)
 
-The kv-offload cycle (*kv-offload* section below) replaces lossy auto-compaction with a
-lossless evict/recall cycle. Every number below was measured on 2026-09-26, not modeled:
+Declarative attention now reduces the **physical** KV read volume during decode on CUDA, not just the logical attention set. The flash-attention VEC kernel was ported to the `n_kv_max` sparse path - it gathers K/V rows by compact index, so the kernel reads only the attended rows instead of the whole cache - and the MMA f16 sparse gate was extended to square MHA head dims. A/B against the dense path (`FOCUS_DA_DENSE=1`) on an RTX 5090, 2655-token prompt with 97% of the KV ranges removed, 3 runs per arm:
 
-| Metric | Measured | Where |
-|---|---|---|
-| MROPE mid-hole gate (R1) | 4/4 checks PASS - kept chunk read through the mid-sequence hole, answer-token Δlogprob **+0.000 nats** vs the full-attention baseline | 123, qwen3.8-27B MROPE |
-| Re-prefill after eviction | **1 token in 26 ms** vs 13.7 s for a full re-prefill (`n_past=3163` → 1-token prefill) | local smoke, Bonsai-8B + stub store |
-| Hole application | 1412-token hole cut from the main sequence, prompt cache kept across `release()`, 0 aborts | local smoke (same run) |
-| One chunk recall (GET + re-prefill) | **~1–2 s, lossless** (the original text, not a summary) | measured |
-| One full compaction (baseline) | **~5.3 min, lossy** | measured |
-| Store round-trip in a live session | 87 chunks (~400 KB) PUT/GET round-tripped; per-hole KV cuts applied turn after turn | 123 production |
+| Path | Result |
+|---|---|
+| **VEC sparse - f16 KV** | ✅ 3/3 byte-identical output, max\|Δlogprob\| = 0.000e+00, journal `n_kv_max 0→512` |
+| **VEC sparse - q4_0 KV** (production config) | ✅ 3/3 byte-identical output, max\|Δlogprob\| = 0.000e+00, journal `n_kv_max 0→512` |
 
-A single recall is two to three orders of magnitude cheaper than a compaction and lossless:
-context beyond `--kv-offload-threshold` is parked in the store and brought back verbatim on
-demand, instead of being compressed into a lossy summary. The default Option C mode
-(evict from the prompt) kept its behavior intact in the same smoke (prompt text reduction
-12813 → 6484 tokens, no behavioral change).
+The dense path stays bit-identical (constexpr folding), so sparse never changes results when no ranges are removed.
 
-**Status: verified (v2.0)** - running in production on 123 since 2026-09-26 (`-c 180000
---kv-offload-threshold 160000 --kv-offload-holes`). Intentionally out of scope for v2.0:
-the sparse `n_kv_max` path with holes (R3) - v1 forces the dense path, the same physical
-state the R1 gate and the DA A path already run in production.
+**Measured in production traffic (09-23).** The sparse-gate journal (`da_sparse[VEC|MMA]:`, one line per ~512-token gather-bound step while sparse, plus the dense fallback with its reason) was captured from live `qwen3.8-focus` traffic, 15:48–21:10:
+
+| Path | Sparse decisions | Mean read | Mean reduction | Range |
+|---|---|---|---|---|
+| VEC (q4_0 KV, production) | 91 | 34.0% | 66.0% | 8–50% |
+| MMA (f16 KV) | 255 | 36.5% | 63.5% | 8–50% |
+| **all** | **346** | **35.9%** | **64.1%** | **8–50%** |
+
+The 50% top of the range is the gate's own bound: the sparse path is only active while it
+reads at most half the KV (`K >= 2*n_kv_max`). Dense fallbacks (108) carry their reason:
+`no sparse kernel variant` (68, MMA head-dim not yet covered) and the 50% decay
+(`K < 2*n_kv_max`, 40). No multi-token-batch fallbacks were observed: spec decode is paused
+while a slot is in DA mode, so DA decode is single-token.
+
+**Status: v1.0** - physical read reduction verified in production traffic (above); tag-quote
+hijack fixed (line-start-only entry tags, `632e31c20`).
 
 ---
 
@@ -418,7 +418,7 @@ still owns the re-chunking. It requires `--da-auto` + `--kv-unified` (the evicti
 the auto-chunk gate) and a store reachable at `--focus-memory-host`.
 
 **Status: verified (v2.0)** - see *Verified: lossless context without compaction* above.
-Running in production (123, qwen3.8-27B MROPE, `-c 180000 --kv-offload-threshold 160000`,
+Running in production (qwen3.8-27B MROPE, `-c 180000 --kv-offload-threshold 160000`,
 since 09-26) with `--kv-offload-holes`: evictions PUT to the store and holes cut the KV on
 every turn of a live session.
 
