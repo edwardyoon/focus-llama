@@ -1,15 +1,23 @@
-// Standalone test for the DA tag-start rule (S1 + S1-CLOSE: line-start
-// only, all six tags).
+// Standalone test for the DA tag stream rules (S1 + S1-CLOSE + S2).
 //
-// The logic under test is da_tag_start_allowed() in
-// tools/server/server-context.cpp - the shared start rule used by
-// scan_da_tag / da_tag_hold_len / da_tag_inflight. S1 tightened the two
-// ENTRY tags (the focus and the local opener) to "beginning of text or
-// right after a newline"; S1-CLOSE extends that to the three RETURN
-// (close) tags and the global tag, dropping the legacy "after any
-// whitespace" rule and the P3 glued-return exception. Every tag now
-// starts only at the beginning of the text or right after a newline,
-// and the verdict no longer depends on the DA mode.
+// Two logics under test, both in tools/server/server-context.cpp:
+//
+// 1. da_tag_start_allowed() - the shared start rule used by
+//    scan_da_tag / da_tag_hold_len / da_tag_inflight. S1 tightened the
+//    two ENTRY tags (the focus and the local opener) to "beginning of
+//    text or right after a newline"; S1-CLOSE extends that to the three
+//    RETURN (close) tags and the global tag, dropping the legacy "after
+//    any whitespace" rule and the P3 glued-return exception. Every tag
+//    now starts only at the beginning of the text or right after a
+//    newline, and the verdict no longer depends on the DA mode.
+//
+// 2. da_tag_prefix() - the holdback validator that keeps a growing tag
+//    head unsent until the tag completes (apply_da_tag then erases it)
+//    or is proven plain text. S2 extends its number grammar from a
+//    single digit run to comma-separated runs, mirroring scan_da_tag()
+//    (magic_chunks="12,13"): the 09-25 19:29 leak (task 5952) was the
+//    old single-run check releasing the hold at the comma, streaming
+//    the tag head before the closing token could erase the tag.
 //
 // The tags are assembled from parts at runtime: full DA tag tokens must
 // not appear inline in this file (a DA session's scanner consumes them
@@ -24,6 +32,7 @@
 
 #include <cctype>
 #include <cstdio>
+#include <cstring>
 #include <string>
 
 enum da_mode_t { DA_MODE_GLOBAL, DA_MODE_FOCUS, DA_MODE_LOCAL };
@@ -46,6 +55,69 @@ static bool da_tag_start_allowed(const std::string & text, size_t lt, da_mode_t 
 }
 
 static int failures = 0;
+
+// The holdback prefix validator (must stay in sync with da_tag_prefix
+// in server-context.cpp).
+static bool da_tag_prefix(const std::string & s) {
+    static const char * const fixed[] = { "<local>", "</focus>", "</local>", "<global>", "</global>" };
+    for (const char * t : fixed) {
+        const size_t tl = std::strlen(t);
+        if (s.size() < tl && s.compare(0, s.size(), t, s.size()) == 0) {
+            return true;
+        }
+    }
+    static const char head[] = "<focus magic_chunks=";
+    const size_t hl = sizeof(head) - 1;
+    if (s.size() < hl && s.compare(0, s.size(), head, s.size()) == 0) {
+        return true;
+    }
+    if (s.size() >= hl && s.compare(0, hl, head) == 0) {
+        size_t i = hl;
+        if (i < s.size() && s[i] == '"') {
+            i++;
+        }
+        if (i == s.size()) {
+            return true;  // attribute name done, waiting for the number
+        }
+        // Number list: digit runs separated by commas, mirroring the
+        // grammar scan_da_tag() parses (magic_chunks="12,13" keeps
+        // several chunks). A comma opens the next run, which may still
+        // be empty; a closing quote is only valid once a run has
+        // arrived, and only the final '>' may follow it.
+        bool in_list = false;  // a digit or comma has arrived
+        for (; i < s.size(); i++) {
+            const unsigned char c = (unsigned char) s[i];
+            if (std::isdigit(c) || c == ',') {
+                in_list = true;
+                continue;  // inside the (possibly multi-run) list
+            }
+            if (c == '"' && in_list) {
+                // closing quote - only the final '>' may follow
+                return i + 1 == s.size();
+            }
+            return false;  // a '>' (complete) or any other character
+        }
+        return true;  // number list open, the tag may still close
+    }
+    return false;
+}
+
+/**
+ * Check one fragment against the expected da_tag_prefix() verdict.
+ * @param {const char *} label
+ * @param {const std::string &} s - unsent tail starting at the tag '<'
+ * @param {bool} expect - expected da_tag_prefix() result
+ * @returns {void}
+ */
+static void check_prefix(const char * label, const std::string & s, bool expect) {
+    const bool got = da_tag_prefix(s);
+    if (got != expect) {
+        std::printf("FAIL %-46s expected %d got %d\n", label, (int) expect, (int) got);
+        failures++;
+    } else {
+        std::printf("ok   %s\n", label);
+    }
+}
 
 /**
  * Check one (text, tag-position, mode) case against the expected verdict.
@@ -120,10 +192,45 @@ int main() {
     check("close-local glued in LOCAL (no P3)", std::string("CODE") + C_LOCAL, C_LOCAL, DA_MODE_LOCAL, false);
     check("global after space in LOCAL", std::string("abc ") + T_GLOBAL, T_GLOBAL, DA_MODE_LOCAL, false);
 
+    // ── S2: da_tag_prefix (holdback validator) ───────────────────────
+    // The fragment is the unsent tail of the generated text, starting at
+    // the tag-start '<'. true = keep holding (could still grow into a
+    // complete tag), false = release (complete tag or plain text).
+    static const std::string HEAD = std::string("<") + "focus magic_chunks=";
+
+    // single-chunk regression (unchanged behavior)
+    check_prefix("focus head partial", std::string("<") + "foc", true);
+    check_prefix("focus head only", HEAD, true);
+    check_prefix("head + opening quote", HEAD + "\"", true);
+    check_prefix("single run open", HEAD + "\"12", true);
+    check_prefix("single run + closing quote", HEAD + "\"12\"", true);
+    check_prefix("single run complete tag", HEAD + "\"12\">", false);
+    check_prefix("single run no quote open", HEAD + "12", true);
+    check_prefix("single run no quote complete", HEAD + "12>", false);
+    check_prefix("fixed local partial", std::string("<loca"), true);
+    check_prefix("fixed local complete", std::string("<") + "local" + ">", false);
+    check_prefix("plain text", "abc", false);
+
+    // multi-chunk list (S2: comma-separated runs, the 09-25 leak fix)
+    check_prefix("multi: comma open (the 09-25 leak)", HEAD + "\"12,", true);
+    check_prefix("multi: next run partial", HEAD + "\"12,1", true);
+    check_prefix("multi: two runs open", HEAD + "\"12,13", true);
+    check_prefix("multi: two runs + closing quote", HEAD + "\"12,13\"", true);
+    check_prefix("multi: two runs complete", HEAD + "\"12,13\">", false);
+    check_prefix("multi: three runs open", HEAD + "\"1,2,3", true);
+    check_prefix("multi: no quote open", HEAD + "12,13", true);
+    check_prefix("multi: no quote complete", HEAD + "12,13>", false);
+
+    // invalid fragments (release = fail-open, the text is plain data)
+    check_prefix("garbage after run", HEAD + "\"12,x", false);
+    check_prefix("garbage after closing quote", HEAD + "\"12\"abc", false);
+    check_prefix("garbage before number", HEAD + "\"x", false);
+    check_prefix("comma then garbage", HEAD + "\"12, x", false);
+
     if (failures) {
         std::printf("\n%d FAILURE(S)\n", failures);
         return 1;
     }
-    std::printf("\nALL PASS (%d cases)\n", 34);
+    std::printf("\nALL PASS (%d cases)\n", 57);
     return 0;
 }

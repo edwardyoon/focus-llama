@@ -4793,8 +4793,8 @@ private:
     // True while the candidate fragment (a suffix of the generated text
     // starting at a tag-start '<') could still grow into a complete DA tag:
     // a proper prefix of a fixed tag, or the <focus magic_chunks="N"> head
-    // plus a digit run that is not closed yet. A complete tag returns false
-    // (apply_da_tag() has consumed it).
+    // plus a number list (digit runs, comma-separated) that is not closed
+    // yet. A complete tag returns false (apply_da_tag() has consumed it).
     static bool da_tag_prefix(const std::string & s) {
         static const char * const fixed[] = { "<local>", "</focus>", "</local>", "<global>", "</global>" };
         for (const char * t : fixed) {
@@ -4816,12 +4816,28 @@ private:
             if (i == s.size()) {
                 return true;  // attribute name done, waiting for the number
             }
+            // Number list: digit runs separated by commas, mirroring the
+            // grammar scan_da_tag() parses (magic_chunks="12,13" keeps
+            // several chunks). A comma opens the next run, which may still
+            // be empty; a closing quote is only valid once a run has
+            // arrived, and only the final '>' may follow it. 09-25 19:29
+            // (task 5952): the old single-run check released the hold at
+            // the comma, streaming the tag head to the client before the
+            // complete tag could be erased at the closing token.
+            bool in_list = false;  // a digit or comma has arrived
             for (; i < s.size(); i++) {
-                if (!std::isdigit((unsigned char) s[i])) {
-                    return false;  // a '>' (complete) or any other character
+                const unsigned char c = (unsigned char) s[i];
+                if (std::isdigit(c) || c == ',') {
+                    in_list = true;
+                    continue;  // inside the (possibly multi-run) list
                 }
+                if (c == '"' && in_list) {
+                    // closing quote - only the final '>' may follow
+                    return i + 1 == s.size();
+                }
+                return false;  // a '>' (complete) or any other character
             }
-            return true;  // number run open, the tag may still close
+            return true;  // number list open, the tag may still close
         }
         return false;
     }
