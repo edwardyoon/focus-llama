@@ -120,6 +120,12 @@ struct task_params {
     std::string kv_offload_host;
     std::string kv_offload_token;
     const llama_vocab * kv_offload_vocab = nullptr;
+    // kv-offload Option B (--kv-offload-holes): hole ranges [lo, hi) in the
+    // FINAL token space (post da_auto_chunk re-tokenization) to cut out of the
+    // slot's main sequence via llama_memory_seq_rm. Set by the eviction gate
+    // this request; applied at the NEXT request's n_past check (the KV must
+    // exist first). Empty in Option C (prompt text reduction).
+    std::vector<std::pair<int32_t, int32_t>> kv_hole_pending;
 
     int64_t t_max_prompt_ms  = -1; // TODO: implement
     int64_t t_max_predict_ms = -1; // if positive, limit the generation phase to this time limit

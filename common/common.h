@@ -645,6 +645,13 @@ struct common_params {
     int32_t     kv_offload_threshold = 150000; // evict oldest chunks at this prompt length (tokens)
     std::string focus_memory_host    = "";     // FocusMemory base URL (e.g. http://127.0.0.1:3900)
     std::string focus_memory_token   = "";     // FocusMemory Bearer token for evict/recall (empty = no auth header)
+    // Option B (seq_rm hole kv offload): when set with --fm-offload, the evicted
+    // segments are NOT removed from the prompt text; instead the server cuts
+    // their KV out of the main sequence (seq_rm holes) so the client can keep
+    // sending the full prompt and the next request re-matches at n_past=full
+    // (1-token re-prefill instead of the ~64s full-tail re-prefill). Off =
+    // Option C (prompt text reduction, the default).
+    bool        kv_offload_holes     = false;
 
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT

@@ -24,6 +24,7 @@
 #include <exception>
 #include <functional>
 #include <memory>
+#include <numeric>
 #include <filesystem>
 #include <random>
 #include <regex>
@@ -377,6 +378,23 @@ struct server_slot {
     // (which re-sends full history and re-fetches on focus). Without a re-prefill
     // (eviction only), the KV is a clean prefix and the cache is kept.
     bool kv_offload_refilled = false;
+    // kv-offload Option B (--kv-offload-holes): holes cut into this slot's MAIN
+    // sequence at eviction time (the evicted segments' KV is removed via
+    // llama_memory_seq_rm, positions are NOT re-based). They persist across
+    // release() between requests: release() keeps the prompt cache (the kv_
+    // holes_active branch) so the next request re-matches at n_past=full and
+    // re-prefills 1 token instead of the evicted tail.
+    //   kv_hole_ranges : applied holes (the ledger) - drives the release()
+    //                    cache policy and the n_kv_max dense override.
+    // The pending holes (not yet applied) are request-scoped: they live in
+    // task_params::kv_hole_pending (set by the eviction gate) and are read
+    // directly at the n_past check - NOT stored in the slot (a slot takeover
+    // would otherwise apply the previous session's stale holes to the new
+    // sequence). Cleared only when the whole sequence is wiped (prompt_clear
+    // or the n_past==0 takeover) - reset() must NOT clear them (the holes live
+    // in the shared cache, not in the per-request slot state).
+    std::vector<std::pair<llama_pos, llama_pos>> kv_hole_ranges;
+    bool kv_holes_active = false;
     // Phase 0 (measure-only): server-level flag copied at slot init. When set,
     // apply_da_rm/apply_da_b skip the KV mutation (output stays vanilla) so the
     // tag state machine + logging can measure g (tag position) and emission
@@ -445,6 +463,11 @@ struct server_slot {
         }
 
         prompt.clear();
+
+        // Option B: the whole main sequence is gone, so the applied-hole
+        // ledger is stale and must not survive into the next request
+        kv_hole_ranges.clear();
+        kv_holes_active = false;
     }
 
     std::vector<common_adapter_lora_info> lora;
@@ -799,6 +822,18 @@ struct server_slot {
                 SLT_INF(*this, "clearing slot after DA removal (A path, holes persist): %zu prompt tokens\n",
                         prompt.tokens.size());
                 prompt_clear();
+            } else if (kv_holes_active) {
+                // Option B (--kv-offload-holes): the evicted segments' KV was
+                // cut out of the main sequence (positions not re-based) but
+                // the prompt text is unchanged, so the next request re-matches
+                // at n_past=full and re-prefills 1 token instead of the
+                // evicted tail -> KEEP the prompt cache. (Placed after the DA
+                // branches on purpose: da_applied must still get its tail
+                // copy-back and da_removed_a must still clear - those win.)
+                SLT_INF(*this, "kv-offload-holes: prompt cache kept (%zu prompt tokens, %zu hole range(s), %d token span)\n",
+                        prompt.tokens.size(), kv_hole_ranges.size(),
+                        std::accumulate(kv_hole_ranges.begin(), kv_hole_ranges.end(), 0,
+                                        [](int s, const auto & r) { return s + (int) (r.second - r.first); }));
             }
             // a B slot that returned to the original sequence mid-decode
             // (</focus> before the end) has a plain sequence again: the
@@ -3599,6 +3634,11 @@ private:
 
                         // keep track how many tokens we can reuse from the previous state
                         int n_past = 0;
+                        // Option B (--kv-offload-holes): set if the n_cache_reuse
+                        // shift block moved KV this request - the pending hole
+                        // coordinates (recorded in the final token space) would be
+                        // stale, so the holes are deferred rather than applied.
+                        bool kv_hole_shift_blocked = false;
 
                         // empty prompt passed -> release the slot and send empty response
                         if (input_tokens.empty()) {
@@ -3704,6 +3744,11 @@ private:
                                             //for (size_t i = head_p; i < head_p + n_match; i++) {
                                             //    SLT_DBG(slot, "cache token %3zu: %6d '%s'\n", i, prompt_tokens[i], common_token_to_piece(ctx_tgt, prompt_tokens[i]).c_str());
                                             //}
+
+                                            // Option B: the shift moved KV, so any pending
+                                            // hole coordinates (recorded in the pre-shift
+                                            // token space) are stale - defer them.
+                                            kv_hole_shift_blocked = true;
 
                                             const int64_t kv_shift = (int64_t) head_p - (int64_t) head_c;
 
@@ -3876,6 +3921,76 @@ private:
                         metrics.add_prompt_cached(n_past);
 
                         slot.prompt.tokens.keep_first(n_past);
+
+                        // Option B (--kv-offload-holes):
+                        // (a) n_past == 0 -> the whole sequence is wiped by the
+                        //     tail seq_rm below, so the applied holes are gone;
+                        //     clear the ledger. Covers every path that zeroes
+                        //     n_past (cache_prompt off, checkpoint do_reset, slot
+                        //     takeover by another session). The pending holes are
+                        //     request-scoped (task_params::kv_hole_pending) and
+                        //     are not applied here (there is no KV to cut) - the
+                        //     gate re-plans them on the next request.
+                        // (b) apply the pending holes (planned by the eviction
+                        //     gate this request, request-scoped) now that the
+                        //     matched-prefix KV is known to exist: each hole must
+                        //     lie fully inside [0, n_past) (its KV was created by
+                        //     an earlier prefill) and the shift block must not
+                        //     have moved the KV. Idempotent: the gate re-plans
+                        //     the same holes every request (the evicted text is
+                        //     kept, so the token count stays over the threshold),
+                        //     so holes already in the applied ledger are skipped.
+                        //     If any hole fails validation, skip ALL (leave the
+                        //     KV intact - the model can still read the content).
+                        if (n_past == 0) {
+                            if (slot.kv_holes_active || !slot.kv_hole_ranges.empty()) {
+                                SLT_INF(slot, "kv-offload-holes: n_past=0 (sequence wiped) - clearing hole ledger (%zu applied)\n",
+                                        slot.kv_hole_ranges.size());
+                                slot.kv_hole_ranges.clear();
+                                slot.kv_holes_active = false;
+                            }
+                        } else if (!kv_hole_shift_blocked && !slot.task->params.kv_hole_pending.empty()) {
+                            std::vector<std::pair<int32_t, int32_t>> fresh;
+                            for (const auto & r : slot.task->params.kv_hole_pending) {
+                                bool dup = false;
+                                for (const auto & a : slot.kv_hole_ranges) {
+                                    if (a.first == r.first && a.second == r.second) {
+                                        dup = true;
+                                        break;
+                                    }
+                                }
+                                if (!dup) {
+                                    fresh.push_back(r);
+                                }
+                            }
+                            if (fresh.size() != slot.task->params.kv_hole_pending.size()) {
+                                SLT_INF(slot, "kv-offload-holes: %zu pending hole(s) already applied - skipping re-apply\n",
+                                        slot.task->params.kv_hole_pending.size() - fresh.size());
+                            }
+                            if (!fresh.empty()) {
+                                bool all_ok = true;
+                                for (const auto & r : fresh) {
+                                    if (r.first < 0 || r.second <= r.first || r.second > n_past || (size_t) r.second > input_tokens.size()) {
+                                        all_ok = false;
+                                        break;
+                                    }
+                                }
+                                if (all_ok) {
+                                    int span = 0;
+                                    for (const auto & r : fresh) {
+                                        slot.mem.seq_rm(slot.kv_seq(), r.first, r.second);
+                                        slot.kv_hole_ranges.push_back(r);
+                                        span += r.second - r.first;
+                                    }
+                                    slot.kv_holes_active = true;
+                                    SLT_INF(slot, "kv-offload-holes: applied %zu hole(s), %d token span, in main seq %d (n_past=%d)\n",
+                                            slot.kv_hole_ranges.size(), span, (int) slot.kv_seq(), n_past);
+                                } else {
+                                    SLT_INF(slot, "kv-offload-holes: deferring %zu pending hole(s) (n_past=%d, need hi<=n_past)\n",
+                                            fresh.size(), n_past);
+                                }
+                            }
+                        }
 
                         // this is to signal the client that the request has started processing
                         if (slot.task->params.stream) {
@@ -4336,6 +4451,24 @@ private:
         }();
         if (dense_override) {
             return;
+        }
+
+        // Option B (--kv-offload-holes): mid-sequence holes are not supported by
+        // the sparse (n_kv_max) path in v1 (R3 - unverified at 100K context).
+        // Force the dense path whenever any slot carries kv holes: the generic
+        // KQ -inf mask handles the holes (the same physical state the DA A-path
+        // runs in production). Reset the bound to 0 so a prior sparse bound (from
+        // a co-existing DA slot) does not persist. Scans all slots: an idle slot's
+        // holes must not be under-estimated by a sparse bound set for a co-tenant.
+        for (auto & slot : slots) {
+            if (slot.kv_holes_active) {
+                if (da_n_kv_max_last != 0) {
+                    SRV_INF("da: n_kv_max %lld -> 0 (kv-offload-holes: forcing dense, R3)\n", (long long) da_n_kv_max_last);
+                    da_n_kv_max_last = 0;
+                    llama_set_n_kv_max(ctx_tgt, 0);
+                }
+                return;
+            }
         }
 
         int64_t n_kv_max = 0;
@@ -6870,7 +7003,11 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                             if (kv_offload_put(params.focus_memory_host, params.focus_memory_token,
                                                kv_session, seg.key, seg.text, seg.tokens)) {
                                 evicted_ranges.push_back({ seg.range_lo, seg.range_hi });
-                                offloaded_hints.push_back(seg.hint);
+                                // Option B keeps the evicted text in the prompt (as a
+                                // real chunk), so no virtual-chunk hint is exposed.
+                                if (!params.kv_offload_holes) {
+                                    offloaded_hints.push_back(seg.hint);
+                                }
                                 evicted_segs.push_back(seg);
                                 SRV_INF("kv_offload: PUT ok key=%s tokens=%d (%s)\n",
                                         seg.key.c_str(), seg.tokens, seg.hint.c_str());
@@ -6879,16 +7016,28 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                             }
                         }
                         if (!evicted_ranges.empty()) {
-                            std::sort(evicted_ranges.begin(), evicted_ranges.end(),
-                                      [](const auto & a, const auto & b) { return a.first > b.first; });
-                            const size_t before_chars = da_prompt.size();
-                            std::string reduced = da_prompt;
-                            for (auto & [lo, hi] : evicted_ranges) {
-                                reduced.erase(lo, hi - lo);
+                            if (params.kv_offload_holes) {
+                                // Option B: keep the evicted text in the prompt. The
+                                // holes are cut from the KV at the next request's
+                                // n_past check (not from the text), so the client can
+                                // keep sending the full prompt and re-match at
+                                // n_past=full (1-token re-prefill instead of the
+                                // evicted tail).
+                                SRV_INF("kv_offload-holes: %zu segment(s) evicted to FocusMemory (session=%s), prompt text kept (%zu chars) - holes will be cut from KV\n",
+                                        evicted_ranges.size(), kv_session.c_str(), da_prompt.size());
+                            } else {
+                                // Option C: remove the evicted text from the prompt
+                                std::sort(evicted_ranges.begin(), evicted_ranges.end(),
+                                          [](const auto & a, const auto & b) { return a.first > b.first; });
+                                const size_t before_chars = da_prompt.size();
+                                std::string reduced = da_prompt;
+                                for (auto & [lo, hi] : evicted_ranges) {
+                                    reduced.erase(lo, hi - lo);
+                                }
+                                da_prompt = std::move(reduced);
+                                SRV_INF("kv_offload: evicted %zu segment(s) to FocusMemory (session=%s), prompt %zu->%zu chars\n",
+                                        evicted_ranges.size(), kv_session.c_str(), before_chars, da_prompt.size());
                             }
-                            da_prompt = std::move(reduced);
-                            SRV_INF("kv_offload: evicted %zu segment(s) to FocusMemory (session=%s), prompt %zu->%zu chars\n",
-                                    evicted_ranges.size(), kv_session.c_str(), before_chars, da_prompt.size());
                         }
                     } else {
                         // Diagnostic: considered but nothing planned (under threshold,
@@ -6949,13 +7098,18 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                         task.params.da_chunks = std::move(chunks);
                         task.params.da_filler = filler;
                         task.params.da_b      = params.kv_unified;
-                        // kv-offload: assign the virtual chunk numbers to the evicted
-                        // segments (M+1..M+K) so get-on-focus can look them up.
-                        const int32_t n_active = (int32_t) task.params.da_chunks.size();
-                        for (size_t i = 0; i < evicted_segs.size(); i++) {
-                            task.params.da_offloaded.push_back(
-                                    { evicted_segs[i].key, evicted_segs[i].hint,
-                                      task.params.da_chunk_base + n_active + (int32_t) i });
+                        // kv-offload (Option C): assign the virtual chunk numbers to
+                        // the evicted segments (M+1..M+K) so get-on-focus can look
+                        // them up. Option B keeps the evicted text as real magic
+                        // chunks (in the prompt), so no virtual chunk IDs are
+                        // assigned and get-on-focus re-prefill is not needed for them.
+                        if (!params.kv_offload_holes) {
+                            const int32_t n_active = (int32_t) task.params.da_chunks.size();
+                            for (size_t i = 0; i < evicted_segs.size(); i++) {
+                                task.params.da_offloaded.push_back(
+                                        { evicted_segs[i].key, evicted_segs[i].hint,
+                                          task.params.da_chunk_base + n_active + (int32_t) i });
+                            }
                         }
                         if (!evicted_segs.empty()) {
                             task.params.kv_offload_session = kv_session;
@@ -6963,11 +7117,49 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                             task.params.kv_offload_token   = params.focus_memory_token;
                             task.params.kv_offload_vocab   = ctx_server.vocab;
                         }
-                        SRV_INF("da_auto: %zu chunk(s) from %zu source message(s), %zu token(s) - %s path%s\n",
+                        // Option B (--kv-offload-holes): map each evicted segment's
+                        // char range (original text space) to a token range (final
+                        // space) and record it as a pending KV hole. The range must
+                        // be shifted by the [Magic Chunk N] headers that
+                        // da_auto_chunk inserted into layout.modified: a header at
+                        // original position h shifts every position p >= h right by
+                        // the header length. A header can sit inside an evicted
+                        // segment (at the segment's content start), so range_lo and
+                        // range_hi get different shifts. The holes are applied at
+                        // the next request's n_past check, once the prompt KV is
+                        // known to exist.
+                        if (params.kv_offload_holes && !evicted_segs.empty()) {
+                            auto header_len = [](int32_t num) -> size_t {
+                                return (size_t) (15 + (int) std::to_string(num).size()); // "[Magic Chunk N]\n"
+                            };
+                            auto mod_pos = [&](size_t p) -> size_t {
+                                size_t shift = 0;
+                                for (size_t i = 0; i < layout.header_pos.size(); i++) {
+                                    if (layout.header_pos[i] <= p) {
+                                        shift += header_len((int32_t) (i + 1));
+                                    }
+                                }
+                                return p + shift;
+                            };
+                            for (auto & seg : evicted_segs) {
+                                const int32_t lo = da_char_to_token_nearest(offs, mod_pos(seg.range_lo));
+                                const int32_t hi = da_char_to_token_nearest(offs, mod_pos(seg.range_hi));
+                                if (lo < 0 || hi < 0 || hi <= lo) {
+                                    SRV_WRN("kv-offload-holes: failed to map evicted segment %s to a token range - skipping its hole\n", seg.key.c_str());
+                                    continue;
+                                }
+                                task.params.kv_hole_pending.push_back({ lo, hi });
+                                SRV_INF("kv-offload-holes: pending hole %s -> tokens [%d, %d) (%d tokens)\n",
+                                        seg.key.c_str(), lo, hi, hi - lo);
+                            }
+                        }
+                        SRV_INF("da_auto: %zu chunk(s) from %zu source message(s), %zu token(s) - %s path%s%s\n",
                                 task.params.da_chunks.size(), layout.n_source_msgs,
                                 task.tokens.get_tokens().size(),
                                 task.params.da_b ? "B" : "A",
-                                task.params.da_offloaded.empty() ? "" : " + kv-offload");
+                                task.params.da_offloaded.empty() ? "" : " + kv-offload",
+                                params.kv_offload_holes && !task.params.kv_hole_pending.empty()
+                                    ? string_format(" + %zu kv-hole(s)", task.params.kv_hole_pending.size()).c_str() : "");
                     }
                 }
             }

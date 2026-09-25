@@ -1775,6 +1775,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_OFFLOAD_THRESHOLD").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
+        {"--kv-offload-holes"},
+        {"--no-kv-offload-holes"},
+        "kv_offload Option B: keep the evicted segments in the prompt and cut their KV out of the main sequence (seq_rm holes) instead of reducing the prompt text - the client keeps sending the full prompt and the next request re-prefills 1 token instead of the evicted tail (default: disabled)",
+        [](common_params & params, bool value) {
+            params.kv_offload_holes = value;
+        }
+    ).set_env("LLAMA_ARG_KV_OFFLOAD_HOLES").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
         {"--focus-memory-host"}, "URL",
         "kv_offload: FocusMemory base URL for evict/recall (e.g. http://127.0.0.1:3900); empty disables the feature (default: empty)",
         [](common_params & params, const std::string & value) {

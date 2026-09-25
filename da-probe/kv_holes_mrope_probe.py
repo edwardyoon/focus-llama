@@ -19,7 +19,12 @@ Two arms, same server, same 5-chunk+filler document (da_ab_harness scaffold):
 
 Checks (R1 passes iff all hold):
   1. both arms answer ZEBRA-42 (the kept chunk survives the hole).
-  2. hole arm: the emitted tag precedes the answer (the removal ran mid-decode).
+  2. the removal actually ran mid-decode: the server's __verbose.timings shows
+     da_n_restricted_steps > 0 and da_path == "A" (a main-seq mid-hole was
+     created). NOTE: the <focus> tag is erased from the client-visible text by
+     apply_da_tag, so it must NOT be looked for in the output - that is the
+     false-negative this probe used to have (R1 09-25: tag=None yet the journal
+     proved the hole was created and the answer read through it).
   3. the hole arm's answer-token logprob is within --lp-tol nats of the
      baseline's (the hole behaves like -inf masking, not garbage / not a
      position-handling break). A large negative delta = the hole corrupted the
@@ -114,7 +119,7 @@ def build_prompt(arm, filler_k):
 
 def complete(base, prompt, extra, max_tokens=48):
     body = {"prompt": prompt, "max_tokens": max_tokens, "temperature": 0,
-            "cache_prompt": False, "stop": ["\n"], "n_probs": 5}
+            "cache_prompt": False, "stop": ["\n"], "n_probs": 5, "verbose": True}
     body.update(extra)
     res = post(base, "/v1/completions", body)
     text = res["choices"][0]["text"]
@@ -124,8 +129,17 @@ def complete(base, prompt, extra, max_tokens=48):
         lps.append(entry["logprob"])
         toks.append(entry["token"])
     m = TAG_RE.search(text)
+    # The server ERASES the <focus> tag from the client-visible text
+    # (apply_da_tag -> generated_text.erase), so the tag is never in `text`
+    # even when it was emitted. The reliable signal that the removal actually
+    # ran (a mid-seq hole was created) is the server's own __verbose.timings:
+    # da_n_restricted_steps > 0 and da_path ("A" = main-seq mid-hole).
+    t = res.get("__verbose", {}).get("timings", {})
     return {"text": text, "lps": lps, "toks": toks,
-            "tag_chunk": int(m.group(1)) if m else None}
+            "tag_chunk": int(m.group(1)) if m else None,
+            "restricted": t.get("da_n_restricted_steps", 0),
+            "attended": t.get("da_n_attended_tokens", 0),
+            "da_path": t.get("da_path")}
 
 
 def answer_lp(run):
@@ -190,18 +204,22 @@ def main():
     for r in range(runs):
         b, h = base_runs[r], hole_runs[r]
         print("run %d baseline: %r" % (r + 1, b["text"][:70]))
-        print("run %d hole    : tag=%s %r" % (r + 1, h["tag_chunk"], h["text"][:70]))
+        print("run %d hole    : restricted=%s attended=%s path=%s %r"
+              % (r + 1, h["restricted"], h["attended"], h["da_path"], h["text"][:70]))
         b_ok = ANSWER in b["text"]
         h_ok = ANSWER in h["text"]
         check("baseline answer", b_ok, "contains %s" % ANSWER)
         check("hole answer (kept chunk readable through mid-hole)", h_ok,
               "contains %s" % ANSWER)
-        # tag must precede the answer in the hole arm
-        m = TAG_RE.search(h["text"])
-        ai = h["text"].find(ANSWER)
-        tag_ok = m is not None and ai != -1 and m.start() < ai
-        check("hole tag->answer (removal ran mid-decode)", tag_ok,
-              "tag=%s pos=%s answer_pos=%s" % (h["tag_chunk"], m.start() if m else None, ai))
+        # the removal must have actually run mid-decode. The server erases the
+        # <focus> tag from the client-visible text, so the tag is never in
+        # h["text"] even when emitted - the reliable signal is the server's own
+        # __verbose.timings: restricted steps > 0 on the A path means a
+        # main-sequence mid-hole was created (exactly the Option B mechanism).
+        removed_ok = (h["restricted"] or 0) > 0 and h["da_path"] == "A"
+        check("hole removal ran mid-decode (server timings)", removed_ok,
+              "restricted=%s attended=%s path=%s (tag erased from output)"
+              % (h["restricted"], h["attended"], h["da_path"]))
         # answer-token logprob: hole must be within tol of baseline (=-inf masking, not garbage)
         bi, blp = answer_lp(b)
         hi_, hlp = answer_lp(h)
