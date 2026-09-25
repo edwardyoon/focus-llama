@@ -3940,8 +3940,12 @@ private:
                         //     the same holes every request (the evicted text is
                         //     kept, so the token count stays over the threshold),
                         //     so holes already in the applied ledger are skipped.
-                        //     If any hole fails validation, skip ALL (leave the
-                        //     KV intact - the model can still read the content).
+                        //     Per-hole: a hole is cut iff its KV is inside the
+                        //     matched prefix (hi <= n_past); the rest are deferred
+                        //     and retried on the next request (disjoint ranges -
+                        //     no cross-hole dependency). All-or-nothing livelocked
+                        //     a growing session: one hole in the re-prefilled tail
+                        //     blocked all ~80 (2026-09-26 production journal).
                         if (n_past == 0) {
                             if (slot.kv_holes_active || !slot.kv_hole_ranges.empty()) {
                                 SLT_INF(slot, "kv-offload-holes: n_past=0 (sequence wiped) - clearing hole ledger (%zu applied)\n",
@@ -3968,26 +3972,27 @@ private:
                                         slot.task->params.kv_hole_pending.size() - fresh.size());
                             }
                             if (!fresh.empty()) {
-                                bool all_ok = true;
+                                int span = 0;
+                                size_t n_applied = 0;
+                                size_t n_deferred = 0;
                                 for (const auto & r : fresh) {
                                     if (r.first < 0 || r.second <= r.first || r.second > n_past || (size_t) r.second > input_tokens.size()) {
-                                        all_ok = false;
-                                        break;
+                                        n_deferred++;
+                                        continue;
                                     }
+                                    slot.mem.seq_rm(slot.kv_seq(), r.first, r.second);
+                                    slot.kv_hole_ranges.push_back(r);
+                                    span += r.second - r.first;
+                                    n_applied++;
                                 }
-                                if (all_ok) {
-                                    int span = 0;
-                                    for (const auto & r : fresh) {
-                                        slot.mem.seq_rm(slot.kv_seq(), r.first, r.second);
-                                        slot.kv_hole_ranges.push_back(r);
-                                        span += r.second - r.first;
-                                    }
+                                if (n_applied > 0) {
                                     slot.kv_holes_active = true;
                                     SLT_INF(slot, "kv-offload-holes: applied %zu hole(s), %d token span, in main seq %d (n_past=%d)\n",
-                                            slot.kv_hole_ranges.size(), span, (int) slot.kv_seq(), n_past);
-                                } else {
+                                            n_applied, span, (int) slot.kv_seq(), n_past);
+                                }
+                                if (n_deferred > 0) {
                                     SLT_INF(slot, "kv-offload-holes: deferring %zu pending hole(s) (n_past=%d, need hi<=n_past)\n",
-                                            fresh.size(), n_past);
+                                            n_deferred, n_past);
                                 }
                             }
                         }
