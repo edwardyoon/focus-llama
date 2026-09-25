@@ -622,6 +622,25 @@ struct server_slot {
         return n_draft_max;
     }
 
+    // DA 2-pass overhead accounting: count a mode transition only when the
+    // mode actually changes, and attribute each generated token to the mode
+    // active at sample time (a closing tag is processed after its last token
+    // is counted, so the tag tokens are attributed to the mode they were
+    // generated in - the global "search" phase, not the focus "re-reason").
+    void da_set_mode(da_mode_t m) {
+        if (da_mode != m) {
+            stats.da_n_transitions += 1;
+            da_mode = m;
+        }
+    }
+    void da_count_generated_token() {
+        switch (da_mode) {
+            case DA_MODE_GLOBAL: stats.da_tokens_global += 1; break;
+            case DA_MODE_FOCUS:  stats.da_tokens_focus  += 1; break;
+            case DA_MODE_LOCAL:  stats.da_tokens_local  += 1; break;
+        }
+    }
+
     // add sampled token of this slot to the batch, optionally add the speculative draft tokens if any
     void handle_last_sampled_token(server_batch & batch) {
         bool add_ok = true;
@@ -713,6 +732,19 @@ struct server_slot {
                         (unsigned long) stats.n_da_restricted_steps,
                         (unsigned long) stats.n_da_attended_tokens,
                         (unsigned long) n_full_steps, reduction);
+            }
+
+            // 2-pass overhead summary: mode-transition count and the
+            // generated-token share per mode (global = search phase, focus =
+            // re-reason phase). The transition sequence itself is in the
+            // da_tag: lines above.
+            if (stats.da_n_transitions > 0) {
+                SLT_INF(*this, "da_overhead: %lu transition(s), generated tokens by mode: global %lu / focus %lu / local %lu (of %lu total)\n",
+                        (unsigned long) stats.da_n_transitions,
+                        (unsigned long) stats.da_tokens_global,
+                        (unsigned long) stats.da_tokens_focus,
+                        (unsigned long) stats.da_tokens_local,
+                        (unsigned long) stats.n_gen);
             }
 
             // Phase 0 (measure-only): report the tag-position distribution
@@ -4999,7 +5031,7 @@ private:
                                     keep_str.c_str(), (int) slot.stats.n_gen, ranges.size(), n_full);
                             apply_da_b(slot, ranges, n_full, "at tag close");
                             if (slot.da_seq >= 0) {
-                                slot.da_mode        = DA_MODE_FOCUS;
+                                slot.da_set_mode(DA_MODE_FOCUS);
                                 slot.da_keep_chunks.assign(keep_idx.begin(), keep_idx.end());
                             }
                         } else if (in_focus) {
@@ -5026,7 +5058,7 @@ private:
                                 slot.da_keep_count += (size_t) (chunks[n].second - chunks[n].first);
                             }
                             slot.da_keep_chunks.assign(keep_idx.begin(), keep_idx.end());
-                            slot.da_mode = DA_MODE_FOCUS;
+                            slot.da_set_mode(DA_MODE_FOCUS);
                             SLT_INF(slot, "da_tag: LOCAL -> FOCUS - keeping chunk(s) %s\n", keep_str.c_str());
                         }
                     } else {
@@ -5065,7 +5097,7 @@ private:
                                     keep_str.c_str(), (int) slot.stats.n_gen, ranges.size(), n_full);
                             apply_da_rm(slot, ranges, n_full, "at tag close");
                             slot.da_keep_chunks.assign(keep_idx.begin(), keep_idx.end());
-                            slot.da_mode = DA_MODE_FOCUS;
+                            slot.da_set_mode(DA_MODE_FOCUS);
                         }
                     }
                     break;
@@ -5082,7 +5114,7 @@ private:
                                     (int) slot.stats.n_gen, ranges.size(), n_full);
                             apply_da_b(slot, ranges, n_full, "at tag close");
                             if (slot.da_seq >= 0) {
-                                slot.da_mode        = DA_MODE_LOCAL;
+                                slot.da_set_mode(DA_MODE_LOCAL);
                                 slot.da_keep_chunks.clear();
                             }
                         } else if (in_focus) {
@@ -5092,7 +5124,7 @@ private:
                                 slot.da_keep_count -= (size_t) (chunks[n].second - chunks[n].first);
                             }
                             slot.da_keep_chunks.clear();
-                            slot.da_mode = DA_MODE_LOCAL;
+                            slot.da_set_mode(DA_MODE_LOCAL);
                             SLT_INF(slot, "%s", "da_tag: FOCUS -> LOCAL - keep chunk(s) dropped\n");
                         }
                         // LOCAL -> LOCAL: no-op
@@ -5119,7 +5151,7 @@ private:
                                 (int) slot.stats.n_gen, ranges.size(), n_full);
                         apply_da_rm(slot, ranges, n_full, "at tag close");
                         slot.da_keep_chunks.clear();
-                        slot.da_mode = DA_MODE_LOCAL;
+                        slot.da_set_mode(DA_MODE_LOCAL);
                     }
                     break;
                 }
@@ -5149,7 +5181,7 @@ private:
                                 slot.da_keep_chunks.size());
                     }
                     // !da_applied: nothing was removed - a clean return
-                    slot.da_mode = DA_MODE_GLOBAL;
+                    slot.da_set_mode(DA_MODE_GLOBAL);
                     break;
                 }
             }
@@ -5267,6 +5299,7 @@ private:
             const int64_t t_now = ggml_time_us();
 
             slot.stats.n_gen += 1;
+            slot.da_count_generated_token();
 
             if (slot.stats.n_gen == 1) {
                 slot.stats.update_prompt_last();
@@ -5443,6 +5476,7 @@ private:
                 // TODO: set result.probs
 
                 slot.stats.n_gen += 1;
+                slot.da_count_generated_token();
 
                 if (!process_token(result, slot)) {
                     slot.print_timings();

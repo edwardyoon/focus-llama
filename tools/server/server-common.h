@@ -370,6 +370,16 @@ struct server_slot_stats {
     uint64_t n_da_attended_tokens  = 0;
     bool     da_removed_a          = false;
 
+    // DA 2-pass overhead: how much the model "re-thinks" on top of the KV
+    // reduction. da_n_transitions counts every da_mode change (global<->focus
+    // <->local); the da_tokens_* fields accumulate generated tokens while in
+    // each mode, so the global share is the "find where the answer is" search
+    // phase and focus is the "re-reason on that chunk" phase.
+    uint64_t da_n_transitions  = 0;
+    uint64_t da_tokens_global  = 0;
+    uint64_t da_tokens_focus   = 0;
+    uint64_t da_tokens_local   = 0;
+
     // these are absolute timestamps (in us)
     // note: must be signed - they are subtracted before the later ones are set
     int64_t t_start       = 0;

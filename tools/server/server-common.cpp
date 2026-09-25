@@ -105,6 +105,10 @@ json server_slot_stats::to_json() const {
         base["da_n_restricted_steps"] = n_da_restricted_steps;
         base["da_n_attended_tokens"]  = n_da_attended_tokens;
         base["da_path"]               = da_removed_a ? "A" : "B";
+        base["da_n_transitions"]      = da_n_transitions;
+        base["da_tokens_global"]      = da_tokens_global;
+        base["da_tokens_focus"]       = da_tokens_focus;
+        base["da_tokens_local"]       = da_tokens_local;
     }
 
     return base;
