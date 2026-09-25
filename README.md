@@ -1,6 +1,8 @@
 # focus-llama
 
-> **A [`llama.cpp`](https://github.com/ggml-org/llama.cpp) fork for Dynamic Attention Masking: the model declares, in its own output, which parts of the KV cache the next tokens may attend to, and the engine enforces it at decode time.**
+> **A [`llama.cpp`](https://github.com/ggml-org/llama.cpp) fork with two production-verified engines: Declarative Attention (DA) - the model declares, in its own output, which parts of the KV cache the next tokens may attend to, and the engine enforces it at decode time - and kv-offload, a lossless evict/recall context store that makes long-horizon sessions viable: a 1-token re-prefill after eviction, and a ~1–2 s lossless chunk recall instead of a ~5.3 min lossy compaction.**
+
+**Status: v2.0 - production-ready.** Running in production (123, qwen3.8-27B MROPE, RTX 5090) with `--da-auto --fm-offload --kv-offload-holes`. DA physical read reduction, DA survival across auto-compaction, the MROPE mid-hole gate (R1), and the kv-offload evict/hole/recall cycle are all verified end to end (below).
 
 ## Verified: physical KV read reduction (CUDA, 2026-09-22)
 
@@ -59,6 +61,33 @@ multi-turn reversibility + instruction placement 3/3, P2b paper-aligned chunking
 (packing / hard-cap / prose / 50K - all mean chunk sizes ≤ the 2560-token cap).
 
 **Status: verified on the GPU box and running in production (123 `qwen3.8-focus`, 09-23).**
+
+---
+
+## Verified: lossless context without compaction (kv-offload, 2026-09-26)
+
+The kv-offload cycle (*kv-offload* section below) replaces lossy auto-compaction with a
+lossless evict/recall cycle. Every number below was measured on 2026-09-26, not modeled:
+
+| Metric | Measured | Where |
+|---|---|---|
+| MROPE mid-hole gate (R1) | 4/4 checks PASS - kept chunk read through the mid-sequence hole, answer-token Δlogprob **+0.000 nats** vs the full-attention baseline | 123, qwen3.8-27B MROPE |
+| Re-prefill after eviction | **1 token in 26 ms** vs 13.7 s for a full re-prefill (`n_past=3163` → 1-token prefill) | local smoke, Bonsai-8B + stub store |
+| Hole application | 1412-token hole cut from the main sequence, prompt cache kept across `release()`, 0 aborts | local smoke (same run) |
+| One chunk recall (GET + re-prefill) | **~1–2 s, lossless** (the original text, not a summary) | measured |
+| One full compaction (baseline) | **~5.3 min, lossy** | measured |
+| Store round-trip in a live session | 87 chunks (~400 KB) PUT/GET round-tripped; per-hole KV cuts applied turn after turn | 123 production |
+
+A single recall is two to three orders of magnitude cheaper than a compaction and lossless:
+context beyond `--kv-offload-threshold` is parked in the store and brought back verbatim on
+demand, instead of being compressed into a lossy summary. The default Option C mode
+(evict from the prompt) kept its behavior intact in the same smoke (prompt text reduction
+12813 → 6484 tokens, no behavioral change).
+
+**Status: verified (v2.0)** - running in production on 123 since 2026-09-26 (`-c 180000
+--kv-offload-threshold 160000 --kv-offload-holes`). Intentionally out of scope for v2.0:
+the sparse `n_kv_max` path with holes (R3) - v1 forces the dense path, the same physical
+state the R1 gate and the DA A path already run in production.
 
 ---
 
@@ -358,31 +387,40 @@ independently usable.
 
 ## kv-offload (auto-compact replacement)
 
-`--fm-offload` replaces the client's lossy auto-compaction with a lossless evict/refill cycle
-backed by an external store (the [FocusMemory](https://github.com/edwardyoon/FocusMemory) dumb
-KV store). When a rendered prompt exceeds `--kv-offload-threshold` tokens, the engine evicts the
-oldest *middle* messages (never the system message or the last user message) before
-`--da-auto` re-chunks: each evicted message's text is PUT to the store, the range is removed
-from the prompt, and the segment becomes a **virtual chunk** numbered `M+1..M+K` (after the
-`M` active chunks) that is listed in the DA instruction. When the model later emits
-`<focus magic_chunks="N">` for an offloaded chunk, the engine GETs its text back and re-prefills
-it at the tail of the sequence (get-on-focus) so the model reads the original content - not a
-compaction summary. Any store error fails open (the segment stays in the prompt), so a downed
-store degrades to a normal DA session, never to data loss.
+`--fm-offload` replaces the client's lossy auto-compaction with a **lossless** evict/recall
+cycle backed by an external store (the [FocusMemory](https://github.com/edwardyoon/FocusMemory)
+dumb KV store). When a rendered prompt exceeds `--kv-offload-threshold` tokens, the engine
+evicts the oldest *middle* messages (never the system message or the last user message) before
+`--da-auto` re-chunks: each evicted message's text is PUT to the store. Two modes control what
+"evict" does to the KV:
 
-This is complementary to both layout paths: it decides *which* middle messages leave the prompt
-and *how* to bring one back on demand; `--da-auto` still owns the re-chunking of what remains.
-It requires `--da-auto` + `--kv-unified` (the eviction runs inside the auto-chunk gate) and a
-store reachable at `--focus-memory-host`.
+- **`--kv-offload-holes` (production path)** - the evicted text *stays in the prompt*; the
+  engine cuts its KV out of the main sequence (`seq_rm` holes, positions not re-based) once the
+  prefix is known to exist. The client keeps sending the full prompt, so every re-request
+  re-matches at `n_past = full` and re-prefills **1 token** instead of the evicted tail
+  (~64 s → ~2 s). Holes are applied per range (disjoint, validated `hi <= n_past`),
+  `release()` keeps the prompt cache, and the generic KQ -inf mask covers the holes - the same
+  physical state the DA A path runs in production. The R1 gate (an MROPE mid-sequence hole
+  behaves like -inf masking) passed on the production 27B with answer-token Δlogprob
+  +0.000 nats. Mid-sequence holes are legal on non-MROPE models too - the batch position
+  check only requires the next token at `seq_max + 1`, so a hole in the middle does not
+  break contiguity (verified in the local smoke, *Verified* section above).
+- **default** - the evicted range is removed from the prompt and the segment becomes a
+  **virtual chunk** numbered `M+1..M+K` (after the `M` active chunks) listed in the DA
+  instruction; when the model emits `<focus magic_chunks="N">` for an offloaded chunk, the
+  engine GETs its text back and re-prefills it at the tail of the sequence (get-on-focus) so
+  the model reads the original content - not a compaction summary.
 
-**Status: work in progress.** The evict/refill cycle is implemented and the store
-round-trips were verified, but it is not enabled on the production node (123 runs
-without `--fm-offload`) and the get-on-focus recall path has not yet been observed in
-production traffic. Each eviction that changes the prompt shape costs a one-time
-re-prefill of the shifted tail; on multi-axis-RoPE (MROPE/IMROPE) models the
-`--cache-reuse` chunk-shift that would amortize it is unsupported
-(`llama_kv_cache::get_can_shift()` is false), so it is accepted as a one-time cost per
-eviction event.
+Any store error fails open (the segment stays in the prompt), so a downed store degrades to a
+normal DA session, never to data loss. The cycle is complementary to both DA layout paths: it
+decides *which* middle messages leave the KV and *how* to bring one back on demand; `--da-auto`
+still owns the re-chunking. It requires `--da-auto` + `--kv-unified` (the eviction runs inside
+the auto-chunk gate) and a store reachable at `--focus-memory-host`.
+
+**Status: verified (v2.0)** - see *Verified: lossless context without compaction* above.
+Running in production (123, qwen3.8-27B MROPE, `-c 180000 --kv-offload-threshold 160000`,
+since 09-26) with `--kv-offload-holes`: evictions PUT to the store and holes cut the KV on
+every turn of a live session.
 
 > **Flag naming.** The engine flag is `--fm-offload` (env `LLAMA_ARG_FM_OFFLOAD`), not
 > `--kv-offload`: the stock llama.cpp `-kvo/--kv-offload` flag (KV-cache offloading) already
@@ -405,9 +443,10 @@ llama-server \
   --spec-type draft-mtp \
   --spec-draft-n-max 4 \
   --spec-draft-ngl all \
-  # kv-offload (auto-compact replacement) - optional, needs a reachable store:
+  # kv-offload (auto-compact replacement) - needs a reachable store:
   --fm-offload \
-  --kv-offload-threshold 130000 \
+  --kv-offload-holes \
+  --kv-offload-threshold 160000 \
   --focus-memory-host http://<store-host>:3900 \
   --focus-memory-token <CONTEXT_API_TOKEN>
 ```
@@ -415,9 +454,10 @@ llama-server \
 (`--da-auto` is the production path: it re-chunks the whole rendered prompt, so DA restricts
 attention over the *entire* conversation - which is what makes the physical KV read reduction
 real (see *Scope of the effect* below). It requires `--kv-unified` (backend B): the A path is
-irreversible, so a wrong focus would permanently delete the answer chunk. Known limitation
-under stabilization - post-compaction drift (tag-quote hijack fixed in v1.0) - is tracked in
-`plans/focus-llama-da-stabilization.md`. A client that also injects FocusMemory markers can add
+irreversible, so a wrong focus would permanently delete the answer chunk. The
+post-compaction drift item (tag-quote hijack) was fixed in v1.0 (line-start-only entry
+tags); residual items are tracked in `plans/focus-llama-da-stabilization.md`. A client that
+also injects FocusMemory markers can add
 `--da-prompt-scan`; the marker layout then wins per request when present.)
 
 (`--parallel 1` keeps the node single-tenant; with `--kv-unified` present it runs backend B - see
