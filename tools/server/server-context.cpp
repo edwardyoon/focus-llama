@@ -4703,41 +4703,37 @@ private:
     };
 
     // Tag-start rule, shared by scan_da_tag / da_tag_hold_len /
-    // da_tag_inflight (the three must stay in sync - 0602ad47c). S1
-    // (line-start only): the two ENTRY tags (the focus and the local
-    // opener) start only at the beginning of the text or right after a
-    // newline - the model emits them as standalone tokens, and a literal
-    // tag quoted mid-line (a tool-call JSON string, a doc sentence) is
-    // data, not a control tag. The three RETURN (close) tags and the
-    // global tag keep the legacy rule - after any whitespace, plus the
-    // glued-return exception in a restricted mode (a close tag glued to
-    // the answer, no space: the model's natural output shape, P3; a
-    // misread in GLOBAL mode is a no-op).
+    // da_tag_inflight (the three must stay in sync - 0602ad47c). S1 +
+    // S1-CLOSE (line-start only, all six tags): every control tag - the
+    // two ENTRY tags (the focus and the local opener), the three RETURN
+    // (close) tags, and the global tag - starts only at the beginning of
+    // the text or right after a newline. The model emits control tags as
+    // standalone lines (the da-auto instruction mandates it: "Emit every
+    // control tag on its own line - a tag quoted mid-line is data, not a
+    // control tag"), and a literal tag quoted or embedded mid-line (after
+    // a space, a backtick, or glued to the answer) is data, not a control
+    // tag. This drops the legacy "after any whitespace" rule and the P3
+    // glued-return exception for the close tags, which 345642 (123,
+    // 09-24, DA on) showed still consumed mid-line close quotes - erasing
+    // them from the model's own reasoning and forcing spurious GLOBAL
+    // returns (the L2 re-derivation loop). A genuine close emitted
+    // mid-line now fails open: the tag stays visible, the mode is
+    // unchanged, and the model re-emits it on its own line per the
+    // instruction.
     static bool da_tag_start_allowed(const std::string & text, size_t lt, da_mode_t mode) {
+        (void) mode;  // the start rule no longer depends on the mode (S1-CLOSE)
         if (lt == 0) {
             return true;
         }
-        const unsigned char prev = (unsigned char) text[lt - 1];
-        // entry tags: line-start only (S1)
-        if (text.compare(lt, 4, "<loc") == 0 || text.compare(lt, 4, "<foc") == 0) {
-            return prev == '\n';
-        }
-        if (std::isspace(prev)) {
-            return true;
-        }
-        // glued return, restricted mode only (P3)
-        return (mode != DA_MODE_GLOBAL) &&
-               (text.compare(lt, 5, "</foc") == 0 ||
-                text.compare(lt, 5, "</loc") == 0 ||
-                text.compare(lt, 5, "</glo") == 0);
+        return (unsigned char) text[lt - 1] == '\n';
     }
 
     // Find the earliest complete DA tag in text[from, size). Returns
     // type < 0 while no tag is closed yet. A full re-scan per token is fine:
     // generation is short and the scan starts at the last consumed position.
-    // A tag must start where da_tag_start_allowed() passes (entry tags:
-    // line-start only; return and global tags: after any whitespace,
-    // plus the glued-return exception in a restricted mode).
+    // A tag must start where da_tag_start_allowed() passes - any of the six
+    // tags, only at the beginning of the text or right after a newline
+    // (S1 + S1-CLOSE).
     static da_tag_t scan_da_tag(const std::string & text, size_t from, da_mode_t mode) {
         da_tag_t best;
         for (size_t lt = text.find('<', from); lt != std::string::npos; lt = text.find('<', lt + 1)) {
