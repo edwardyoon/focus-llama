@@ -2570,6 +2570,7 @@ llm_graph_params llama_context::graph_params(
         /*.loras       =*/ loras.get(),
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
+        /*.prec_policy =*/ &model.prec_policy,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.n_kv_max    =*/ n_kv_max,
