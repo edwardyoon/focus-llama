@@ -50,7 +50,7 @@ struct server_slot;
 static bool kv_offload_get(
         const std::string & host, const std::string & token,
         const std::string & session_id, const std::string & key,
-        std::string & out_text);
+        std::string & out_text, int read_timeout_sec = 5);
 static bool kv_offload_refill(llama_context * ctx, server_slot & slot, const llama_tokens & toks);
 
 static common_speculative_output_limits server_output_limits(const common_params & params) {
@@ -6063,6 +6063,10 @@ static bool da_scan_prompt(
     std::vector<marker_t> block;  // accepted block's markers (incl. the footer)
     int32_t base = -1;
     bool accepted = false;
+    // Diagnostic: log once per request (not per footer candidate) when the
+    // filler's versioned sig marker is missing, so a hook/server contract
+    // drift shows the expected marker vs. what the hook actually emitted.
+    bool sig_diagnosed = false;
 
     // k-anchor validation: the block is the LAST k chunk markers before the
     // last filler before the footer, all within [from, footer); k comes from
@@ -6104,22 +6108,21 @@ static bool da_scan_prompt(
                 return false;
             }
         }
-        // filler signature: the hook's fixed instruction names this block's
-        // exact chunk range. Two substrings that bracket the <focus ...>
-        // tag (whose escaping may vary in the rendered prompt). (see
+        // filler signature: the hook embeds a versioned machine marker naming
+        // this block's exact chunk range. Only the marker form + version + range
+        // are the cross-component contract - the model-facing English instruction
+        // around it is free to be reworded without breaking the scan. (see
         // buildDaBlock in FocusMemory/index.js - keep the two in sync)
         const std::string filler_text = text.substr(filler->end, footer->start - filler->end);
-        char sig[160];
-        snprintf(sig, sizeof(sig),
-                 "Instructions (Declarative Attention): The memory entries above are numbered magic chunks (%d-%d). First identify",
-                 b, b + k - 1);
+        const std::string sig = "[[da:sig:v1:" + std::to_string(b) + "-" + std::to_string(b + k - 1) + "]]";
         if (filler_text.find(sig) == std::string::npos) {
-            return false;
-        }
-        snprintf(sig, sizeof(sig),
-                 "on its own line, where N is the chunk number (%d-%d). Then answer the question.",
-                 b, b + k - 1);
-        if (filler_text.find(sig) == std::string::npos) {
+            if (!sig_diagnosed) {
+                sig_diagnosed = true;
+                std::string excerpt = filler_text.substr(0, 120);
+                for (auto & ch : excerpt) if (ch == '\n' || ch == '\r') ch = ' ';
+                SRV_WRN("da_scan: filler missing sig marker %s (hook/server version drift?) - filler head: %.120s\n",
+                        sig.c_str(), excerpt.c_str());
+            }
             return false;
         }
         block.clear();
@@ -6234,18 +6237,20 @@ static bool da_scan_prompt(
                 continue;
             }
 
+            // filler signature (same versioned machine marker as the strict
+            // path above) - only the marker form + version + range are the
+            // contract, the surrounding English prose is free to change.
             const std::string filler_text = text.substr(filler->end, footer->start - filler->end);
-            char sig[160];
-            snprintf(sig, sizeof(sig),
-                     "Instructions (Declarative Attention): The memory entries above are numbered magic chunks (%d-%d). First identify",
-                     cand_base, cand_base + (int) n_chunks - 1);
+            const std::string sig = "[[da:sig:v1:" + std::to_string(cand_base) + "-" +
+                                    std::to_string(cand_base + (int) n_chunks - 1) + "]]";
             if (filler_text.find(sig) == std::string::npos) {
-                continue;
-            }
-            snprintf(sig, sizeof(sig),
-                     "on its own line, where N is the chunk number (%d-%d). Then answer the question.",
-                     cand_base, cand_base + (int) n_chunks - 1);
-            if (filler_text.find(sig) == std::string::npos) {
+                if (!sig_diagnosed) {
+                    sig_diagnosed = true;
+                    std::string excerpt = filler_text.substr(0, 120);
+                    for (auto & ch : excerpt) if (ch == '\n' || ch == '\r') ch = ' ';
+                    SRV_WRN("da_scan: filler missing sig marker %s (hook/server version drift?) - filler head: %.120s\n",
+                            sig.c_str(), excerpt.c_str());
+                }
                 continue;
             }
 
@@ -6429,11 +6434,12 @@ static std::string kv_offload_url_encode(const std::string & s) {
 static bool kv_offload_get(
         const std::string & host, const std::string & token,
         const std::string & session_id, const std::string & key,
-        std::string & out_text) {
+        std::string & out_text, int read_timeout_sec) {
     if (host.empty() || key.empty()) return false;
+    if (read_timeout_sec <= 0) read_timeout_sec = 5;
     try {
         auto [cli, parts] = common_http_client(host);
-        cli.set_read_timeout(5, 0);
+        cli.set_read_timeout(read_timeout_sec, 0);
         if (!token.empty()) {
             cli.set_default_headers({ { "Authorization", "Bearer " + token } });
         }
@@ -6616,7 +6622,8 @@ struct da_auto_layout {
 };
 
 static da_auto_layout da_auto_chunk(const llama_vocab * vocab, const std::string & text, int32_t da_chunk_tokens,
-        const std::vector<std::string> & offloaded_hints = {}) {
+        const std::vector<std::string> & offloaded_hints = {},
+        const std::string & todo_block = "") {
     da_auto_layout out;
 
     // chat template message boundaries: <\|im_start\|>ROLE\n
@@ -6897,8 +6904,17 @@ static da_auto_layout da_auto_chunk(const llama_vocab * vocab, const std::string
             instr_pos = term;
         }
     }
-    out.filler = { instr_pos, instr_pos + instruction.size() };
-    modified.insert(instr_pos, instruction);
+    // todo-inject: the persistent task-state block sits at the end of the LAST
+    // USER MESSAGE, immediately before the DA instruction. It is deliberately
+    // EXCLUDED from the filler range: the filler (the DA instruction) is the
+    // removable scaffold that apply_da_b/apply_da_rm drop in FOCUS/LOCAL mode,
+    // but the todo block is real state that must stay attendable in every mode
+    // (it is part of the scaffold = system + last user message). Inserting it
+    // at instr_pos (inside the last user message) also keeps it out of the
+    // evictable middle-message range (eviction starts after the first user
+    // message and never touches the last one).
+    out.filler = { instr_pos + todo_block.size(), instr_pos + todo_block.size() + instruction.size() };
+    modified.insert(instr_pos, todo_block + instruction);
 
 
 
@@ -7090,9 +7106,43 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                                     evict_segs.size(), plan_tokens);
                         }
                         std::vector<std::pair<size_t, size_t>> evicted_ranges;
+                        // Per-session uploaded-key cache (Option B re-PUT elimination):
+                        // the PUT is idempotent (key = FNV-1a content hash of the segment
+                        // text), so a key already uploaded for this session is a cache hit -
+                        // skip the network call and count it as evicted. The lock is not
+                        // held across the network call: a concurrent miss on the same key
+                        // just re-PUTs once, which is safe (idempotent).
                         for (auto & seg : evict_segs) {
-                            if (kv_offload_put(params.focus_memory_host, params.focus_memory_token,
-                                               kv_session, seg.key, seg.text, seg.tokens)) {
+                            bool put_ok = false;
+                            bool was_cached = false;
+                            {
+                                std::lock_guard<std::mutex> lk(kv_offload_put_mutex);
+                                auto it = kv_offload_uploaded.find(kv_session);
+                                if (it != kv_offload_uploaded.end() && it->second.count(seg.key) > 0) {
+                                    was_cached = true;
+                                }
+                            }
+                            if (was_cached) {
+                                put_ok = true;
+                                SRV_INF("kv_offload: PUT skip (cached) key=%s tokens=%d (%s)\n",
+                                        seg.key.c_str(), seg.tokens, seg.hint.c_str());
+                            } else {
+                                put_ok = kv_offload_put(params.focus_memory_host, params.focus_memory_token,
+                                                        kv_session, seg.key, seg.text, seg.tokens);
+                                if (put_ok) {
+                                    std::lock_guard<std::mutex> lk(kv_offload_put_mutex);
+                                    auto & keys = kv_offload_uploaded[kv_session];
+                                    // Memory ceiling: bound the per-session key set. Evict
+                                    // the lexicographically smallest key (std::set has no
+                                    // insertion order) - worst case that key is re-PUT
+                                    // later (idempotent).
+                                    if (keys.size() >= 4096) keys.erase(keys.begin());
+                                    keys.insert(seg.key);
+                                    SRV_INF("kv_offload: PUT ok key=%s tokens=%d (%s)\n",
+                                            seg.key.c_str(), seg.tokens, seg.hint.c_str());
+                                }
+                            }
+                            if (put_ok) {
                                 evicted_ranges.push_back({ seg.range_lo, seg.range_hi });
                                 // Option B keeps the evicted text in the prompt (as a
                                 // real chunk), so no virtual-chunk hint is exposed.
@@ -7100,8 +7150,6 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                                     offloaded_hints.push_back(seg.hint);
                                 }
                                 evicted_segs.push_back(seg);
-                                SRV_INF("kv_offload: PUT ok key=%s tokens=%d (%s)\n",
-                                        seg.key.c_str(), seg.tokens, seg.hint.c_str());
                             } else {
                                 SRV_WRN("kv_offload: PUT failed for key=%s - keeping segment in prompt\n", seg.key.c_str());
                             }
@@ -7146,8 +7194,34 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                                 (int) params.kv_offload, (int) params.focus_memory_host.empty());
                     }
                 }
+                // todo-inject: before chunking, fetch the session's persistent
+                // task-state (todo) list from the FocusMemory store and build the
+                // injection block. The session key reuses the kv-offload path
+                // (the OpenAI `user` field, else the "kv-offload-default" constant
+                // Qwen Code sessions derive). The block is injected by
+                // da_auto_chunk at the evict-protected last_user position.
+                // Fail-open: a store miss (404/timeout/down) skips the injection
+                // for this turn — the 1s read timeout bounds the critical-path
+                // stall so a down store cannot hold the request for 5s.
+                std::string todo_block;
+                if (params.todo_inject && !params.focus_memory_host.empty()) {
+                    std::string todo_session = "kv-offload-default";
+                    if (data.contains("user") && data["user"].is_string() && !data["user"].get<std::string>().empty()) {
+                        todo_session = data["user"].get<std::string>();
+                    }
+                    std::string todo_text;
+                    if (kv_offload_get(params.focus_memory_host, params.focus_memory_token,
+                                       todo_session, "todo:" + todo_session, todo_text, 1)) {
+                        todo_block = "\n\n[Current task state - not scaffold, this is real]\n" + todo_text + "\n";
+                        SRV_INF("todo_inject: injected %zu chars (session=%s)\n",
+                                todo_block.size(), todo_session.c_str());
+                    } else {
+                        SRV_INF("todo_inject: no todo in store (session=%s) - skipping injection\n",
+                                todo_session.c_str());
+                    }
+                }
                 const da_auto_layout layout =
-                        da_auto_chunk(ctx_server.vocab, da_prompt, params.da_chunk_tokens, offloaded_hints);
+                        da_auto_chunk(ctx_server.vocab, da_prompt, params.da_chunk_tokens, offloaded_hints, todo_block);
                 if (layout.ok) {
                     const llama_tokens  toks = common_tokenize(ctx_server.vocab, layout.modified, true, true);
                     const std::vector<size_t> offs = da_token_offsets_lenient(ctx_server.vocab, layout.modified, toks);

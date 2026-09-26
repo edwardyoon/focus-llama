@@ -190,4 +190,14 @@ private:
     bool           should_reset_buckets = false;
     // call right before sleep to update the cached responses
     void update_cached_responses(bool is_sleeping);
+
+    // kv-offload: per-session set of content-hash keys already uploaded to the
+    // FocusMemory store. Option B (--kv-offload-holes) keeps evicted text in the
+    // prompt, so the same segment (same content-hash key) is re-planned and re-PUT
+    // every turn; the PUT is idempotent (key = content hash), so a cache hit lets
+    // us skip the network call. Lifetime = server process (a stateless server has
+    // no per-session end signal; a restart clears it -> full re-upload, the safe
+    // boundary). Bounded per-session by KV_OFFLOAD_PUT_CACHE_CAP to cap memory.
+    std::mutex                                   kv_offload_put_mutex;
+    std::map<std::string, std::set<std::string>> kv_offload_uploaded; // session -> keys
 };
