@@ -157,6 +157,27 @@ void ggml_cuda_fattn_sparse_gate_log(const char * path, bool use_sparse, ggml_te
     }
 }
 
+// Sparse-gate threshold as a percentage of KV rows (clamped 1..100, default 50):
+// gathering the finite KV cells only pays off when it reads at most this fraction
+// of the cache. The server sets FOCUS_SPARSE_GATE_THRESHOLD from
+// --sparse-gate-threshold at startup. Lazy static init matches the getenv house
+// style in ggml-cuda.
+static int sparse_gate_threshold_pct() {
+    static const int pct = [] {
+        const char * env = getenv("FOCUS_SPARSE_GATE_THRESHOLD");
+        const int v = env ? std::atoi(env) : 50;
+        return v < 1 ? 1 : (v > 100 ? 100 : v);
+    }();
+    return pct;
+}
+
+// Minimum total KV rows for which gathering only the n_kv_max finite cells reads at
+// most pct% of the cache; the dense path is used below this bound. At the default
+// pct=50 this is exactly 2*n (bit-identical to the original hardcoded 50% gate).
+static int64_t kv_min_rows(int64_t n_kv_max, int pct) {
+    return (100LL * n_kv_max + pct - 1) / pct;
+}
+
 // First failed condition of the MMA f16 sparse gate (nullptr = all pass).
 // Shared by the gate and the journal so the dense fallback carries its reason.
 const char * ggml_cuda_flash_attn_ext_mma_f16_sparse_fail(ggml_backend_cuda_context & ctx, const ggml_tensor * dst) {
@@ -196,10 +217,12 @@ const char * ggml_cuda_flash_attn_ext_mma_f16_sparse_fail(ggml_backend_cuda_cont
     if (mask->ne[2] != 1) {
         return "mask->ne[2]!=1";
     }
-    if (K->ne[1] < std::max<int64_t>(4096, 2LL * n_kv_max)) {
+    const int     kv_pct = sparse_gate_threshold_pct();
+    const int64_t kv_min = kv_min_rows(n_kv_max, kv_pct);
+    if (K->ne[1] < std::max<int64_t>(4096, kv_min)) {
         static thread_local char buf[128];
-        snprintf(buf, sizeof(buf), "K->ne[1]=%lld < max(4096, 2*%d) (finite >= 50%%)",
-                 (long long) K->ne[1], n_kv_max);
+        snprintf(buf, sizeof(buf), "K->ne[1]=%lld < max(4096, min_kv(%d,%d%%)=%lld)",
+                 (long long) K->ne[1], n_kv_max, kv_pct, (long long) kv_min);
         return buf;
     }
     return nullptr;
@@ -257,10 +280,12 @@ const char * ggml_cuda_flash_attn_ext_vec_sparse_fail(const ggml_tensor * dst) {
     if (mask->ne[2] != 1) {
         return "mask->ne[2]!=1";
     }
-    if (K->ne[1] < 2LL * n_kv_max) {
+    const int     kv_pct = sparse_gate_threshold_pct();
+    const int64_t kv_min = kv_min_rows(n_kv_max, kv_pct);
+    if (K->ne[1] < kv_min) {
         static thread_local char buf[128];
-        snprintf(buf, sizeof(buf), "K->ne[1]=%lld < 2*n_kv_max=%d (finite >= 50%%)",
-                 (long long) K->ne[1], 2 * n_kv_max);
+        snprintf(buf, sizeof(buf), "K->ne[1]=%lld < min_kv(%d,%d%%)=%lld",
+                 (long long) K->ne[1], n_kv_max, kv_pct, (long long) kv_min);
         return buf;
     }
     return nullptr;
@@ -269,7 +294,8 @@ const char * ggml_cuda_flash_attn_ext_vec_sparse_fail(const ggml_tensor * dst) {
 // Vector-kernel sparse gate (n_kv_max): single-token decode gathers the compact finite KV
 // rows instead of scanning the whole cache. Unlike the MMA path it needs no tensor cores, so
 // only NVIDIA (for the compact_mask kernel) is required. Sparse is only worth it when we read
-// at most half the KV; the VEC kernel otherwise has no extra gather overhead.
+// at most sparse_gate_threshold_pct% of the KV (default 50, tunable via --sparse-gate-threshold);
+// the VEC kernel otherwise has no extra gather overhead.
 bool ggml_cuda_flash_attn_ext_vec_shall_use_sparse(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 #if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
     GGML_UNUSED_VARS(ctx, dst);

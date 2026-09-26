@@ -1783,6 +1783,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_OFFLOAD_HOLES").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
+        {"--sparse-gate-threshold"}, "PCT",
+        "DA sparse FA gate: use the sparse (gather) path only while the finite KV rows are at most PCT% of the cache, dense below that (1-100, default: 50)",
+        [](common_params & params, int value) {
+            params.sparse_gate_threshold = value;
+        }
+    ).set_env("LLAMA_ARG_SPARSE_GATE_THRESHOLD").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
         {"--focus-memory-host"}, "URL",
         "kv_offload: FocusMemory base URL for evict/recall (e.g. http://127.0.0.1:3900); empty disables the feature (default: empty)",
         [](common_params & params, const std::string & value) {

@@ -652,6 +652,10 @@ struct common_params {
     // (1-token re-prefill instead of the ~64s full-tail re-prefill). Off =
     // Option C (prompt text reduction, the default).
     bool        kv_offload_holes     = false;
+    // sparse FA gate (DA n_kv_max): the CUDA/Metal sparse (gather) path is used
+    // only while the finite KV rows are at most this % of the cache; dense
+    // below. Bridged to FOCUS_SPARSE_GATE_THRESHOLD in the server main (1-100).
+    int32_t     sparse_gate_threshold = 50;
 
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT
@@ -1026,6 +1030,9 @@ struct common_memory {
 
     // aborts execution on failure
     void seq_rm (llama_seq_id seq_id, llama_pos p0, llama_pos p1) const;
+    // like seq_rm, but returns false instead of aborting when the range is not removable
+    // (e.g. the cells were already removed) - for idempotent re-apply paths
+    bool seq_rm_checked(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const;
     void seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta) const;
     void seq_cp (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) const;
 };
