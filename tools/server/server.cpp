@@ -820,6 +820,10 @@ int llama_server(int argc, char ** argv) {
 
     SRV_INF("%s", "initializing ...\n");
 
+    // sparse FA gate threshold: bridge CLI -> env before the first gate call
+    // (the lazy static in ggml-cuda reads it on first use)
+    common_set_env("FOCUS_SPARSE_GATE_THRESHOLD", std::to_string(params.sparse_gate_threshold));
+
     llama_backend_init();
     llama_numa_init(params.numa);
 
