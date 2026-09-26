@@ -19,6 +19,7 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cinttypes>
 #include <exception>
@@ -1382,21 +1383,26 @@ private:
             params_base.load_progress_callback_user_data = &load_progress_text;
         }
 
-        // 2-stream (B) reserves one sequence id beyond the slot ids (da_seq is
+        // 2-stream (B) reserves sequence ids beyond the slot ids (da_seq is
         // always >= n_slots, so it can never collide with a slot's own sequence
-        // or an idle slot's cached prompt). In --kv-unified mode n_ctx_seq is
-        // the full pool regardless of n_seq_max, so the extra id costs only
-        // sequence metadata, not KV capacity. n_parallel is the sole driver of
+        // or an idle slot's cached prompt). apply_da_b scans [n_slots,
+        // n_seq_max) for a free id and gives each B slot its own, so with
+        // n_parallel slots all able to sit on the B path at once, n_seq_max
+        // must reach 2*n_slots or the extra slots fall back to the
+        // irreversible A path. In --kv-unified mode n_ctx_seq is the full pool
+        // regardless of n_seq_max, so the extra ids cost only sequence
+        // metadata, not KV capacity. n_parallel is the sole driver of
         // cparams.n_seq_max (common.cpp), so bump it only around context
         // creation and restore it before the slot loop reads it.
         //
         // n_outputs_max must move with it: llama_context::output_reserve sizes
         // the output buffer for max(n_outputs, n_seq_max) rows and asserts
-        // n_outputs_max >= n_seq_max, so the reserved id needs one more row.
-        const int n_da_b_slots = params_base.n_parallel;
+        // n_outputs_max >= n_seq_max, so the reserved ids need that many rows.
+        const int n_da_b_slots   = params_base.n_parallel;
+        const int n_da_b_seq_max = 2 * n_da_b_slots;
         if (params_base.kv_unified) {
-            params_base.n_parallel = n_da_b_slots + 1;
-            params_base.n_outputs_max = std::max(params_base.n_outputs_max, n_da_b_slots + 1);
+            params_base.n_parallel = n_da_b_seq_max;
+            params_base.n_outputs_max = std::max(params_base.n_outputs_max, n_da_b_seq_max);
         }
 
         llama_init = common_init_from_params(params_base);
@@ -1430,15 +1436,16 @@ private:
             {
                 common_params params_dft = common_base_params_to_speculative(params_base);
 
-                // the draft context must accept the same da_seq id as the target
-                // context: common_memory::seq_cp operates on both, and a B slot
-                // reserves id n_da_b_slots. common_base_params_to_speculative
-                // fixed n_outputs_max to the original slot count, so widen
-                // n_seq_max AND n_outputs_max together (llama_context::
-                // output_reserve asserts n_outputs_max >= n_seq_max).
+                // the draft context must accept the same da_seq ids as the
+                // target context: common_memory::seq_cp operates on both, and
+                // a B slot reserves an id in [n_slots, n_seq_max).
+                // common_base_params_to_speculative fixed n_outputs_max to the
+                // original slot count, so widen n_seq_max AND n_outputs_max
+                // together (llama_context::output_reserve asserts
+                // n_outputs_max >= n_seq_max).
                 if (params_base.kv_unified) {
-                    params_dft.n_parallel = n_da_b_slots + 1;
-                    params_dft.n_outputs_max = std::max(params_dft.n_outputs_max, n_da_b_slots + 1);
+                    params_dft.n_parallel = n_da_b_seq_max;
+                    params_dft.n_outputs_max = std::max(params_dft.n_outputs_max, n_da_b_seq_max);
                 }
 
                 // progress callback
@@ -5055,7 +5062,7 @@ private:
                 break;  // no more complete tags
             }
 
-            const int32_t n_full   = (int32_t) slot.prompt.n_tokens();
+            int32_t n_full   = (int32_t) slot.prompt.n_tokens();
             const bool    in_focus = slot.da_mode == DA_MODE_FOCUS;
             const bool    in_local = slot.da_mode == DA_MODE_LOCAL;
 
@@ -5122,11 +5129,17 @@ private:
                                 SLT_INF(slot, "kv_offload: get-on-focus chunk %d (key=%s) - fetching from FocusMemory\n",
                                         n, seg.key.c_str());
                                 std::string text;
-                                if (kv_offload_get(slot.task->params.kv_offload_host,
-                                                   slot.task->params.kv_offload_token,
-                                                   slot.task->params.kv_offload_session,
-                                                   seg.key, text)
-                                        && slot.task->params.kv_offload_vocab) {
+                                // The GET can block up to the read timeout (5s) on a slow or
+                                // unreachable store. Yield to the queue so metrics/cancel tasks
+                                // are still handled while we wait (fail-open either way).
+                                bool got = false;
+                                queue_tasks.yield_to_queue([&]() {
+                                    got = kv_offload_get(slot.task->params.kv_offload_host,
+                                                         slot.task->params.kv_offload_token,
+                                                         slot.task->params.kv_offload_session,
+                                                         seg.key, text);
+                                });
+                                if (got && slot.task->params.kv_offload_vocab) {
                                     SLT_INF(slot, "kv_offload: GET ok chunk %d - %zu chars, re-prefilling\n",
                                             n, text.size());
                                     const llama_tokens toks =
@@ -5156,6 +5169,14 @@ private:
                         if (std::find(keep_idx.begin(), keep_idx.end(), idx) == keep_idx.end()) {
                             keep_idx.push_back(idx);
                         }
+                    }
+                    // get-on-focus refill may have grown the prompt (the refilled
+                    // tokens are appended at the tail on kv_seq()). Recompute the
+                    // bound so the B switch copies the refilled tail onto da_seq
+                    // instead of tripping the n_tokens() > bound guard and silently
+                    // falling back to the irreversible A-path (seq_rm).
+                    if (did_refill) {
+                        n_full = (int32_t) slot.prompt.n_tokens();
                     }
                     if (keep_idx.empty()) {
                         if (did_refill) {
@@ -6380,6 +6401,26 @@ static bool kv_offload_put(
     }
 }
 
+// Percent-encode a value for use in a URL query string (RFC 3986 unreserved
+// set: A-Z a-z 0-9 - _ . ~). Everything else becomes %XX so that a session id
+// or key containing '&' '?' '=' etc. cannot break the query structure.
+static std::string kv_offload_url_encode(const std::string & s) {
+    static const char * hex = "0123456789ABCDEF";
+    std::string out;
+    out.reserve(s.size());
+    for (unsigned char c : s) {
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+            c == '-' || c == '_' || c == '.' || c == '~') {
+            out += (char) c;
+        } else {
+            out += '%';
+            out += hex[c >> 4];
+            out += hex[c & 0xF];
+        }
+    }
+    return out;
+}
+
 // GET one segment's text back from the FocusMemory store (get-on-focus).
 // Returns true and fills out_text on success; false on any error (fail-open:
 // the caller proceeds without the chunk).
@@ -6394,7 +6435,7 @@ static bool kv_offload_get(
         if (!token.empty()) {
             cli.set_default_headers({ { "Authorization", "Bearer " + token } });
         }
-        std::string path = "/v1/kv-offload/chunk?session_id=" + session_id + "&key=" + key;
+        std::string path = "/v1/kv-offload/chunk?session_id=" + kv_offload_url_encode(session_id) + "&key=" + kv_offload_url_encode(key);
         if (!parts.path.empty() && parts.path != "/") path = parts.path + path;
         auto res = cli.Get(path);
         if (!res || res->status != 200) return false;
@@ -6419,21 +6460,32 @@ static bool kv_offload_refill(llama_context * ctx, server_slot & slot, const lla
     if (n <= 0 || ctx == nullptr) return false;
     const int32_t n_full = (int32_t) slot.prompt.n_tokens();
     const llama_seq_id seq = slot.kv_seq();
+    const int32_t n_batch = (int32_t) llama_n_batch(ctx);
+    if (n_batch <= 0) return false;
     try {
-        llama_batch batch = llama_batch_init(n, 0, 1);
-        std::vector<llama_seq_id> seq_ids(n, seq);
-        for (int32_t i = 0; i < n; i++) {
-            batch.token[i]    = toks[i];
-            batch.pos[i]      = n_full + i;
-            batch.seq_id[i]   = &seq_ids[i];
-            batch.n_seq_id[i] = 1;
-            batch.logits[i]   = (i == n - 1);
-        }
-        int ret = llama_decode(ctx, batch);
-        llama_batch_free(batch);
-        if (ret != 0) {
-            SRV_WRN("kv_offload: refill decode failed (ret=%d, %d tokens) - fail-open\n", ret, n);
-            return false;
+        // The re-prefilled chunk can be larger than n_batch, and llama_decode
+        // asserts n_tokens <= n_batch (it does not sub-batch), so split the
+        // refill into n_batch-sized sub-batches.
+        int32_t off = 0;
+        while (off < n) {
+            const int32_t m = std::min(n_batch, n - off);
+            llama_batch batch = llama_batch_init(m, 0, 1);
+            std::vector<llama_seq_id> seq_ids(m, seq);
+            for (int32_t i = 0; i < m; i++) {
+                batch.token[i]    = toks[off + i];
+                batch.pos[i]      = n_full + off + i;
+                batch.seq_id[i]   = &seq_ids[i];
+                batch.n_seq_id[i] = 1;
+                batch.logits[i]   = (off + i == n - 1);
+            }
+            int ret = llama_decode(ctx, batch);
+            llama_batch_free(batch);
+            if (ret != 0) {
+                SRV_WRN("kv_offload: refill decode failed (ret=%d, tokens %d..%d of %d) - fail-open\n",
+                        ret, off, off + m, n);
+                return false;
+            }
+            off += m;
         }
         // advance the slot's prompt tokens so pos_next() reflects the refill
         llama_tokens new_toks = slot.prompt.tokens.get_tokens();
@@ -6994,9 +7046,8 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     task.params.da_chunks.empty() &&
                     (int32_t) task.tokens.size() >= params.da_min_ctx &&
                     !params.kv_unified) {
-                static bool da_auto_needs_kvunified_warned = false;
-                if (!da_auto_needs_kvunified_warned) {
-                    da_auto_needs_kvunified_warned = true;
+                static std::atomic<bool> da_auto_needs_kvunified_warned{false};
+                if (!da_auto_needs_kvunified_warned.exchange(true)) {
                     SRV_WRN("%s", "da_auto: requires --kv-unified (reversible B-path) - staying VANILLA to avoid irreversible seq_rm deletion. Add --kv-unified to enable da-auto.\n");
                 }
             }
@@ -7084,9 +7135,8 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     // Diagnostic (one-time): kv-offload configured off - the flag was
                     // not parsed (was the old --kv-offload collision) or the host is
                     // empty, so eviction can never fire.
-                    static bool kv_offload_disabled_warned = false;
-                    if (!kv_offload_disabled_warned) {
-                        kv_offload_disabled_warned = true;
+                    static std::atomic<bool> kv_offload_disabled_warned{false};
+                    if (!kv_offload_disabled_warned.exchange(true)) {
                         SRV_WRN("kv_offload: disabled (flag=%d, host_empty=%d) - add --fm-offload and --focus-memory-host to enable eviction\n",
                                 (int) params.kv_offload, (int) params.focus_memory_host.empty());
                     }
