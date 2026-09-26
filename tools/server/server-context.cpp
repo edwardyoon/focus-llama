@@ -6454,9 +6454,10 @@ static bool kv_offload_refill(llama_context * ctx, server_slot & slot, const lla
 // Plan the eviction of the oldest middle messages so the prompt fits under
 // the threshold. Returns true and fills out_segments (each with its original-
 // text range, text, key, hint) if any eviction is planned; false otherwise.
-// Never evicts the system message or the last user message. The caller does
-// the FocusMemory PUT and removes only the successfully-PUT ranges from the
-// prompt (a failed PUT keeps its segment in the prompt - fail-open).
+// Never evicts the system message, the first user message (the task anchor /
+// original request), or the last user message. The caller does the FocusMemory
+// PUT and removes only the successfully-PUT ranges from the prompt (a failed
+// PUT keeps its segment in the prompt - fail-open).
 static bool kv_offload_evict(
         const llama_vocab * vocab,
         const std::string & text,
@@ -6479,9 +6480,15 @@ static bool kv_offload_evict(
     }
     if (msgs.size() < 3 || msgs[0].role != "system") return false;
 
-    size_t last_user = 0;
-    for (size_t i = 0; i < msgs.size(); i++) if (msgs[i].role == "user") last_user = i;
-    if (last_user < 2) return false;
+    // first user message = the task anchor (original request); last user = the
+    // current question. Both are protected from eviction (see evict_start below).
+    size_t first_user = 0, last_user = 0;
+    for (size_t i = 0; i < msgs.size(); i++) {
+        if (msgs[i].role != "user") continue;
+        if (first_user == 0) first_user = i;
+        last_user = i;
+    }
+    if (first_user == 0 || last_user < 2) return false;
 
     auto n_tok = [&](const std::string & s) -> int32_t {
         return (int32_t) common_tokenize(vocab, s, true, true).size();
@@ -6492,10 +6499,16 @@ static bool kv_offload_evict(
         return { lo, hi };
     };
 
-    // evict from the oldest middle message forward until under the threshold
+    // Evict from the oldest middle message forward until under the threshold,
+    // but never the task anchor: the system message (index 0) and the first
+    // user message (the original request) stay in the KV so the task definition
+    // remains attendable in <global> mode. Eviction therefore starts after the
+    // first user message, not at index 1.
+    const size_t evict_start = first_user + 1;
+    if (evict_start >= last_user) return false;  // nothing between anchor and last user
     int32_t remaining = total_tokens;
     std::vector<size_t> evict_idx;
-    for (size_t i = 1; i < last_user; i++) {
+    for (size_t i = evict_start; i < last_user; i++) {
         if (remaining <= threshold) break;
         auto [lo, hi] = msg_range(i);
         if (hi <= lo) continue;
