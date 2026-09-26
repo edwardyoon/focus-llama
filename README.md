@@ -4,15 +4,19 @@
 
 **Status: v2.0 - production-ready.** Running in production (qwen3.8-27B MROPE on the production GPU node, RTX 5090) with `--da-auto --fm-offload --kv-offload-holes`. DA physical read reduction, DA survival across auto-compaction, the MROPE mid-hole gate (R1), and the kv-offload evict/hole/recall cycle are all verified end to end (below).
 
-## Verified: lossless context without compaction (kv-offload, 2026-09-26)
+## Verified: lossless evict/recall (kv-offload, 2026-09-26)
 
-The kv-offload cycle (*kv-offload* section below) replaces lossy auto-compaction with a
-lossless evict/recall cycle. Every number below was measured on 2026-09-26, not modeled:
+The kv-offload cycle (*kv-offload* section below) is a lossless evict/recall alternative to
+lossy auto-compaction: evicted text is parked in the store and brought back verbatim on
+demand, instead of being compressed into a summary. It does not stop the client's own
+auto-compact (the client still compacts on its own schedule); it makes an eviction cheap -
+a 1-token re-prefill instead of a full one - and the recall lossless. Every number below
+was measured on 2026-09-26, not modeled:
 
 | Metric | Measured | Where |
 |---|---|---|
 | MROPE mid-hole gate (R1) | 4/4 checks PASS - kept chunk read through the mid-sequence hole, answer-token Δlogprob **+0.000 nats** vs the full-attention baseline | production GPU node, qwen3.8-27B MROPE |
-| Re-prefill after eviction | **1 token in 26 ms** vs 13.7 s for a full re-prefill (`n_past=3163` → 1-token prefill) | local smoke, Bonsai-8B + stub store |
+| Re-prefill after eviction | **1 token in 26 ms** vs 13.7 s for a full re-prefill (`n_past=3163` → 1-token prefill) | local smoke, Bonsai-8B (non-MROPE plain qwen3) + stub store - mechanism proof, not a production MROPE latency expectation |
 | Hole application | 1412-token hole cut from the main sequence, prompt cache kept across `release()`, 0 aborts | local smoke (same run) |
 | One chunk recall (GET + re-prefill) | **~1–2 s, lossless** (the original text, not a summary) | measured |
 | One full compaction (baseline) | **~5.3 min, lossy** | measured |
@@ -20,12 +24,13 @@ lossless evict/recall cycle. Every number below was measured on 2026-09-26, not 
 
 A single recall is two to three orders of magnitude cheaper than a compaction and lossless:
 context beyond `--kv-offload-threshold` is parked in the store and brought back verbatim on
-demand, instead of being compressed into a lossy summary. The default Option C mode
-(evict from the prompt) kept its behavior intact in the same smoke (prompt text reduction
-12813 → 6484 tokens, no behavioral change).
+demand, instead of being compressed into a lossy summary. Production runs **Option B**
+(`--kv-offload-holes`: the evicted text stays in the prompt and the engine cuts its KV as
+holes); the default **Option C** (evict from the prompt, virtual chunks) kept its behavior
+intact in the same smoke (prompt text reduction 12813 → 6484 tokens, no behavioral change).
 
-**Status: verified (v2.0)** - running in production since 2026-09-26 (`-c 180000
---kv-offload-threshold 160000 --kv-offload-holes`). Intentionally out of scope for v2.0:
+**Status: verified (v2.0)** - running in production since 2026-09-26 (`-c 200000
+--kv-offload-threshold 50000 --kv-offload-holes`). Intentionally out of scope for v2.0:
 the sparse `n_kv_max` path with holes (R3) - v1 forces the dense path, the same physical
 state the R1 gate and the DA A path already run in production.
 
@@ -81,10 +86,12 @@ The dense path stays bit-identical (constexpr folding), so sparse never changes 
 | **all** | **346** | **35.9%** | **64.1%** | **8–50%** |
 
 The 50% top of the range is the gate's own bound: the sparse path is only active while it
-reads at most half the KV (`K >= 2*n_kv_max`). Dense fallbacks (108) carry their reason:
-`no sparse kernel variant` (68, MMA head-dim not yet covered) and the 50% decay
-(`K < 2*n_kv_max`, 40). No multi-token-batch fallbacks were observed: spec decode is paused
-while a slot is in DA mode, so DA decode is single-token.
+reads at most half the KV (`K >= 2*n_kv_max` at the default gate threshold). The threshold
+is tunable via `--sparse-gate-threshold PCT` (1-100, default 50): the sparse gather path is
+used only while the finite KV rows are at most PCT% of the cache, dense below. Dense
+fallbacks (108) carry their reason: `no sparse kernel variant` (68, MMA head-dim not yet
+covered) and the 50% decay (`K < 2*n_kv_max`, 40). No multi-token-batch fallbacks were
+observed: spec decode is paused while a slot is in DA mode, so DA decode is single-token.
 
 **Status: v1.0** - physical read reduction verified in production traffic (above); tag-quote
 hijack fixed (line-start-only entry tags, `632e31c20`).
@@ -385,11 +392,13 @@ The two paths coexist (marker layout wins when present; auto takes over otherwis
 Production launch). Without either, requests run with full attention - the two projects remain
 independently usable.
 
-## kv-offload (auto-compact replacement)
+## kv-offload (lossless evict/recall, auto-compact alternative)
 
-`--fm-offload` replaces the client's lossy auto-compaction with a **lossless** evict/recall
-cycle backed by an external store (the [FocusMemory](https://github.com/edwardyoon/FocusMemory)
-dumb KV store). When a rendered prompt exceeds `--kv-offload-threshold` tokens, the engine
+`--fm-offload` provides a **lossless** evict/recall cycle backed by an external store (the
+[FocusMemory](https://github.com/edwardyoon/FocusMemory) dumb KV store) as the alternative to
+the client's lossy auto-compaction: it does not disable the client's compaction, it changes
+what an eviction costs (a 1-token re-prefill) and how a chunk comes back (the original text,
+not a summary). When a rendered prompt exceeds `--kv-offload-threshold` tokens, the engine
 evicts the oldest *middle* messages (never the system message or the last user message) before
 `--da-auto` re-chunks: each evicted message's text is PUT to the store. Two modes control what
 "evict" does to the KV:
@@ -417,8 +426,8 @@ decides *which* middle messages leave the KV and *how* to bring one back on dema
 still owns the re-chunking. It requires `--da-auto` + `--kv-unified` (the eviction runs inside
 the auto-chunk gate) and a store reachable at `--focus-memory-host`.
 
-**Status: verified (v2.0)** - see *Verified: lossless context without compaction* above.
-Running in production (qwen3.8-27B MROPE, `-c 180000 --kv-offload-threshold 160000`,
+**Status: verified (v2.0)** - see *Verified: lossless evict/recall* above.
+Running in production (qwen3.8-27B MROPE, `-c 200000 --kv-offload-threshold 50000`,
 since 09-26) with `--kv-offload-holes`: evictions PUT to the store and holes cut the KV on
 every turn of a live session.
 
@@ -446,7 +455,7 @@ llama-server \
   # kv-offload (auto-compact replacement) - needs a reachable store:
   --fm-offload \
   --kv-offload-holes \
-  --kv-offload-threshold 160000 \
+  --kv-offload-threshold 50000 \
   --focus-memory-host http://<store-host>:3900 \
   --focus-memory-token <CONTEXT_API_TOKEN>
 ```
@@ -474,7 +483,7 @@ Backend A vs B below.)
 | `--spec-draft-n-max 4` | Up to 4 draft tokens per step | Enough to overlap decode with drafting, without so many that rejections waste work |
 | `--spec-draft-ngl all` | Puts the whole draft model on the GPU | The draft model is small; keeping it fully on-GPU avoids CPU round-trips that would erase the spec gain |
 | `--fm-offload` | **kv-offload**: evict the oldest middle messages to the FocusMemory store once the prompt exceeds `--kv-offload-threshold`, and re-prefill them on demand when the model focuses an offloaded chunk | Replaces lossy auto-compaction with a lossless evict/refill cycle (see *kv-offload* above). Optional - off by default |
-| `--kv-offload-threshold 130000` | Token count at which kv-offload eviction engages | Below this the prompt is kept whole; the threshold should sit under the client's auto-compact point (e.g. 70% of a 200K window) |
+| `--kv-offload-threshold 50000` | Token count at which kv-offload eviction engages | Below this the prompt is kept whole; it should sit under the client's auto-compact point (production: 50000, a quarter of the 200K window) |
 | `--focus-memory-host` | Base URL of the FocusMemory KV store (`PUT`/`GET` `/v1/kv-offload/chunk`) | Empty = kv-offload disabled even with `--fm-offload` on (fail-open) |
 | `--focus-memory-token` | Bearer token for the store API (`CONTEXT_API_TOKEN`) | Empty = no auth header; set it to match the store |
 
