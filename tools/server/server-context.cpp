@@ -1581,15 +1581,16 @@ private:
         // try speculative decoding
         if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
             try {
-                // In --kv-unified mode the 2-stream (B) DA path reserves one extra
-                // sequence id (n_slots, see apply_da_b) that both ctxs already accept
-                // (n_seq_max = n_parallel + 1, bumped above). The speculative per-seq
-                // state (dparams + each impl's per-seq vectors) must cover that id too,
-                // or a B slot drafting on da_seq hits the `seq_id < dparams.size()`
-                // assert. The extra id stays idle (drafting=false) until a B slot uses
-                // it, so non-B / non-unified paths are unaffected.
+                // In --kv-unified mode the 2-stream (B) DA path reserves n_da_b_slots
+                // extra sequence ids (n_slots..2*n_slots, see apply_da_b) that both ctxs
+                // accept (context n_seq_max = 2*n_parallel, bumped above). The
+                // speculative per-seq state (dparams + each impl's per-seq vectors)
+                // must cover all of them too, or a B slot drafting on da_seq hits the
+                // `seq_id < dparams.size()` assert. The extra ids stay idle
+                // (drafting=false) until B slots use them, so non-B / non-unified
+                // paths are unaffected.
                 const uint32_t n_seq_spec =
-                        (uint32_t) params_base.n_parallel + (params_base.kv_unified ? 1u : 0u);
+                        (uint32_t) params_base.n_parallel + (params_base.kv_unified ? (uint32_t) n_da_b_slots : 0u);
                 spec.reset(common_speculative_init(params_base.speculative, n_seq_spec));
             } catch (const std::exception & e) {
                 SRV_ERR("failed to initialize speculative decoding context: %s\n", e.what());
@@ -4658,9 +4659,10 @@ private:
     //     KV streams aborts (llama_kv_cache::seq_cp), while within one stream
     //     it only retags cell metadata.
     //   - a sequence id beyond the slot ids must be available: the server
-    //     reserves one extra id at context creation (n_seq_max = n_slots + 1
-    //     in --kv-unified mode). Ids below n_slots are never used - they may
-    //     hold idle slots' cached prompts, which prompt_clear() would destroy.
+    //     reserves n_slots extra ids at context creation (n_seq_max = 2*n_slots
+    //     in --kv-unified mode), so up to n_slots B slots can run at once.
+    //     Ids below n_slots are never used - they may hold idle slots' cached
+    //     prompts, which prompt_clear() would destroy.
     //   - the prefilled prompt must not exceed the removal boundary: the keep
     //     ranges only cover [0, bound), so tokens in [bound, n_prompt) would
     //     be missing from the new sequence (the media-blocked after-prefill
@@ -4715,8 +4717,8 @@ private:
 
         // pick a sequence id beyond the slot ids: ids below n_slots may hold
         // idle slots' cached prompts, which this slot's prompt_clear() would
-        // destroy. The server reserves one extra id at context creation
-        // (n_seq_max = n_slots + 1 in --kv-unified mode).
+        // destroy. The server reserves n_slots extra ids at context creation
+        // (n_seq_max = 2*n_slots in --kv-unified mode).
         const int n_seq_max = (int) llama_n_seq_max(ctx_tgt);
         const int n_slots   = (int) slots.size();
         llama_seq_id da_seq = -1;
