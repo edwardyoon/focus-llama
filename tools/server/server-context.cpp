@@ -6377,6 +6377,32 @@ static std::string kv_offload_json_escape(const std::string & s) {
     return out;
 }
 
+// Resolve the FocusMemory session id for one request. Priority:
+// 1. X-Session-Id header (the Qwen Code client carries the real session
+//    UUID here; matched case-insensitively, the wire case is not guaranteed),
+// 2. the OpenAI `user` field, 3. the shared "kv-offload-default" constant
+// (clients that send neither). Every store call of the request must use the
+// same value (evict PUT, todo GET, refill GET via task.params.kv_offload_session)
+// or the per-session store files would fragment.
+static std::string kv_offload_resolve_session(const server_http_req & req, const json & data) {
+    auto header_ci = [&req](const std::string & want) -> std::string {
+        std::string w = want;
+        for (auto & c : w) c = (char) tolower((unsigned char) c);
+        for (const auto & kv : req.headers) {
+            std::string k = kv.first;
+            for (auto & c : k) c = (char) tolower((unsigned char) c);
+            if (k == w) return kv.second;
+        }
+        return "";
+    };
+    const std::string h = header_ci("X-Session-Id");
+    if (!h.empty()) return h;
+    if (data.contains("user") && data["user"].is_string() && !data["user"].get<std::string>().empty()) {
+        return data["user"].get<std::string>();
+    }
+    return "kv-offload-default";
+}
+
 // PUT one evicted segment's text to the FocusMemory store. Returns true on
 // success; false on any error (the caller then keeps the segment in the prompt).
 static bool kv_offload_put(
@@ -7085,10 +7111,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                 std::vector<kv_offload_evict_segment> evicted_segs;
                 std::string kv_session;  // FocusMemory session id (set if kv_offload ran)
                 if (params.kv_offload && !params.focus_memory_host.empty()) {
-                    kv_session = "kv-offload-default";
-                    if (data.contains("user") && data["user"].is_string() && !data["user"].get<std::string>().empty()) {
-                        kv_session = data["user"].get<std::string>();
-                    }
+                    kv_session = kv_offload_resolve_session(req, data);
                     // Diagnostic: config state + current token count vs threshold, so
                     // the journal shows exactly why eviction does or does not fire
                     // (was the flag parsed? threshold reached? host set?).
@@ -7205,10 +7228,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                 // stall so a down store cannot hold the request for 5s.
                 std::string todo_block;
                 if (params.todo_inject && !params.focus_memory_host.empty()) {
-                    std::string todo_session = "kv-offload-default";
-                    if (data.contains("user") && data["user"].is_string() && !data["user"].get<std::string>().empty()) {
-                        todo_session = data["user"].get<std::string>();
-                    }
+                    std::string todo_session = kv_offload_resolve_session(req, data);
                     std::string todo_text;
                     if (kv_offload_get(params.focus_memory_host, params.focus_memory_token,
                                        todo_session, "todo:" + todo_session, todo_text, 1)) {
