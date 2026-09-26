@@ -2,7 +2,7 @@
 
 > **A [`llama.cpp`](https://github.com/ggml-org/llama.cpp) fork with two production-verified engines: Declarative Attention (DA) - the model declares, in its own output, which parts of the KV cache the next tokens may attend to, and the engine enforces it at decode time - and kv-offload, a lossless evict/recall context store that makes long-horizon sessions viable: a 1-token re-prefill after eviction, and a ~1–2 s lossless chunk recall instead of a ~5.3 min lossy compaction.**
 
-**Status: v2.0 - production-ready.** Running in production (qwen3.8-27B MROPE on the production GPU node, RTX 5090) with `--da-auto --fm-offload --kv-offload-holes`. DA physical read reduction, DA survival across auto-compaction, the MROPE mid-hole gate (R1), and the kv-offload evict/hole/recall cycle are all verified end to end (below).
+**Status: v2.0 - production-ready.** Running in production (qwen3.8-27B MROPE on the production GPU node, RTX 5090) with `--da-auto --fm-offload --kv-offload-holes`. DA physical read reduction, DA survival across auto-compaction, the MROPE mid-hole gate (R1), and the kv-offload evict/hole/recall cycle are all verified end to end (below). In a real-use A/B (Prometheus `predicted_tokens_seconds`, idle samples excluded), DA on decodes ~14% faster than DA off (94.3 → 107.5 tok/s, 2026-09-24 off vs 2026-09-26 on).
 
 ## Verified: lossless evict/recall (kv-offload, 2026-09-26)
 
