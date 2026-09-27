@@ -6572,13 +6572,12 @@ static bool kv_offload_refill(llama_context * ctx, server_slot & slot, const lla
         while (off < n) {
             const int32_t m = std::min(n_batch, n - off);
             llama_batch batch = llama_batch_init(m, 0, 1);
-            std::vector<llama_seq_id> seq_ids(m, seq);
+            // common_batch_add: manages n_tokens (init leaves it 0) and keeps
+            // seq_id[i] pointing at the malloc'd arrays (llama_batch_free
+            // requires that - overwriting it with a foreign pointer aborts).
             for (int32_t i = 0; i < m; i++) {
-                batch.token[i]    = toks[off + i];
-                batch.pos[i]      = n_full + off + i;
-                batch.seq_id[i]   = &seq_ids[i];
-                batch.n_seq_id[i] = 1;
-                batch.logits[i]   = (off + i == n - 1);
+                common_batch_add(batch, toks[off + i], n_full + off + i,
+                                 { seq }, (off + i == n - 1));
             }
             int ret = llama_decode(ctx, batch);
             llama_batch_free(batch);
