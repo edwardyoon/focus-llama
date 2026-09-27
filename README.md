@@ -455,7 +455,7 @@ llama-server \
   # kv-offload (auto-compact replacement) - needs a reachable store:
   --fm-offload \
   --kv-offload-holes \
-  --kv-offload-threshold 50000 \
+  --kv-offload-threshold 38672 \
   --focus-memory-host http://<store-host>:3900 \
   --focus-memory-token <CONTEXT_API_TOKEN>
 ```
@@ -483,7 +483,7 @@ Backend A vs B below.)
 | `--spec-draft-n-max 4` | Up to 4 draft tokens per step | Enough to overlap decode with drafting, without so many that rejections waste work |
 | `--spec-draft-ngl all` | Puts the whole draft model on the GPU | The draft model is small; keeping it fully on-GPU avoids CPU round-trips that would erase the spec gain |
 | `--fm-offload` | **kv-offload**: evict the oldest middle messages to the FocusMemory store once the prompt exceeds `--kv-offload-threshold`, and re-prefill them on demand when the model focuses an offloaded chunk | Replaces lossy auto-compaction with a lossless evict/refill cycle (see *kv-offload* above). Optional - off by default |
-| `--kv-offload-threshold 50000` | Token count at which kv-offload eviction engages | Below this the prompt is kept whole; it should sit under the client's auto-compact point (production: 50000, a quarter of the 200K window) |
+| `--kv-offload-threshold 38672` | Token count at which kv-offload eviction engages | Size it at ~8-9 × `--da-chunk-tokens` (4096 → 38672): high enough that short sessions never evict, low enough that eviction engages long before the client's auto-compact point, so the prompt stays a few chunks over the threshold instead of ballooning |
 | `--focus-memory-host` | Base URL of the FocusMemory KV store (`PUT`/`GET` `/v1/kv-offload/chunk`) | Empty = kv-offload disabled even with `--fm-offload` on (fail-open) |
 | `--focus-memory-token` | Bearer token for the store API (`CONTEXT_API_TOKEN`) | Empty = no auth header; set it to match the store |
 
