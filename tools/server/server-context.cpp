@@ -5189,6 +5189,8 @@ private:
                     // Fail-open. measure-only (Phase 0) skips the re-prefill so the KV is
                     // not mutated and the output stays vanilla (mirrors the da_rm/da_b guards).
                     if (slot.kv_holes_active && !keep_idx.empty() && !slot.da_measure_only) {
+                        SLT_INF(slot, "kv_offload: checking %zu keep chunk(s) against %zu hole range(s)\n",
+                            keep_idx.size(), slot.kv_hole_ranges.size());
                         const int32_t n_prompt = (int32_t) slot.prompt.tokens.size();
                         for (size_t n : keep_idx) {
                             const auto & cr = chunks[n];
