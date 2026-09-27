@@ -5122,6 +5122,13 @@ private:
                         // the active layout) - the model reads the re-prefilled content
                         // in the current mode. Fail-open on any store error.
                         if (n >= base + n_chunks) {
+                            // measure-only (Phase 0): observe the tag position without
+                            // mutating KV - skip the store GET and re-prefill so the
+                            // output stays vanilla (mirrors the da_rm/da_b guards).
+                            if (slot.da_measure_only) {
+                                SLT_INF(slot, "kv_offload: get-on-focus chunk %d SKIPPED (measure-only) - no store GET / KV refill; output stays vanilla\n", n);
+                                continue;
+                            }
                             bool found = false;
                             for (const auto & seg : offloaded) {
                                 if (seg.chunk_id != n) continue;
@@ -5170,6 +5177,40 @@ private:
                         const size_t idx = (size_t) (n - base);
                         if (std::find(keep_idx.begin(), keep_idx.end(), idx) == keep_idx.end()) {
                             keep_idx.push_back(idx);
+                        }
+                    }
+                    // kv-offload (Option B, --kv-offload-holes): a focused real chunk may
+                    // overlap an applied KV hole (its evicted message's KV was seq_rm'd from
+                    // the main sequence), so the B-switch seq_cp would copy an empty range and
+                    // the model could not read the evicted content. Re-prefill the holed
+                    // overlap at the tail (Option B keeps the text in the prompt, so no store
+                    // GET is needed) so the model can read it; the B switch then copies the
+                    // refilled tail onto da_seq, exactly like the Option C get-on-focus path.
+                    // Fail-open. measure-only (Phase 0) skips the re-prefill so the KV is
+                    // not mutated and the output stays vanilla (mirrors the da_rm/da_b guards).
+                    if (slot.kv_holes_active && !keep_idx.empty() && !slot.da_measure_only) {
+                        const int32_t n_prompt = (int32_t) slot.prompt.tokens.size();
+                        for (size_t n : keep_idx) {
+                            const auto & cr = chunks[n];
+                            for (const auto & hole : slot.kv_hole_ranges) {
+                                const int32_t olo = std::max(cr.first, (int32_t) hole.first);
+                                int32_t       ohi = std::min(cr.second, (int32_t) hole.second);
+                                if (ohi <= olo) continue;
+                                if (ohi > n_prompt) ohi = n_prompt;
+                                if (ohi <= olo) continue;
+                                llama_tokens toks;
+                                for (int32_t p = olo; p < ohi; ++p) {
+                                    toks.push_back(slot.prompt.tokens[p]);
+                                }
+                                SLT_INF(slot, "kv_offload: focus on holed chunk %zu - re-prefilling %d token(s) at [%d,%d)\n",
+                                        n, (int) toks.size(), olo, ohi);
+                                if (kv_offload_refill(ctx_tgt, slot, toks)) {
+                                    did_refill = true;
+                                    slot.kv_offload_refilled = true;
+                                } else {
+                                    SLT_WRN(slot, "kv_offload: refill failed for holed chunk %zu - fail-open\n", n);
+                                }
+                            }
                         }
                     }
                     // get-on-focus refill may have grown the prompt (the refilled
