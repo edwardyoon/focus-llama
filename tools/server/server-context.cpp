@@ -50,7 +50,7 @@ struct server_slot;
 static bool kv_offload_get(
         const std::string & host, const std::string & token,
         const std::string & session_id, const std::string & key,
-        std::string & out_text, int read_timeout_sec = 5);
+        std::string & out_text);
 static bool kv_offload_refill(llama_context * ctx, server_slot & slot, const llama_tokens & toks);
 
 static common_speculative_output_limits server_output_limits(const common_params & params) {
@@ -6382,7 +6382,7 @@ static std::string kv_offload_json_escape(const std::string & s) {
 //    UUID here; matched case-insensitively, the wire case is not guaranteed),
 // 2. the OpenAI `user` field, 3. the shared "kv-offload-default" constant
 // (clients that send neither). Every store call of the request must use the
-// same value (evict PUT, todo GET, refill GET via task.params.kv_offload_session)
+// same value (evict PUT, refill GET via task.params.kv_offload_session)
 // or the per-session store files would fragment.
 static std::string kv_offload_resolve_session(const server_http_req & req, const json & data) {
     auto header_ci = [&req](const std::string & want) -> std::string {
@@ -6460,12 +6460,11 @@ static std::string kv_offload_url_encode(const std::string & s) {
 static bool kv_offload_get(
         const std::string & host, const std::string & token,
         const std::string & session_id, const std::string & key,
-        std::string & out_text, int read_timeout_sec) {
+        std::string & out_text) {
     if (host.empty() || key.empty()) return false;
-    if (read_timeout_sec <= 0) read_timeout_sec = 5;
     try {
         auto [cli, parts] = common_http_client(host);
-        cli.set_read_timeout(read_timeout_sec, 0);
+        cli.set_read_timeout(5, 0);
         if (!token.empty()) {
             cli.set_default_headers({ { "Authorization", "Bearer " + token } });
         }
@@ -6648,8 +6647,7 @@ struct da_auto_layout {
 };
 
 static da_auto_layout da_auto_chunk(const llama_vocab * vocab, const std::string & text, int32_t da_chunk_tokens,
-        const std::vector<std::string> & offloaded_hints = {},
-        const std::string & todo_block = "") {
+        const std::vector<std::string> & offloaded_hints = {}) {
     da_auto_layout out;
 
     // chat template message boundaries: <\|im_start\|>ROLE\n
@@ -6930,17 +6928,8 @@ static da_auto_layout da_auto_chunk(const llama_vocab * vocab, const std::string
             instr_pos = term;
         }
     }
-    // todo-inject: the persistent task-state block sits at the end of the LAST
-    // USER MESSAGE, immediately before the DA instruction. It is deliberately
-    // EXCLUDED from the filler range: the filler (the DA instruction) is the
-    // removable scaffold that apply_da_b/apply_da_rm drop in FOCUS/LOCAL mode,
-    // but the todo block is real state that must stay attendable in every mode
-    // (it is part of the scaffold = system + last user message). Inserting it
-    // at instr_pos (inside the last user message) also keeps it out of the
-    // evictable middle-message range (eviction starts after the first user
-    // message and never touches the last one).
-    out.filler = { instr_pos + todo_block.size(), instr_pos + todo_block.size() + instruction.size() };
-    modified.insert(instr_pos, todo_block + instruction);
+    out.filler = { instr_pos, instr_pos + instruction.size() };
+    modified.insert(instr_pos, instruction);
 
 
 
@@ -7217,31 +7206,8 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                                 (int) params.kv_offload, (int) params.focus_memory_host.empty());
                     }
                 }
-                // todo-inject: before chunking, fetch the session's persistent
-                // task-state (todo) list from the FocusMemory store and build the
-                // injection block. The session key reuses the kv-offload path
-                // (the OpenAI `user` field, else the "kv-offload-default" constant
-                // Qwen Code sessions derive). The block is injected by
-                // da_auto_chunk at the evict-protected last_user position.
-                // Fail-open: a store miss (404/timeout/down) skips the injection
-                // for this turn — the 1s read timeout bounds the critical-path
-                // stall so a down store cannot hold the request for 5s.
-                std::string todo_block;
-                if (params.todo_inject && !params.focus_memory_host.empty()) {
-                    std::string todo_session = kv_offload_resolve_session(req, data);
-                    std::string todo_text;
-                    if (kv_offload_get(params.focus_memory_host, params.focus_memory_token,
-                                       todo_session, "todo:" + todo_session, todo_text, 1)) {
-                        todo_block = "\n\n[Current task state - not scaffold, this is real]\n" + todo_text + "\n";
-                        SRV_INF("todo_inject: injected %zu chars (session=%s)\n",
-                                todo_block.size(), todo_session.c_str());
-                    } else {
-                        SRV_INF("todo_inject: no todo in store (session=%s) - skipping injection\n",
-                                todo_session.c_str());
-                    }
-                }
                 const da_auto_layout layout =
-                        da_auto_chunk(ctx_server.vocab, da_prompt, params.da_chunk_tokens, offloaded_hints, todo_block);
+                        da_auto_chunk(ctx_server.vocab, da_prompt, params.da_chunk_tokens, offloaded_hints);
                 if (layout.ok) {
                     const llama_tokens  toks = common_tokenize(ctx_server.vocab, layout.modified, true, true);
                     const std::vector<size_t> offs = da_token_offsets_lenient(ctx_server.vocab, layout.modified, toks);

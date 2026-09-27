@@ -652,13 +652,6 @@ struct common_params {
     // (1-token re-prefill instead of the ~64s full-tail re-prefill). Off =
     // Option C (prompt text reduction, the default).
     bool        kv_offload_holes     = false;
-    // todo-inject: each turn, GET the session's persistent task-state (todo)
-    // list from the FocusMemory store (key "todo:<session>") and inject it at
-    // the evict-protected last_user position as a separate block before the DA
-    // instruction, so the working state survives kv-offload eviction. Requires
-    // --da-auto (the injection point is the DA instruction) and a non-empty
-    // --focus-memory-host. Fail-open: a store miss skips the injection.
-    bool        todo_inject          = false;
     // sparse FA gate (DA n_kv_max): the CUDA/Metal sparse (gather) path is used
     // only while the finite KV rows are at most this % of the cache; dense
     // below. Bridged to FOCUS_SPARSE_GATE_THRESHOLD in the server main (1-100).
