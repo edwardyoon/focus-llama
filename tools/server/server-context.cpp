@@ -6590,15 +6590,14 @@ static bool kv_offload_refill(llama_context * ctx, server_slot & slot, const lla
             }
             off += m;
         }
-        // advance the slot's prompt tokens so pos_next() reflects the refill
-        llama_tokens new_toks = slot.prompt.tokens.get_tokens();
-        const size_t old_size = new_toks.size();
-        new_toks.resize(old_size + (size_t) n);
-        for (int32_t i = 0; i < n; i++) new_toks[old_size + (size_t) i] = toks[i];
-        slot.prompt.clear();
-        slot.prompt.tokens.insert(new_toks);
+        // advance the slot's prompt tokens so pos_next() reflects the refill.
+        // insert() appends directly: get_tokens() asserts !has_mtmd (true on any
+        // server with mmproj loaded, even for text-only prompts) and the clear()
+        // round-trip would drop the media index map.
+        const size_t old_size = slot.prompt.tokens.size();
+        slot.prompt.tokens.insert(toks);
         SRV_INF("kv_offload: re-prefilled %d token(s) at [%d, %d) on seq %d - prompt tokens %zu -> %zu\n",
-                n, n_full, n_full + n, (int) seq, old_size, new_toks.size());
+                n, n_full, n_full + n, (int) seq, old_size, old_size + (size_t) n);
         return true;
     } catch (const std::exception & e) {
         SRV_WRN("kv_offload: refill exception: %s - fail-open\n", e.what());
