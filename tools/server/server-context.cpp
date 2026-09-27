@@ -5192,14 +5192,38 @@ private:
                         SLT_INF(slot, "kv_offload: checking %zu keep chunk(s) against %zu hole range(s)\n",
                             keep_idx.size(), slot.kv_hole_ranges.size());
                         const int32_t n_prompt = (int32_t) slot.prompt.tokens.size();
+                        std::string keep_nums, hole_str;
+                        for (size_t n : keep_idx) {
+                            if (!keep_nums.empty()) keep_nums += ",";
+                            keep_nums += std::to_string((int) n);
+                        }
+                        for (const auto & hole : slot.kv_hole_ranges) {
+                            if (!hole_str.empty()) hole_str += " ";
+                            hole_str += "[" + std::to_string(hole.first) + "," + std::to_string(hole.second) + ")";
+                        }
+                        SLT_INF(slot, "kv_offload: keep = {%s}, holes = {%s}, prompt tokens = %d\n",
+                            keep_nums.c_str(), hole_str.c_str(), n_prompt);
                         for (size_t n : keep_idx) {
                             const auto & cr = chunks[n];
+                            SLT_INF(slot, "kv_offload:   chunk %zu range [%d,%d)\n", n, cr.first, cr.second);
                             for (const auto & hole : slot.kv_hole_ranges) {
                                 const int32_t olo = std::max(cr.first, (int32_t) hole.first);
                                 int32_t       ohi = std::min(cr.second, (int32_t) hole.second);
-                                if (ohi <= olo) continue;
-                                if (ohi > n_prompt) ohi = n_prompt;
-                                if (ohi <= olo) continue;
+                                if (ohi <= olo) {
+                                    SLT_INF(slot, "kv_offload:   chunk %zu x hole [%d,%d) - no overlap, skip\n",
+                                        n, hole.first, hole.second);
+                                    continue;
+                                }
+                                if (ohi > n_prompt) {
+                                    SLT_INF(slot, "kv_offload:   chunk %zu x hole [%d,%d) - ohi clamped to prompt (%d)\n",
+                                        n, hole.first, hole.second, n_prompt);
+                                    ohi = n_prompt;
+                                }
+                                if (ohi <= olo) {
+                                    SLT_INF(slot, "kv_offload:   chunk %zu x hole [%d,%d) - no overlap after clamp, skip\n",
+                                        n, hole.first, hole.second);
+                                    continue;
+                                }
                                 llama_tokens toks;
                                 for (int32_t p = olo; p < ohi; ++p) {
                                     toks.push_back(slot.prompt.tokens[p]);
@@ -6538,6 +6562,8 @@ static bool kv_offload_refill(llama_context * ctx, server_slot & slot, const lla
     const llama_seq_id seq = slot.kv_seq();
     const int32_t n_batch = (int32_t) llama_n_batch(ctx);
     if (n_batch <= 0) return false;
+    SRV_INF("kv_offload: refill start - %d token(s), tail pos %d, seq %d, n_batch %d\n",
+            n, n_full, (int) seq, n_batch);
     try {
         // The re-prefilled chunk can be larger than n_batch, and llama_decode
         // asserts n_tokens <= n_batch (it does not sub-batch), so split the
@@ -6556,6 +6582,8 @@ static bool kv_offload_refill(llama_context * ctx, server_slot & slot, const lla
             }
             int ret = llama_decode(ctx, batch);
             llama_batch_free(batch);
+            SRV_INF("kv_offload: refill sub-batch [%d,%d) of %d token(s) ret=%d\n",
+                    off, off + m, n, ret);
             if (ret != 0) {
                 SRV_WRN("kv_offload: refill decode failed (ret=%d, tokens %d..%d of %d) - fail-open\n",
                         ret, off, off + m, n);
@@ -6570,8 +6598,8 @@ static bool kv_offload_refill(llama_context * ctx, server_slot & slot, const lla
         for (int32_t i = 0; i < n; i++) new_toks[old_size + (size_t) i] = toks[i];
         slot.prompt.clear();
         slot.prompt.tokens.insert(new_toks);
-        SRV_INF("kv_offload: re-prefilled %d token(s) at [%d, %d) on seq %d\n",
-                n, n_full, n_full + n, (int) seq);
+        SRV_INF("kv_offload: re-prefilled %d token(s) at [%d, %d) on seq %d - prompt tokens %zu -> %zu\n",
+                n, n_full, n_full + n, (int) seq, old_size, new_toks.size());
         return true;
     } catch (const std::exception & e) {
         SRV_WRN("kv_offload: refill exception: %s - fail-open\n", e.what());
