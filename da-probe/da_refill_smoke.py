@@ -204,7 +204,7 @@ JOURNAL_PATTERNS = [
     ("pending",     re.compile(r"kv-offload-holes: pending hole \S+ -> tokens \[(\d+), (\d+)\)")),
     ("applied",     re.compile(r"kv-offload-holes: applied (\d+) hole\(s\), \d+ token span, in main seq \d+ \(n_past=(\d+)\)")),
     ("checking",    re.compile(r"kv_offload: checking (\d+) keep chunk\(s\) against (\d+) hole range")),
-    ("refill",      re.compile(r"kv_offload: focus on holed chunk (\d+) - re-prefilling (\d+) token\(s\) at \[(\d+), (\d+)\)")),
+    ("refill",      re.compile(r"kv_offload: focus on holed chunk (\d+) - re-prefilling (\d+) token\(s\) at \[(\d+), ?(\d+)\)")),
     ("refill_fail", re.compile(r"kv_offload: refill failed for holed chunk")),
     ("no_evict",    re.compile(r"kv_offload: no eviction planned")),
     ("disabled",    re.compile(r"kv_offload: disabled \(flag=")),
