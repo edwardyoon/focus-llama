@@ -10,7 +10,8 @@ additional_generation_work. The transition count (global<->focus<->local
 bouncing) is the key loss signal.
 
 Arms (same 5-chunk + filler document, reused from da_ab_harness.py):
-  A  vanilla  - plain system text + direct question, no da_* fields
+  A  vanilla  - plain system text + direct question, no da_* fields (sends
+                 da_disable:true to opt out of server-side DA injection)
   C  DA sparse - harness tag instruction + da_chunks/da_filler/da_b, default
                  (sparse) kernel
   B  DA dense  - identical request to C, but the server was started with
@@ -208,11 +209,15 @@ def cmd_capture(args):
     out = {"server": base, "filler_k": args.filler_k, "repeat": args.repeat,
            "max_tokens": args.max_tokens, "arms": {}, "da_layout": {}}
     for a in arms:
-        extra = {}
         if a in ("C", "B"):
             extra = {"da_chunks": layouts[a]["da_chunks"],
                      "da_filler": layouts[a]["da_filler"],
                      "da_b": True}
+        else:
+            # A (vanilla): explicitly opt out of server-side DA injection
+            # (da-prompt-scan / da-auto) so the baseline stays one-pass even
+            # on DA-enabled servers (123). No-op on servers without DA.
+            extra = {"da_disable": True}
         runs = []
         for r in range(1, args.repeat + 1):
             run = complete(base, prompts[a], extra, args.max_tokens)
