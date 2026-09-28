@@ -6548,6 +6548,37 @@ static bool kv_offload_get(
     }
 }
 
+// Query the FocusMemory store for a session's pin-released flag (B4). The
+// state worker sets it when the user has cancelled or superseded the
+// session's ORIGINAL first task: a pinned cancelled request keeps steering
+// the model while the cancelling instructions sit in KV holes (2026-09-28
+// incident). While false (the default) the first user message stays pinned
+// (task anchor - 2026-09-26 fix); once true it becomes a normal evictable
+// middle message (re-surfaced per turn by the store's instruction ledger).
+// Returns true and fills out_pin_released on success; false on any error
+// (fail-open: the caller keeps the pin - current behavior).
+static bool kv_offload_session_get(
+        const std::string & host, const std::string & token,
+        const std::string & session_id, bool & out_pin_released) {
+    if (host.empty() || session_id.empty()) return false;
+    try {
+        auto [cli, parts] = common_http_client(host);
+        cli.set_read_timeout(5, 0);
+        if (!token.empty()) {
+            cli.set_default_headers({ { "Authorization", "Bearer " + token } });
+        }
+        std::string path = "/v1/kv-offload/session?session_id=" + kv_offload_url_encode(session_id);
+        if (!parts.path.empty() && parts.path != "/") path = parts.path + path;
+        auto res = cli.Get(path);
+        if (!res || res->status != 200) return false;
+        json j = json::parse(res->body);
+        out_pin_released = j.contains("pin_released") && j["pin_released"].is_boolean() && j["pin_released"].get<bool>();
+        return true;
+    } catch (const std::exception &) {
+        return false;
+    }
+}
+
 // Re-prefill an offloaded chunk at the tail of the slot's sequence
 // (get-on-focus). Appends the tokens at positions [n_full, n_full+len) on
 // kv_seq() and runs a prefill decode so the model can attend to the chunk.
@@ -6608,16 +6639,25 @@ static bool kv_offload_refill(llama_context * ctx, server_slot & slot, const lla
 // Plan the eviction of the oldest middle messages so the prompt fits under
 // the threshold. Returns true and fills out_segments (each with its original-
 // text range, text, key, hint) if any eviction is planned; false otherwise.
-// Never evicts the system message, the first user message (the task anchor /
-// original request), or the last user message. The caller does the FocusMemory
-// PUT and removes only the successfully-PUT ranges from the prompt (a failed
-// PUT keeps its segment in the prompt - fail-open).
+// Never evicts the system message or the last user message. The first user
+// message (the task anchor / original request) is pinned by default - it
+// stays in the KV so the task definition remains attendable in <global> mode
+// (2026-09-26 anchor-loss fix) - unless release_pin is true (B4): the
+// FocusMemory state worker set the session's pin_released flag because the
+// user cancelled or superseded the original task, and a pinned CANCELLED
+// request now outweighs the evicted cancellation (2026-09-28 restore-loop
+// incident). Released, the first user message is a normal evictable middle
+// message: its text goes to the store (focus-retrievable) and it is
+// re-surfaced per turn by the store's instruction ledger. The caller does
+// the FocusMemory PUT and removes only the successfully-PUT ranges from the
+// prompt (a failed PUT keeps its segment in the prompt - fail-open).
 static bool kv_offload_evict(
         const llama_vocab * vocab,
         const std::string & text,
         int32_t total_tokens,
         int32_t threshold,
-        std::vector<kv_offload_evict_segment> & out_segments) {
+        std::vector<kv_offload_evict_segment> & out_segments,
+        bool release_pin = false) {
     if (threshold <= 0 || total_tokens <= threshold) return false;
 
     struct msg_t { size_t start; size_t role_end; std::string role; };
@@ -6653,13 +6693,12 @@ static bool kv_offload_evict(
         return { lo, hi };
     };
 
-    // Evict from the oldest middle message forward until under the threshold,
-    // but never the task anchor: the system message (index 0) and the first
-    // user message (the original request) stay in the KV so the task definition
-    // remains attendable in <global> mode. Eviction therefore starts after the
-    // first user message, not at index 1.
-    const size_t evict_start = first_user + 1;
-    if (evict_start >= last_user) return false;  // nothing between anchor and last user
+    // Evict from the oldest middle message forward until under the threshold.
+    // The system message (index 0) is never evicted. The first user message
+    // (the task anchor) is pinned by default - eviction starts after it;
+    // with release_pin it becomes a normal candidate (eviction starts at it).
+    const size_t evict_start = release_pin ? first_user : first_user + 1;
+    if (evict_start >= last_user) return false;  // nothing between start and last user
     int32_t remaining = total_tokens;
     std::vector<size_t> evict_idx;
     for (size_t i = evict_start; i < last_user; i++) {
@@ -7170,15 +7209,37 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                 std::string kv_session;  // FocusMemory session id (set if kv_offload ran)
                 if (params.kv_offload && !params.focus_memory_host.empty()) {
                     kv_session = kv_offload_resolve_session(req, data);
+                    // B4 pin release: the FocusMemory state worker sets the
+                    // session's pin_released flag when the user cancelled or
+                    // superseded the original first task. Sticky: a cached
+                    // true is never re-queried; a false is re-queried on the
+                    // next eviction plan (a local GET, sub-millisecond). Any
+                    // query failure keeps the pin (fail-open = current
+                    // behavior).
+                    bool release_pin = false;
+                    {
+                        std::lock_guard<std::mutex> lk(kv_offload_put_mutex);
+                        release_pin = kv_offload_pin_released.count(kv_session) > 0;
+                    }
+                    if (!release_pin &&
+                            kv_offload_session_get(params.focus_memory_host, params.focus_memory_token,
+                                                   kv_session, release_pin)) {
+                        if (release_pin) {
+                            std::lock_guard<std::mutex> lk(kv_offload_put_mutex);
+                            kv_offload_pin_released.insert(kv_session);
+                            SRV_INF("kv_offload: pin released (session=%s) - first user message becomes evictable\n",
+                                    kv_session.c_str());
+                        }
+                    }
                     // Diagnostic: config state + current token count vs threshold, so
                     // the journal shows exactly why eviction does or does not fire
-                    // (was the flag parsed? threshold reached? host set?).
-                    SRV_INF("kv_offload: gate - threshold=%d host=%s tokens=%d session=%s\n",
+                    // (was the flag parsed? threshold reached? host set? pin released?).
+                    SRV_INF("kv_offload: gate - threshold=%d host=%s tokens=%d session=%s pin_released=%d\n",
                             params.kv_offload_threshold, params.focus_memory_host.c_str(),
-                            (int) task.tokens.size(), kv_session.c_str());
+                            (int) task.tokens.size(), kv_session.c_str(), (int) release_pin);
                     std::vector<kv_offload_evict_segment> evict_segs;
                     if (kv_offload_evict(ctx_server.vocab, da_prompt, (int32_t) task.tokens.size(),
-                                         params.kv_offload_threshold, evict_segs)) {
+                                         params.kv_offload_threshold, evict_segs, release_pin)) {
                         // Diagnostic: the eviction plan (n segments, tokens each).
                         {
                             int32_t plan_tokens = 0;

@@ -200,4 +200,10 @@ private:
     // boundary). Bounded per-session by KV_OFFLOAD_PUT_CACHE_CAP to cap memory.
     std::mutex                                   kv_offload_put_mutex;
     std::map<std::string, std::set<std::string>> kv_offload_uploaded; // session -> keys
+    // kv-offload (B4): sessions whose first-user-message pin has been released
+    // by the FocusMemory state worker (the user revoked the original task).
+    // Sticky per process lifetime: the flag never un-sets, so a cached true
+    // never needs re-querying; a false result is simply re-queried on the
+    // next eviction plan (a local GET, sub-millisecond).
+    std::set<std::string> kv_offload_pin_released; // session ids
 };
