@@ -32,6 +32,12 @@ endif()
 target_include_directories(${TARGET} PRIVATE ../mtmd)
 target_include_directories(${TARGET} PRIVATE ${PROJECT_SOURCE_DIR})
 target_link_libraries(${TARGET} PUBLIC llama-common mtmd ${CMAKE_THREAD_LIBS_INIT})
+# server-context.cpp instantiates httplib::Client (common/http.h). Its layout
+# depends on CPPHTTPLIB_SSL_ENABLED (derived from CPPHTTPLIB_OPENSSL_SUPPORT),
+# which only the cpp-httplib target defines. Without it, Client is 8 bytes in
+# this TU vs 16 in libcpp-httplib.a -> ODR violation, stack canary corruption
+# in kv_offload_session_get (2026-09-28).
+target_link_libraries(${TARGET} PRIVATE cpp-httplib)
 
 # llama-server-impl: server logic, reusable by app
 

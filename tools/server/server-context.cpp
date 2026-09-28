@@ -6563,6 +6563,7 @@ static bool kv_offload_session_get(
     if (host.empty() || session_id.empty()) return false;
     try {
         auto [cli, parts] = common_http_client(host);
+        cli.set_connection_timeout(1, 0);
         cli.set_read_timeout(5, 0);
         if (!token.empty()) {
             cli.set_default_headers({ { "Authorization", "Bearer " + token } });
