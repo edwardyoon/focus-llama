@@ -1064,6 +1064,8 @@ std::filesystem::path fs_get_config_directory();
 
 void fs_write_atomic(const std::filesystem::path & path, const std::string & data);
 
+void fs_write_atomic(const std::filesystem::path & path, const std::string & data);
+
 //
 // TTY utils
 //
