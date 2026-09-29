@@ -1,12 +1,85 @@
 # focus-llama
 
-> **A [`llama.cpp`](https://github.com/ggml-org/llama.cpp) fork with two production-verified engines: Declarative Attention (DA) - the model declares, in its own output, which parts of the KV cache the next tokens may attend to, and the engine enforces it at decode time - and kv-offload, a lossless evict/recall context store that makes long-horizon sessions viable: a 1-token re-prefill after eviction, and a ~1–2 s lossless chunk recall instead of a ~5.3 min lossy compaction.**
+A llama.cpp fork with two production-verified engines. Declarative Attention (DA): the model declares, in its own output, which parts of the KV cache the next tokens may attend to, and the engine enforces it at decode time through a sparse VEC/MMA Flash-Attention kernel that physically skips the unattended KV rows. kv-offload: a lossless evict/recall context store that makes long-horizon sessions viable — evicted messages are parked verbatim (not summarized) and re-prefilled on demand in a single token instead of a full re-prefill, with the original task anchor pinned by default and releasable once the user has revoked it.
 
-**Status: v2.0 - production-ready.** Running in production (qwen3.8-27B MROPE on the production GPU node, RTX 5090) with `--da-auto --fm-offload --kv-offload-holes`. DA physical read reduction, DA survival across auto-compaction, the MROPE mid-hole gate (R1), and the kv-offload evict/hole/recall cycle are all verified end to end (below). In a 1-hour identical coding session (RTX 5090, AD-Q6_K), DA on decodes ~35% faster than DA off (76.2 → 102.7 tok/s).
+**Status: v3.0 - production-ready.** Running in production on qwen3.8-27B MROPE (RTX 5090); DA and kv-offload are both verified end to end (below). In a 1-hour identical coding session, DA decodes ~35% faster than DA off (76.2 → 102.7 tok/s).
 
 <img src="media/da-throughput.png" width="500" alt="Decode throughput without and with Declarative Attention">
 
 *Decode throughput over a session — without DA (left) vs with DA (right). Without DA, throughput drifts down as the KV cache grows over the session. With DA's bounded hot-attention window, throughput stays flat regardless of session length. (Grafana dashboards, production traffic; trend lines added manually for illustration.)*
+
+## How it works
+
+One turn, end to end — from the model's own attention tags down to the physical KV reads and the external store:
+
+- **Tag parsing & mode switching** — the model emits `<focus magic_chunks="N">` / `<local>` / `<global>` mid-stream; the engine parses them at token boundaries and switches the KV scope (seq_cp on the reversible B-path).
+- **Sparse physical read** — a custom VEC/MMA Flash-Attention kernel gathers only the non-masked KV rows before the tile computes, turning the logical scope restriction into an actual decode speedup.
+- **kv-offload evict / refill** — once the prompt crosses the threshold, the oldest middle messages are evicted to an external store (not summarized) and re-prefilled verbatim on demand when the model focuses an offloaded chunk.
+- **Anchor / pin management** — the original task message stays pinned by default so it's never silently evicted, but a sticky `pin_released` flag lets it become evictable once the state worker detects the user has revoked it.
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│  USER TURN                                                            │
+│  "explain how the retry logic in payments.go works"                  │
+└───────────────────────────────┬────────────────────────────────────--┘
+                                 │
+                                 ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│  PROMPT (rendered)                                                    │
+│                                                                        │
+│  [Magic Chunk 1] ...file A contents...                                │
+│  [Magic Chunk 2] ...file B contents...                                │
+│  [Magic Chunk 3] ...earlier conversation...                           │
+│  ...                                                                   │
+│  Chunks 12-14 were offloaded (evicted, parked in store) ◄─────┐       │
+│  Instructions: use <focus magic_chunks="N"> / <local> / ...   │       │
+└───────────────────────────────┬───────────────────────────────┼──────┘
+                                 │                                │
+                                 ▼                                │
+┌──────────────────────────────────────────────────────────────────────┐
+│  MODEL (decoding)                                                     │
+│                                                                        │
+│    "...let me check the retry logic <focus magic_chunks="2">          │
+│     [reasons, reads only chunk 2] </focus> so the answer is..."       │
+└───────────────────────────────┬────────────────────────────────────--┘
+                                 │  tag parsed mid-stream, at token boundary
+                                 ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│  focus-llama ENGINE  (tools/server/server-context.cpp)                │
+│                                                                        │
+│   apply_da_tag()                                                      │
+│     ├─ <focus N>  → keep scaffold + chunk N        (B: seq_cp)        │
+│     ├─ <local>    → keep scaffold + generated only (B: seq_cp)        │
+│     └─ </focus>   → return to full context         (B: seq_cp back)   │
+│                                                                        │
+│   sparse VEC/MMA Flash-Attention kernel                               │
+│     - gathers only the non-masked KV rows before the tile computes    │
+│     - up to 66% fewer physical KV reads → 76.2 → 102.7 tok/s          │
+└───────────┬─────────────────────────────────────────────┬────────────┘
+            │                                              │
+            │ KV cache (GPU)                               │ if magic_chunks
+            ▼                                              │ points at an
+┌───────────────────────────┐                              │ OFFLOADED chunk
+│  KV CACHE                 │                              ▼
+│                            │              ┌──────────────────────────────┐
+│  [sys][c1][c2][ hole ][c4] │◄── evict ────│  kv-offload STORE (external)  │
+│         ▲            │     │   (seq_rm)   │                                │
+│         └────────────┘     │              │  PUT  evicted text, keyed     │
+│   pinned "hot window"      │──── GET ────►│       by content hash          │
+│   stays bounded regardless │  (get-on-    │  GET  verbatim recall on      │
+│   of session length        │   focus)     │       demand (~1-2s)           │
+└───────────────────────────┘              │  1-token re-prefill hole       │
+                                            │  instead of full re-prefill    │
+                                            │  (~13.7s → ~26ms)               │
+                                            │                                │
+                                            │  Sticky Pin Release (B4):      │
+                                            │  pin_released flag lets the    │
+                                            │  original anchor message       │
+                                            │  become evictable once the     │
+                                            │  user has revoked it            │
+                                            └──────────────────────────────┘
+```
+
 
 ## Verified: lossless evict/recall (kv-offload, 2026-09-26)
 
