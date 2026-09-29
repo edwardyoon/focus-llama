@@ -1,8 +1,8 @@
 # focus-llama
 
-A llama.cpp fork with two production-verified engines. Declarative Attention (DA): the model declares, in its own output, which parts of the KV cache the next tokens may attend to, and the engine enforces it at decode time through a sparse VEC/MMA Flash-Attention kernel that physically skips the unattended KV rows. kv-offload: a lossless evict/recall context store that makes long-horizon sessions viable — evicted messages are parked verbatim (not summarized) and re-prefilled on demand in a single token instead of a full re-prefill, with the original task anchor pinned by default and releasable once the user has revoked it.
+A llama.cpp fork with two production-verified features. Declarative Attention (DA): the model declares, in its own output, which parts of the KV cache the next tokens may attend to, and the engine enforces it at decode time through a sparse VEC/MMA Flash-Attention kernel that physically skips the unattended KV rows. kv-offload: a lossless evict/recall context store that makes long-horizon sessions viable — evicted messages are parked verbatim (not summarized) and re-prefilled on demand with a 1-token re-prefill instead of a full one, with the original task anchor pinned by default and releasable once the user releases it.
 
-**Status: v3.0 - production-ready.** Running in production on qwen3.8-27B MROPE (RTX 5090); DA and kv-offload are both verified end to end (below). In a 1-hour identical coding session, DA decodes ~35% faster than DA off (76.2 → 102.7 tok/s).
+**Status: v3.0 - production-ready.** Running in production on qwen3.8-27B MROPE (RTX 5090); DA and kv-offload are both verified end to end (below). In an identical 1-hour coding session, DA decodes ~35% faster than with DA off (76.2 → 102.7 tok/s).
 
 <img src="media/da-throughput.png" width="500" alt="Decode throughput without and with Declarative Attention">
 
@@ -15,7 +15,7 @@ One turn, end to end — from the model's own attention tags down to the physica
 - **Tag parsing & mode switching** — the model emits `<focus magic_chunks="N">` / `<local>` / `<global>` mid-stream; the engine parses them at token boundaries and switches the KV scope (seq_cp on the reversible B-path).
 - **Sparse physical read** — a custom VEC/MMA Flash-Attention kernel gathers only the non-masked KV rows before the tile computes, turning the logical scope restriction into an actual decode speedup.
 - **kv-offload evict / refill** — once the prompt crosses the threshold, the oldest middle messages are evicted to an external store (not summarized) and re-prefilled verbatim on demand when the model focuses an offloaded chunk.
-- **Anchor / pin management** — the original task message stays pinned by default so it's never silently evicted, but a sticky `pin_released` flag lets it become evictable once the state worker detects the user has revoked it.
+- **Anchor / pin management** — the original task message stays pinned by default so it's never silently evicted, but a sticky `pin_released` flag lets it become evictable once the state worker detects the user has released it.
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
@@ -86,7 +86,7 @@ One turn, end to end — from the model's own attention tags down to the physica
 The kv-offload cycle (*kv-offload* section below) is a lossless evict/recall alternative to
 lossy auto-compaction: evicted text is parked in the store and brought back verbatim on
 demand, instead of being compressed into a summary. It does not stop the client's own
-auto-compact (the client still compacts on its own schedule); it makes an eviction cheap -
+auto-compaction (the client still compacts on its own schedule); it makes an eviction cheap -
 a 1-token re-prefill instead of a full one - and the recall lossless. Every number below
 was measured on 2026-09-26, not modeled:
 
@@ -99,17 +99,16 @@ was measured on 2026-09-26, not modeled:
 | One full compaction (baseline) | **~5.3 min, lossy** | measured |
 | Store round-trip in a live session | 87 chunks (~400 KB) PUT/GET round-tripped; per-hole KV cuts applied turn after turn | production GPU node |
 
-A single recall is two to three orders of magnitude cheaper than a compaction and lossless:
-context beyond `--kv-offload-threshold` is parked in the store and brought back verbatim on
-demand, instead of being compressed into a lossy summary. Production runs **Option B**
-(`--kv-offload-holes`: the evicted text stays in the prompt and the engine cuts its KV as
-holes); the default **Option C** (evict from the prompt, virtual chunks) kept its behavior
-intact in the same smoke (prompt text reduction 12813 → 6484 tokens, no behavioral change).
+A single recall is two to three orders of magnitude cheaper than a compaction, and lossless.
+Production runs the **holes mode** (`--kv-offload-holes`: the evicted text stays in the
+prompt and the engine cuts its KV as holes); the default **virtual-chunk mode** (evict from
+the prompt, virtual chunks) kept its behavior intact in the same smoke (prompt text
+reduction 12813 → 6484 tokens, no behavioral change).
 
 **Status: verified (v2.0)** - running in production since 2026-09-26 (`-c 200000
---kv-offload-threshold 50000 --kv-offload-holes`). Intentionally out of scope for v2.0:
-the sparse `n_kv_max` path with holes (R3) - v1 forces the dense path, the same physical
-state the R1 gate and the DA A path already run in production.
+--kv-offload-threshold 38672 --kv-offload-holes`). Intentionally out of scope for v2.0:
+the sparse `n_kv_max` path with holes (R3) - the engine forces the dense path, the same
+physical state the R1 gate and the DA A path already run in production.
 
 ---
 
@@ -156,7 +155,7 @@ The dense path stays bit-identical (constexpr folding), so sparse never changes 
 
 **Measured in production traffic (09-23).** The sparse-gate journal (`da_sparse[VEC|MMA]:`, one line per ~512-token gather-bound step while sparse, plus the dense fallback with its reason) was captured from live `qwen3.8-focus` traffic, 15:48–21:10:
 
-| Path | Sparse decisions | Mean read | Mean reduction | Range |
+| Path | Sparse decisions | Mean read | Mean reduction | Read range |
 |---|---|---|---|---|
 | VEC (q4_0 KV, production) | 91 | 34.0% | 66.0% | 8–50% |
 | MMA (f16 KV) | 255 | 36.5% | 63.5% | 8–50% |
@@ -165,9 +164,10 @@ The dense path stays bit-identical (constexpr folding), so sparse never changes 
 The 50% top of the range is the gate's own bound: the sparse path is only active while it
 reads at most half the KV (`K >= 2*n_kv_max` at the default gate threshold). The threshold
 is tunable via `--sparse-gate-threshold PCT` (1-100, default 50): the sparse gather path is
-used only while the finite KV rows are at most PCT% of the cache, dense below. Dense
-fallbacks (108) carry their reason: `no sparse kernel variant` (68, MMA head-dim not yet
-covered) and the 50% decay (`K < 2*n_kv_max`, 40). No multi-token-batch fallbacks were
+used only while the non-masked KV rows are at most PCT% of the cache, dense when below that.
+Dense fallbacks (108) carry their reason: `no sparse kernel variant` (68, MMA head-dim not
+yet covered) and falling below the 50% gate (`K < 2*n_kv_max`, 40). No multi-token-batch
+fallbacks were
 observed: spec decode is paused while a slot is in DA mode, so DA decode is single-token.
 
 **Status: v1.0** - physical read reduction verified in production traffic (above); tag-quote
@@ -177,7 +177,7 @@ hijack fixed (line-start-only entry tags, `632e31c20`).
 
 ## What this is
 
-`focus-llama` is a research fork of `llama.cpp` for experimenting with **Declarative Attention (DA)**, a protocol from
+`focus-llama` is a fork of `llama.cpp` implementing **Declarative Attention (DA)**, a protocol from
 *Language Models Can Control Their Own Attention* (Ho et al., 2026, [arXiv:2609.02737](https://arxiv.org/abs/2609.02737)).
 
 In DA, an off-the-shelf model is prompted to split its chain-of-thought into spans with a declared attention scope:
@@ -226,10 +226,10 @@ Key points:
 | Backend | Mechanism | Speed-up | Cost |
 |---------|-----------|----------|------|
 | **A. `seq_rm`** | Remove non-focus ranges, restore by re-prefill | None guaranteed (semantic equivalence only) | Re-prefill on every focus → global switch |
-| **B. Two streams** | Stream 0 holds the full context permanently; stream 1 holds the kept (scaffold + focus) chunks + response, copied with `seq_cp` (a cell retag in the unified pool, no data copy) | Logical read-set reduction - the attended tokens shrink, and the FA kernels' masked-chunk skipping (Metal 32-cell decode / 64-block prefill, CPU per-position) reduces the physical KV load at chunk granularity. B's unique value: the original stream is preserved, so a global return needs no re-prefill | ~2x KV metadata (unified pool) |
-| **C. Kernel skipping** | Skip fully-masked tiles/blocks in the flash-attention kernels | Potentially in-place, no extra memory | Kernel work per backend (CUDA / Metal) |
+| **B. Two streams** | Stream 0 holds the full context permanently; stream 1 holds the kept (scaffold + focus) chunks + response, copied with `seq_cp` (a cell retag in the unified pool, no data copy) | Logical read-set reduction - the attended tokens shrink. On Metal/CPU the FA kernels' masked-chunk skipping (32-cell decode / 64-block prefill, per-position) also cuts the physical KV load at chunk granularity; on CUDA single-token decode the reduction stays logical (the physical cut is backend C). B's unique value: the original stream is preserved, so a global return needs no re-prefill | ~2x KV metadata (unified pool) |
+| **C. Kernel skipping** | Skip fully-masked tiles/blocks in the flash-attention kernels | Yes - in place in the kernel, no extra memory | Per-backend kernel work (CUDA / Metal) |
 
-Backend A is for validating protocol adherence and accuracy. Backend B is the first candidate for measuring real speed-ups. C is only worth building if B's numbers justify it.
+Backend A validates protocol adherence and accuracy. Backend B is the reversible production path for the logical read-set reduction. Backend C (the sparse VEC/MMA kernels) delivers the measured physical read reduction - see *Verified: physical KV read reduction* above.
 
 ## Build
 
@@ -426,7 +426,7 @@ Per B request the server logs:
 and are masked, so the attention still scans the same cell range. Whether fully masked chunks are actually
 skipped depends on the backend and the attention kernel (for example, single-token decode on CUDA does not
 skip them), and no byte count is logged. Treat the percentage as the size of the attended token set, not as a
-speed-up. Measuring real speed is still open.
+speed-up; the measured physical read reduction is in *Verified: physical KV read reduction* above.
 
 ## Relationship to FocusMemory
 
@@ -469,10 +469,10 @@ The two paths coexist (marker layout wins when present; auto takes over otherwis
 Production launch). Without either, requests run with full attention - the two projects remain
 independently usable.
 
-## kv-offload (lossless evict/recall, auto-compact alternative)
+## kv-offload (lossless evict/recall, auto-compaction alternative)
 
 `--fm-offload` provides a **lossless** evict/recall cycle backed by an external store (the
-[FocusMemory](https://github.com/edwardyoon/FocusMemory) dumb KV store) as the alternative to
+[FocusMemory](https://github.com/edwardyoon/FocusMemory) storage-only KV store) as the alternative to
 the client's lossy auto-compaction: it does not disable the client's compaction, it changes
 what an eviction costs (a 1-token re-prefill) and how a chunk comes back (the original text,
 not a summary). When a rendered prompt exceeds `--kv-offload-threshold` tokens, the engine
@@ -484,7 +484,7 @@ evicts the oldest *middle* messages (never the system message or the last user m
   engine cuts its KV out of the main sequence (`seq_rm` holes, positions not re-based) once the
   prefix is known to exist. The client keeps sending the full prompt, so every re-request
   re-matches at `n_past = full` and re-prefills **1 token** instead of the evicted tail
-  (~64 s → ~2 s). Holes are applied per range (disjoint, validated `hi <= n_past`),
+  (~64 s → ~2 s at production scale). Holes are applied per range (disjoint, validated `hi <= n_past`),
   `release()` keeps the prompt cache, and the generic KQ -inf mask covers the holes - the same
   physical state the DA A path runs in production. The R1 gate (an MROPE mid-sequence hole
   behaves like -inf masking) passed on the production 27B with answer-token Δlogprob
@@ -504,7 +504,7 @@ still owns the re-chunking. It requires `--da-auto` + `--kv-unified` (the evicti
 the auto-chunk gate) and a store reachable at `--focus-memory-host`.
 
 **Status: verified (v2.0)** - see *Verified: lossless evict/recall* above.
-Running in production (qwen3.8-27B MROPE, `-c 200000 --kv-offload-threshold 50000`,
+Running in production (qwen3.8-27B MROPE, `-c 200000 --kv-offload-threshold 38672`,
 since 09-26) with `--kv-offload-holes`: evictions PUT to the store and holes cut the KV on
 every turn of a live session.
 
@@ -529,7 +529,7 @@ llama-server \
   --spec-type draft-mtp \
   --spec-draft-n-max 4 \
   --spec-draft-ngl all \
-  # kv-offload (auto-compact replacement) - needs a reachable store:
+  # kv-offload (auto-compaction replacement) - needs a reachable store:
   --fm-offload \
   --kv-offload-holes \
   --kv-offload-threshold 38672 \
@@ -556,11 +556,11 @@ Backend A vs B below.)
 | `--kv-unified` | Enables backend B (reversible two-stream KV) | Required by `--da-auto`: the A path (`seq_rm`) is irreversible, a wrong focus permanently deletes the answer chunk |
 | `--da-min-ctx 2048` | Minimum prompt length (tokens) before auto-chunking engages | Short prompts stay full-attention (no DA overhead); default is 0 (always) |
 | `--da-chunk-tokens 4096` | Target magic-chunk size (tokens); hard cap 5/4 × target | Production chunk size (default 2048); larger = fewer, coarser spans |
-| `--spec-type draft-mtp` | **Speculative decoding** with the model's MTP draft head | Speed-up on top of DA. Since P6, spec and DA **coexist**: while a slot is in DA mode (`da_seq` active) spec is paused automatically and resumes on the return to global attention - so spec stays ON without breaking DA |
+| `--spec-type draft-mtp` | **Speculative decoding** with the model's MTP draft head | Speed-up on top of DA. Spec and DA **coexist**: while a slot is in DA mode (`da_seq` active) spec is paused automatically and resumes on the return to global attention - so spec stays ON without breaking DA |
 | `--spec-draft-n-max 4` | Up to 4 draft tokens per step | Enough to overlap decode with drafting, without so many that rejections waste work |
 | `--spec-draft-ngl all` | Puts the whole draft model on the GPU | The draft model is small; keeping it fully on-GPU avoids CPU round-trips that would erase the spec gain |
 | `--fm-offload` | **kv-offload**: evict the oldest middle messages to the FocusMemory store once the prompt exceeds `--kv-offload-threshold`, and re-prefill them on demand when the model focuses an offloaded chunk | Replaces lossy auto-compaction with a lossless evict/refill cycle (see *kv-offload* above). Optional - off by default |
-| `--kv-offload-threshold 38672` | Token count at which kv-offload eviction engages | Size it at ~8-9 × `--da-chunk-tokens` (4096 → 38672): high enough that short sessions never evict, low enough that eviction engages long before the client's auto-compact point, so the prompt stays a few chunks over the threshold instead of ballooning |
+| `--kv-offload-threshold 38672` | Token count at which kv-offload eviction engages | Size it at ~8-9 × `--da-chunk-tokens` (4096 → 38672): high enough that short sessions never evict, low enough that eviction engages long before the client's auto-compaction point, so the prompt stays a few chunks over the threshold instead of ballooning |
 | `--focus-memory-host` | Base URL of the FocusMemory KV store (`PUT`/`GET` `/v1/kv-offload/chunk`) | Empty = kv-offload disabled even with `--fm-offload` on (fail-open) |
 | `--focus-memory-token` | Bearer token for the store API (`CONTEXT_API_TOKEN`) | Empty = no auth header; set it to match the store |
 
@@ -631,7 +631,7 @@ How to read the result:
 | `timings.da_n_attended_tokens` | Logical tokens attended per restricted step (sum over steps) - the reduction vs. the full prompt is the DA effect. **Logical, not physical** reads |
 | `timings.da_path` = `A` / `B` | Which backend enforced the restriction (see Backend A vs B above) |
 | `timings` has **no** `da_*` fields | Either the prompt had no valid marker block (fail-open vanilla) or the model never emitted a tag - check the journal `da_scan:`/`da_tag:` lines to tell which |
-| `choices[0].message.content` | The model's answer. The `<focus ...>` tag is erased from the text; depending on how the tokens streamed it may or may not be visible to the client (v1-accepted) |
+| `choices[0].message.content` | The model's answer. The `<focus ...>` tag is erased from the text; depending on how the tokens streamed it may or may not be visible to the client (accepted as v1 behavior) |
 
 Expected outcomes per prompt shape:
 
