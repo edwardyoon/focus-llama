@@ -4,6 +4,10 @@
 
 **Status: v2.0 - production-ready.** Running in production (qwen3.8-27B MROPE on the production GPU node, RTX 5090) with `--da-auto --fm-offload --kv-offload-holes`. DA physical read reduction, DA survival across auto-compaction, the MROPE mid-hole gate (R1), and the kv-offload evict/hole/recall cycle are all verified end to end (below). In a 1-hour identical coding session (RTX 5090, AD-Q6_K), DA on decodes ~35% faster than DA off (76.2 → 102.7 tok/s).
 
+![Decode throughput without and with Declarative Attention](media/da-throughput.png)
+
+*Decode throughput over a session — without DA (left) vs with DA (right). Without DA, throughput drifts down as the KV cache grows over the session. With DA's bounded hot-attention window, throughput stays flat regardless of session length. (Grafana dashboards, production traffic; trend lines added manually for illustration.)*
+
 ## Verified: lossless evict/recall (kv-offload, 2026-09-26)
 
 The kv-offload cycle (*kv-offload* section below) is a lossless evict/recall alternative to
