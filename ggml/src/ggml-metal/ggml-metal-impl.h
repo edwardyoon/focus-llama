@@ -123,8 +123,8 @@
 #define FC_DSV4_HC                     2000
 #define FC_PAD                         2100
 #define FC_FLASH_ATTN_EXT_TENSOR       2200
-#define FC_LIGHTNING_INDEXER           2200
-#define FC_MUL_MV_MMA                  2300
+#define FC_LIGHTNING_INDEXER           2400
+#define FC_MUL_MV_MMA                  2500
 
 // op-specific constants
 #define OP_FLASH_ATTN_EXT_NQPSG 8
