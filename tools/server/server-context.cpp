@@ -373,12 +373,22 @@ struct server_slot {
     // returned to the original sequence mid-decode keeps its cache.
     bool da_removed_a = false;
     // kv-offload: true once a get-on-focus re-prefill appended fetched chunk
-    // tokens mid-sequence (apply_da_tag). release() clears the prompt cache in
-    // this case: the re-prefilled tokens sit between the active prefix and the
-    // generated tail, so they no longer align with the next request's prefix
-    // (which re-sends full history and re-fetches on focus). Without a re-prefill
-    // (eviction only), the KV is a clean prefix and the cache is kept.
+    // tokens mid-sequence (apply_da_tag). The re-prefilled tokens sit between
+    // the active prefix and the generated tail, so they no longer align with
+    // the next request's prefix (which re-sends full history). release()
+    // removes only that polluted tail (seq_rm from kv_offload_refill_base) and
+    // keeps the prompt (with holes) so the next request re-matches at
+    // n_past = refill_base and re-prefills only the delta instead of the whole
+    // prompt. Without a re-prefill (eviction only), the KV is a clean prefix
+    // and the cache is kept as-is.
     bool kv_offload_refilled = false;
+    // kv-offload: the position where the FIRST get-on-focus re-prefill started
+    // on the main sequence (= prompt + tokens generated before the first
+    // <focus> tag). release() seq_rm's [refill_base, -1) to drop the refilled
+    // + generated-after tokens while keeping [0, refill_base). -1 = no refill
+    // happened this request. Only the first refill's base is recorded (later
+    // refills append further out, so the first base covers all of them).
+    int32_t kv_offload_refill_base = -1;
     // kv-offload Option B (--kv-offload-holes): holes cut into this slot's MAIN
     // sequence at eviction time (the evicted segments' KV is removed via
     // llama_memory_seq_rm, positions are NOT re-based). They persist across
@@ -541,6 +551,16 @@ struct server_slot {
         da_removed_a     = false;
         n_da_removed     = 0;
         da_first_tag_gen = -1;
+
+        // kv-offload get-on-focus refill state is request-scoped. Without this
+        // reset, a stale kv_offload_refilled + kv_offload_refill_base would make
+        // the NEXT (clean) request take the kv_offload_refilled branch in
+        // release() and seq_rm/resize its prompt at the previous request's base
+        // - corrupting the clean prompt. (The original prompt_clear() fallback
+        // was idempotent-safe under a stale flag; the partial tail removal is
+        // not, so the reset is now mandatory.)
+        kv_offload_refilled    = false;
+        kv_offload_refill_base = -1;
 
         llama_set_sampler(ctx_tgt, id, nullptr);
 
@@ -804,9 +824,41 @@ struct server_slot {
                         prompt.tokens.size(), task->params.da_rm.size());
                 prompt_clear();
             } else if (kv_offload_refilled) {
-                SLT_INF(*this, "clearing slot after kv-offload get-on-focus (re-prefilled tokens mid-sequence): %zu prompt tokens\n",
-                        prompt.tokens.size());
-                prompt_clear();
+                // A get-on-focus re-prefill appended fetched/holed chunk tokens at
+                // the tail (after the prompt + pre-<focus> generated tokens), so the
+                // cached sequence no longer aligns with the next request's prefix.
+                // Instead of clearing the whole prompt cache (which forces a full
+                // re-prefill next turn - the 41s stall), drop only the polluted tail
+                // [refill_base, -1) and keep [0, refill_base) (the prompt with holes
+                // + the pre-<focus> generated tokens). The next request re-matches at
+                // n_past = refill_base and re-prefills only the delta. The MROPE
+                // forward-jump rule is satisfied: the next append is at refill_base,
+                // which is > (refill_base - 1) = the kept cache max.
+                //
+                // Only when no focus is active (da_seq < 0): the get-on-focus
+                // refill for an offloaded chunk does not open a focus (keep_idx
+                // empty -> mode unchanged), so every token (prompt + generated +
+                // refilled) is on the main sequence id and a single
+                // seq_rm(id, base, -1) covers the polluted tail. If a focus is
+                // active (da_seq >= 0, e.g. a holed re-prefill with an active
+                // keep) the generated tokens live on da_seq, so id alone does not
+                // hold the full tail - fall back to the full clear (original).
+                if (kv_offload_refill_base >= 0 && da_seq < 0 &&
+                        (size_t) kv_offload_refill_base <= prompt.tokens.size()) {
+                    const int32_t base = kv_offload_refill_base;
+                    mem.seq_rm(id, base, -1);
+                    // keep_first (not a raw resize): also drops the now-unreferenced
+                    // media chunks from map_idx_to_media and asserts we are not
+                    // cutting mid-image. base sits right after the pre-<focus>
+                    // generated text, so it is a clean token boundary.
+                    prompt.tokens.keep_first(base);
+                    SLT_INF(*this, "kv-offload-refill: tail removed [%d, -1), prompt kept (%d tokens, %zu hole range(s)) - cache reused, no full re-prefill\n",
+                            base, base, kv_hole_ranges.size());
+                } else {
+                    SLT_INF(*this, "clearing slot after kv-offload get-on-focus (re-prefilled tokens mid-sequence): %zu prompt tokens\n",
+                            prompt.tokens.size());
+                    prompt_clear();
+                }
             } else if (da_applied && da_seq >= 0) {
                 const int32_t n_full = (int32_t) prompt.n_tokens();
                 if (n_full > da_bound) {
@@ -6631,6 +6683,13 @@ static bool kv_offload_refill(llama_context * ctx, server_slot & slot, const lla
         // round-trip would drop the media index map.
         const size_t old_size = slot.prompt.tokens.size();
         slot.prompt.tokens.insert(toks);
+        // Record where the FIRST refill started so release() can drop only the
+        // polluted tail [base, -1) and keep the prompt [0, base) for cache
+        // reuse (avoids the full-prompt re-prefill). Later refills append
+        // further out, so the first base covers all of them.
+        if (slot.kv_offload_refill_base < 0) {
+            slot.kv_offload_refill_base = n_full;
+        }
         SRV_INF("kv_offload: re-prefilled %d token(s) at [%d, %d) on seq %d - prompt tokens %zu -> %zu\n",
                 n, n_full, n_full + n, (int) seq, old_size, old_size + (size_t) n);
         return true;
