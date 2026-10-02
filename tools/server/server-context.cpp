@@ -7299,6 +7299,7 @@ private:
                     slot.prompt_clear();
                     return;
                 }
+                GGML_ASSERT(slot.spec_draft_q.empty() || (slot.spec_draft_q.size() == slot.spec_draft.size()));
                 const auto & synth_probs = common_speculative_get_synth_probs(spec.get());
 
                 // drafters that fill no distribution fall back here

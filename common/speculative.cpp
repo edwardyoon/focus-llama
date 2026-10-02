@@ -1981,18 +1981,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
+        // new generation: the depth learned for the previous content is stale,
+        // so the controller starts from the floor again, even for an empty prompt
+        if (adaptive) {
+            adaptive_ctrl[seq_id].reset(this->params.n_max, this->params.n_min_adaptive);
+        }
         // reset here rather than per round, or two identical requests differ
         common_sampler_reset(smpls[seq_id].get());
 
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
             return;
-        }
-
-        // new generation: the depth learned for the previous content is stale,
-        // so the controller starts from the floor again
-        if (adaptive) {
-            adaptive_ctrl[seq_id].reset(this->params.n_max, this->params.n_min_adaptive);
         }
 
         auto * ctx_dft = this->params.ctx_dft;
