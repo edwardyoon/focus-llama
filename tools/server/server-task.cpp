@@ -145,6 +145,67 @@ json task_params::to_json(bool only_metrics) const {
     };
 }
 
+// Strip trailing orphaned tool-call closing tags from a content string.
+//
+// The model (qwen3.8-focus) occasionally emits a tool-call closing tag without
+// the matching opening tag - observed right after the DA B switch (the post-
+// switch decode window), e.g. "</parameter>\n</function>\n</tool_call>". The
+// PEG parser does not classify a closing-only fragment as a tool call, so it
+// lands in content and leaks to the client as visible text. Only trailing tag
+// fragments are stripped (repeatedly, tolerating inter-tag whitespace), so
+// legitimate content that merely mentions a tag mid-string is untouched.
+// Returns the (possibly shortened) content and sets *stripped to the number of
+// closing tags removed.
+static std::string strip_orphaned_tool_call_closing(std::string content, size_t * stripped) {
+    static const std::vector<std::string> closers = {
+        "</parameter>",
+        "</function>",
+        "</tool_call>",
+    };
+    size_t removed = 0;
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        size_t end = content.size();
+        while (end > 0) {
+            const char c = content[end - 1];
+            if (c == '\n' || c == '\r' || c == ' ' || c == '\t') {
+                --end;
+            } else {
+                break;
+            }
+        }
+        for (const auto & closer : closers) {
+            if (end >= closer.size() && content.compare(end - closer.size(), closer.size(), closer) == 0) {
+                content.resize(end - closer.size());
+                ++removed;
+                changed = true;
+                break;
+            }
+        }
+    }
+    // If a closing tag was stripped, drop the trailing whitespace that
+    // separated it from the preceding text (e.g. "answer\n</function>" ->
+    // "answer", not "answer\n"). When nothing was stripped the content is
+    // left byte-for-byte untouched.
+    if (removed > 0) {
+        size_t hi = content.size();
+        while (hi > 0) {
+            const char c = content[hi - 1];
+            if (c == '\n' || c == '\r' || c == ' ' || c == '\t') {
+                --hi;
+            } else {
+                break;
+            }
+        }
+        content.resize(hi);
+    }
+    if (stripped != nullptr) {
+        *stripped = removed;
+    }
+    return content;
+}
+
 //
 // task_result_state
 //
@@ -174,6 +235,19 @@ common_chat_msg task_result_state::update_chat_msg(
     if (!new_msg.empty()) {
         new_msg.set_tool_call_ids(generated_tool_call_ids, gen_tool_call_id);
         chat_msg = new_msg;
+        // Sanitize: strip trailing orphaned tool-call closing tags the model
+        // emitted without the matching opening tag (see the helper). Applied to
+        // both partial and final updates so the fragment never reaches the
+        // client, mid-stream or in the final message.
+        {
+            const size_t content_before = chat_msg.content.size();
+            size_t n_stripped = 0;
+            chat_msg.content = strip_orphaned_tool_call_closing(chat_msg.content, &n_stripped);
+            if (n_stripped > 0) {
+                SRV_INF("diag_parse: stripped %zu orphaned tool-call closing tag(s) from content (len=%zu->%zu, partial=%d)\n",
+                        n_stripped, content_before, chat_msg.content.size(), is_partial ? 1 : 0);
+            }
+        }
         auto all_diffs = common_chat_msg_diff::compute_diffs(msg_prv_copy, chat_msg);
 
         if (!filter_tool_calls) {
