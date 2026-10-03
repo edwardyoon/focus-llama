@@ -233,6 +233,29 @@ common_chat_msg task_result_state::update_chat_msg(
             }
         }
     }
+
+    // Diagnostic (tool-call leak investigation, 2026-10-03): capture how the
+    // cumulative PEG parse tracks a tool call across streaming chunks. Logs
+    // the final parse, every tool-call count transition, and a heartbeat
+    // every ~400 chars, so the journal shows whether a tool call opening was
+    // recognized (tc 0->1) and whether it survived to the final parse, plus
+    // what text the parser saw at the tail each time.
+    {
+        const bool tc_changed = msg_prv_copy.tool_calls.size() != chat_msg.tool_calls.size();
+        const bool heartbeat  = generated_text.size() >= last_diag_len + 400;
+        if (!is_partial || tc_changed || heartbeat) {
+            const size_t tail_off = generated_text.size() > 120 ? generated_text.size() - 120 : 0;
+            SRV_INF("diag_parse: %s len=%zu tc=%zu->%zu content=%zu reasoning=%zu tail=%.120s\n",
+                    is_partial ? "partial" : "final",
+                    generated_text.size(),
+                    msg_prv_copy.tool_calls.size(),
+                    chat_msg.tool_calls.size(),
+                    chat_msg.content.size(),
+                    chat_msg.reasoning_content.size(),
+                    generated_text.substr(tail_off).c_str());
+            last_diag_len = generated_text.size();
+        }
+    }
     return chat_msg;
 }
 

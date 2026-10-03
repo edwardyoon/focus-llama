@@ -171,6 +171,7 @@ struct task_result_state {
     common_chat_parser_params chat_parser_params;
     common_chat_msg chat_msg;
     std::string generated_text; // append new chunks of generated text here
+    size_t last_diag_len = 0; // diagnostic-logging cadence (tool-call leak investigation)
     std::vector<std::string> generated_tool_call_ids;
     std::unordered_set<size_t> sent_tool_call_names;
 

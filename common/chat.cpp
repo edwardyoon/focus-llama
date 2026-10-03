@@ -1485,6 +1485,18 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
             }
             mapper->from_ast(ctx.ast, result);
 
+            // Diagnostic (tool-call leak investigation, 2026-10-03): this path
+            // silently drops the unparsed tail. Log it so the journal shows
+            // exactly which text the parse stopped on (e.g. an orphaned
+            // closing tag) and what the partial result kept.
+            const size_t tail_len = effective_input.size() - result.end;
+            const size_t show_off = tail_len > 200 ? tail_len - 200 : 0;
+            LOG_INF("%s: %s parse FAIL at %zu of %zu chars - kept content=%zu reasoning=%zu tc=%zu; unparsed tail (%zu chars): %.200s\n",
+                    __func__, is_partial ? "partial" : "full",
+                    result.end, effective_input.size(),
+                    msg.content.size(), msg.reasoning_content.size(), msg.tool_calls.size(),
+                    tail_len, effective_input.substr(result.end + show_off).c_str());
+
             if (ctx.is_debug()) {
                 fprintf(stderr, "\nAST for partial parse (fail):\n%s\n", ctx.ast.dump().c_str());
                 fflush(stderr);
@@ -1512,6 +1524,25 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
     if (ctx.is_debug()) {
         fprintf(stderr, "\nAST for %s parse:\n%s\n", is_partial ? "partial" : "full", ctx.ast.dump().c_str());
         fflush(stderr);
+    }
+
+    // Diagnostic (tool-call leak investigation, 2026-10-03): on success the
+    // grammar should consume (nearly) all of the input. A non-trivial
+    // unconsumed tail means the parser matched a prefix and left text behind
+    // (e.g. a closing tag after a complete call, or text after the end
+    // marker) - log it with what the parse produced. The result type is
+    // included because NEED_MORE_INPUT (incomplete tool call mid-stream) and
+    // SUCCESS are handled by this same path.
+    if (result.end < effective_input.size()) {
+        const size_t tail_len = effective_input.size() - result.end;
+        if (tail_len > 4) {
+            const size_t show_off = tail_len > 200 ? tail_len - 200 : 0;
+            LOG_INF("%s: %s parse %s with unconsumed tail (%zu chars) - content=%zu reasoning=%zu tc=%zu; tail: %.200s\n",
+                    __func__, is_partial ? "partial" : "full",
+                    common_peg_parse_result_type_name(result.type), tail_len,
+                    msg.content.size(), msg.reasoning_content.size(), msg.tool_calls.size(),
+                    effective_input.substr(result.end + show_off).c_str());
+        }
     }
 
     if (!is_partial) {
