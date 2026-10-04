@@ -6616,9 +6616,8 @@ static bool kv_offload_refill(llama_context * ctx, server_slot & slot, const lla
     std::string sanitized_wrapped_text =
         "\n[Recalled Chunk Start]\n" + raw_text + "\n[End of Recalled Chunk]\n";
 
-    // 4. 안전해진 텍스트를 다시 토큰화
-    const struct llama_model * model = llama_get_model(ctx);
-    llama_tokens wrapped_toks = common_tokenize(model, sanitized_wrapped_text, false, true);
+    // 4. ctx를 직접 사용하여 안전해진 텍스트를 다시 토큰화 (수정 완료)
+    llama_tokens wrapped_toks = common_tokenize(ctx, sanitized_wrapped_text, false, true);
 
     const int32_t n = (int32_t) wrapped_toks.size();
     const int32_t n_full = (int32_t) slot.prompt.n_tokens();
