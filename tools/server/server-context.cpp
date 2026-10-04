@@ -6662,6 +6662,10 @@ static bool kv_offload_refill(llama_context * ctx, server_slot & slot, const lla
     replace_all_tags(raw_text, "</global>",         "[past_end_global]");
     replace_all_tags(raw_text, "<recap>",           "[past_recap]");
     replace_all_tags(raw_text, "</recap>",          "[past_end_recap]");
+    replace_all_tags(raw_text, "<recall>",          "[past_recall]");
+    replace_all_tags(raw_text, "</recall>",         "[past_end_recall]");
+    replace_all_tags(raw_text, "<invoke>",          "[past_invoke]");
+    replace_all_tags(raw_text, "</invoke>",         "[past_end_invoke]");
 
     // 3. Wrapper 구분자 감싸기
     std::string sanitized_wrapped_text =
