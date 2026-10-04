@@ -18,6 +18,9 @@
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
+#include <string>
+#include <vector>
+
 #include <algorithm>
 #include <atomic>
 #include <cstddef>
@@ -6576,6 +6579,15 @@ static bool kv_offload_session_get(
     }
 }
 
+// 보조 함수: 문자열 내 치환 함수
+static void replace_all_tags(std::string & str, const std::string & from, const std::string & to) {
+    size_t start_pos = 0;
+    while ((start_pos = str.find(from, start_pos)) != std::string::npos) {
+        str.replace(start_pos, from.length(), to);
+        start_pos += to.length();
+    }
+}
+
 // Re-prefill an offloaded chunk at the tail of the slot's sequence
 // (get-on-focus). Appends the tokens at positions [n_full, n_full+len) on
 // kv_seq() and runs a prefill decode so the model can attend to the chunk.
@@ -6584,14 +6596,40 @@ static bool kv_offload_session_get(
 // pos_next() reflects the new length. HIGH RISK: mid-decode prefill - must be
 // validated by the offload probe before trusting.
 static bool kv_offload_refill(llama_context * ctx, server_slot & slot, const llama_tokens & toks) {
-    const int32_t n = (int32_t) toks.size();
-    if (n <= 0 || ctx == nullptr) return false;
+    const int32_t n_raw = (int32_t) toks.size();
+    if (n_raw <= 0 || ctx == nullptr) return false;
+
+    // 1. 기존 복원 토큰(toks)을 텍스트로 Detokenize
+    std::string raw_text = common_detokenize(ctx, toks);
+
+    // 2. 과거 툴콜/제어 태그 Sanitize (모델 오작동 및 턴 조기 종료 방지)
+    replace_all_tags(raw_text, "<tool_call>",      "[past_tool_call]");
+    replace_all_tags(raw_text, "</tool_call>",     "[past_end_tool_call]");
+    replace_all_tags(raw_text, "<function=",       "[past_function=");
+    replace_all_tags(raw_text, "</function>",      "[past_end_function]");
+    replace_all_tags(raw_text, "<parameter=",      "[past_parameter=");
+    replace_all_tags(raw_text, "</parameter>",     "[past_end_parameter]");
+    replace_all_tags(raw_text, "<|im_end|>",       "[past_im_end]");
+    replace_all_tags(raw_text, "<|im_start|>",     "[past_im_start]");
+
+    // 3. Wrapper 구분자 감싸기
+    std::string sanitized_wrapped_text =
+        "\n[Recalled Chunk Start]\n" + raw_text + "\n[End of Recalled Chunk]\n";
+
+    // 4. 안전해진 텍스트를 다시 토큰화
+    const struct llama_model * model = llama_get_model(ctx);
+    llama_tokens wrapped_toks = common_tokenize(model, sanitized_wrapped_text, false, true);
+
+    const int32_t n = (int32_t) wrapped_toks.size();
     const int32_t n_full = (int32_t) slot.prompt.n_tokens();
     const llama_seq_id seq = slot.kv_seq();
     const int32_t n_batch = (int32_t) llama_n_batch(ctx);
+
     if (n_batch <= 0) return false;
-    SRV_INF("kv_offload: refill start - %d token(s), tail pos %d, seq %d, n_batch %d\n",
-            n, n_full, (int) seq, n_batch);
+
+    SRV_INF("kv_offload: refill start - %d token(s) (raw %d -> sanitized %d), tail pos %d, seq %d, n_batch %d\n",
+            n, n_raw, n, n_full, (int) seq, n_batch);
+
     try {
         // The re-prefilled chunk can be larger than n_batch, and llama_decode
         // asserts n_tokens <= n_batch (it does not sub-batch), so split the
@@ -6600,17 +6638,21 @@ static bool kv_offload_refill(llama_context * ctx, server_slot & slot, const lla
         while (off < n) {
             const int32_t m = std::min(n_batch, n - off);
             llama_batch batch = llama_batch_init(m, 0, 1);
+
             // common_batch_add: manages n_tokens (init leaves it 0) and keeps
             // seq_id[i] pointing at the malloc'd arrays (llama_batch_free
             // requires that - overwriting it with a foreign pointer aborts).
             for (int32_t i = 0; i < m; i++) {
-                common_batch_add(batch, toks[off + i], n_full + off + i,
-                                 { seq }, (off + i == n - 1));
+                common_batch_add(batch, wrapped_toks[off + i], n_full + off + i,
+                                  { seq }, (off + i == n - 1));
             }
+
             int ret = llama_decode(ctx, batch);
             llama_batch_free(batch);
+
             SRV_INF("kv_offload: refill sub-batch [%d,%d) of %d token(s) ret=%d\n",
                     off, off + m, n, ret);
+
             if (ret != 0) {
                 SRV_WRN("kv_offload: refill decode failed (ret=%d, tokens %d..%d of %d) - fail-open\n",
                         ret, off, off + m, n);
@@ -6618,14 +6660,17 @@ static bool kv_offload_refill(llama_context * ctx, server_slot & slot, const lla
             }
             off += m;
         }
+
         // advance the slot's prompt tokens so pos_next() reflects the refill.
         // insert() appends directly: get_tokens() asserts !has_mtmd (true on any
         // server with mmproj loaded, even for text-only prompts) and the clear()
         // round-trip would drop the media index map.
         const size_t old_size = slot.prompt.tokens.size();
-        slot.prompt.tokens.insert(toks);
-        SRV_INF("kv_offload: re-prefilled %d token(s) at [%d, %d) on seq %d - prompt tokens %zu -> %zu\n",
+        slot.prompt.tokens.insert(wrapped_toks);
+
+        SRV_INF("kv_offload: re-prefilled %d token(s) at [%d, %d) on seq %d prompt tokens %zu -> %zu\n",
                 n, n_full, n_full + n, (int) seq, old_size, old_size + (size_t) n);
+
         return true;
     } catch (const std::exception & e) {
         SRV_WRN("kv_offload: refill exception: %s - fail-open\n", e.what());
