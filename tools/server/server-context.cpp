@@ -6704,6 +6704,18 @@ static bool kv_offload_refill(llama_context * ctx, server_slot & slot, const lla
             }
 
             int ret = llama_decode(ctx, batch);
+
+            // Keep the draft (MTP) context in sync with the refill: a
+            // target-only decode leaves the draft KV empty over the
+            // refilled region, silently dropping draft acceptance for the
+            // rest of the session. The impls decode the draft without
+            // outputs (logits nulled), so the existing output flags (last
+            // token only) are sufficient - no n_outputs_max impact.
+            bool spec_ok = true;
+            if (ret == 0 && slot.spec != nullptr) {
+                spec_ok = common_speculative_process(slot.spec, batch);
+            }
+
             llama_batch_free(batch);
 
             SRV_INF("kv_offload: refill sub-batch [%d,%d) of %d token(s) ret=%d\n",
@@ -6712,6 +6724,12 @@ static bool kv_offload_refill(llama_context * ctx, server_slot & slot, const lla
             if (ret != 0) {
                 SRV_WRN("kv_offload: refill decode failed (ret=%d, tokens %d..%d of %d) - fail-open\n",
                         ret, off, off + m, n);
+                kv_offload_refill_rollback(slot, n_full, off);
+                return false;
+            }
+            if (!spec_ok) {
+                SRV_WRN("kv_offload: refill draft process failed (tokens %d..%d of %d) - fail-open\n",
+                        off, off + m, n);
                 kv_offload_refill_rollback(slot, n_full, off);
                 return false;
             }
