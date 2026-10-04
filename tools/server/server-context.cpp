@@ -6612,6 +6612,22 @@ static bool kv_offload_refill(llama_context * ctx, server_slot & slot, const lla
     replace_all_tags(raw_text, "<|im_end|>",       "[past_im_end]");
     replace_all_tags(raw_text, "<|im_start|>",     "[past_im_start]");
 
+    replace_all_tags(raw_text, "<think>",           "[past_think]");
+    replace_all_tags(raw_text, "</think>",          "[past_end_think]");
+    replace_all_tags(raw_text, "</thinking>",       "[past_end_thinking]");
+    replace_all_tags(raw_text, "<tool_response>",   "[past_tool_response]");
+    replace_all_tags(raw_text, "</tool_response>",  "[past_end_tool_response]");
+    replace_all_tags(raw_text, "<|endoftext|>",     "[past_endoftext]");
+    replace_all_tags(raw_text, "<focus ",           "[past_focus ");
+    replace_all_tags(raw_text, "<focus>",           "[past_focus]");
+    replace_all_tags(raw_text, "</focus>",          "[past_end_focus]");
+    replace_all_tags(raw_text, "<local>",           "[past_local]");
+    replace_all_tags(raw_text, "</local>",          "[past_end_local]");
+    replace_all_tags(raw_text, "<global>",          "[past_global]");
+    replace_all_tags(raw_text, "</global>",         "[past_end_global]");
+    replace_all_tags(raw_text, "<recap>",           "[past_recap]");
+    replace_all_tags(raw_text, "</recap>",          "[past_end_recap]");
+
     // 3. Wrapper 구분자 감싸기
     std::string sanitized_wrapped_text =
         "\n[Recalled Chunk Start]\n" + raw_text + "\n[End of Recalled Chunk]\n";
