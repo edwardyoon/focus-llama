@@ -372,13 +372,6 @@ struct server_slot {
     // A holes are baked into the cached sequence (clear), a B slot that
     // returned to the original sequence mid-decode keeps its cache.
     bool da_removed_a = false;
-    // kv-offload: true once a get-on-focus re-prefill appended fetched chunk
-    // tokens mid-sequence (apply_da_tag). release() clears the prompt cache in
-    // this case: the re-prefilled tokens sit between the active prefix and the
-    // generated tail, so they no longer align with the next request's prefix
-    // (which re-sends full history and re-fetches on focus). Without a re-prefill
-    // (eviction only), the KV is a clean prefix and the cache is kept.
-    bool kv_offload_refilled = false;
     // kv-offload Option B (--kv-offload-holes): holes cut into this slot's MAIN
     // sequence at eviction time (the evicted segments' KV is removed via
     // llama_memory_seq_rm, positions are NOT re-based). They persist across
@@ -797,15 +790,17 @@ struct server_slot {
             //             (the next turn reuses the complete prefix)
             //     A path: holes persist in the original sequence -> clear
             // - DA tag request that never emitted a tag: cache kept (vanilla)
+            // - kv-offload get-on-focus refill: the refilled chunk is appended
+            //   at the tail with KV and prompt.tokens in sync, so it is just part
+            //   of the generated tail - the B path copies it back (or the default
+            //   keeps it) and the next request's prefix match (get_common_prefix
+            //   + keep_first + seq_rm) trims it. Keeping the cache (not the old
+            //   prompt_clear) avoids the full re-prefill stall.
             if (task->is_child()) {
                 prompt_clear();
             } else if (!task->params.da_rm.empty()) {
                 SLT_INF(*this, "clearing slot after da_rm request: %zu prompt tokens, %zu range(s)\n",
                         prompt.tokens.size(), task->params.da_rm.size());
-                prompt_clear();
-            } else if (kv_offload_refilled) {
-                SLT_INF(*this, "clearing slot after kv-offload get-on-focus (re-prefilled tokens mid-sequence): %zu prompt tokens\n",
-                        prompt.tokens.size());
                 prompt_clear();
             } else if (da_applied && da_seq >= 0) {
                 const int32_t n_full = (int32_t) prompt.n_tokens();
@@ -5153,7 +5148,6 @@ private:
                                             common_tokenize(slot.task->params.kv_offload_vocab, text, true, true);
                                     if (kv_offload_refill(ctx_tgt, slot, toks)) {
                                         did_refill = true;
-                                        slot.kv_offload_refilled = true;
                                     } else {
                                         SLT_WRN(slot, "kv_offload: refill failed for chunk %d - fail-open\n", n);
                                     }
@@ -5230,7 +5224,6 @@ private:
                                         n, (int) toks.size(), olo, ohi);
                                 if (kv_offload_refill(ctx_tgt, slot, toks)) {
                                     did_refill = true;
-                                    slot.kv_offload_refilled = true;
                                 } else {
                                     SLT_WRN(slot, "kv_offload: refill failed for holed chunk %zu - fail-open\n", n);
                                 }
