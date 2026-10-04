@@ -392,6 +392,12 @@ struct server_slot {
     // in the shared cache, not in the per-request slot state).
     std::vector<std::pair<llama_pos, llama_pos>> kv_hole_ranges;
     bool kv_holes_active = false;
+    // kv-offload refill failure: a partial refill was written to the KV and
+    // its attention-KV rollback failed (a recurrent-state hybrid cannot
+    // partially roll back), so the slot's KV is inconsistent with
+    // prompt.tokens. release() must prompt_clear() this slot instead of
+    // keeping the prompt cache. Request-scoped: reset() clears it.
+    bool refill_poisoned = false;
     // Phase 0 (measure-only): server-level flag copied at slot init. When set,
     // apply_da_rm/apply_da_b skip the KV mutation (output stays vanilla) so the
     // tag state machine + logging can measure g (tag position) and emission
@@ -537,6 +543,11 @@ struct server_slot {
         da_removed_a     = false;
         n_da_removed     = 0;
         da_first_tag_gen = -1;
+
+        // kv-offload refill poison is request-scoped: the poisoned KV dies with the
+        // prompt cache at release(), so the flag must not leak into the next request
+        // (unlike kv_holes_active, which persists in the shared cache).
+        refill_poisoned = false;
 
         llama_set_sampler(ctx_tgt, id, nullptr);
 
@@ -799,7 +810,14 @@ struct server_slot {
             //   keeps it) and the next request's prefix match (get_common_prefix
             //   + keep_first + seq_rm) trims it. Keeping the cache (not the old
             //   prompt_clear) avoids the full re-prefill stall.
-            if (task->is_child()) {
+            if (refill_poisoned) {
+                // kv-offload refill failed mid-way and its attention-KV rollback was a
+                // no-op (recurrent-state hybrid cannot partially roll back): the KV is
+                // inconsistent with prompt.tokens, so the prompt cache cannot be kept.
+                SLT_INF(*this, "clearing slot after poisoned kv-offload refill (KV rollback no-op): %zu prompt tokens\n",
+                        prompt.tokens.size());
+                prompt_clear();
+            } else if (task->is_child()) {
                 prompt_clear();
             } else if (!task->params.da_rm.empty()) {
                 SLT_INF(*this, "clearing slot after da_rm request: %zu prompt tokens, %zu range(s)\n",
@@ -6588,6 +6606,23 @@ static void replace_all_tags(std::string & str, const std::string & from, const 
     }
 }
 
+// Roll back a partial kv_offload_refill: remove [n_full, -1) (the tail from the
+// pre-refill length onward) on kv_seq(), restoring KV<->prompt.tokens
+// consistency. Runs on every failure (any error class), not only the first
+// sub-batch: a later sub-batch failure leaves the earlier ones' tokens in the
+// KV and the rollback must remove them all. If the removal is a no-op (e.g. a
+// recurrent-state hybrid cannot be partially rolled back), the slot's KV stays
+// inconsistent with prompt.tokens -> mark it poisoned so release()
+// prompt_clear()s it instead of keeping the prompt cache. Harmless when
+// nothing was written (the range contains no cells).
+static void kv_offload_refill_rollback(server_slot & slot, int32_t n_full, int32_t off) {
+    if (!slot.mem.seq_rm_checked(slot.kv_seq(), n_full, -1)) {
+        slot.refill_poisoned = true;
+        SRV_WRN("kv_offload: refill rollback no-op for [%d, -1) in seq %d after %d token(s) - slot poisoned, prompt cache will be cleared on release\n",
+                n_full, (int) slot.kv_seq(), off);
+    }
+}
+
 // Re-prefill an offloaded chunk at the tail of the slot's sequence
 // (get-on-focus). Appends the tokens at positions [n_full, n_full+len) on
 // kv_seq() and runs a prefill decode so the model can attend to the chunk.
@@ -6645,11 +6680,13 @@ static bool kv_offload_refill(llama_context * ctx, server_slot & slot, const lla
     SRV_INF("kv_offload: refill start - %d token(s) (raw %d -> sanitized %d), tail pos %d, seq %d, n_batch %d\n",
             n, n_raw, n, n_full, (int) seq, n_batch);
 
+    // Hoisted out of the try so the catch path can roll back the partial
+    // refill: number of tokens successfully written to the KV before the failure.
+    int32_t off = 0;
     try {
         // The re-prefilled chunk can be larger than n_batch, and llama_decode
         // asserts n_tokens <= n_batch (it does not sub-batch), so split the
         // refill into n_batch-sized sub-batches.
-        int32_t off = 0;
         while (off < n) {
             const int32_t m = std::min(n_batch, n - off);
             llama_batch batch = llama_batch_init(m, 0, 1);
@@ -6671,6 +6708,7 @@ static bool kv_offload_refill(llama_context * ctx, server_slot & slot, const lla
             if (ret != 0) {
                 SRV_WRN("kv_offload: refill decode failed (ret=%d, tokens %d..%d of %d) - fail-open\n",
                         ret, off, off + m, n);
+                kv_offload_refill_rollback(slot, n_full, off);
                 return false;
             }
             off += m;
@@ -6689,6 +6727,7 @@ static bool kv_offload_refill(llama_context * ctx, server_slot & slot, const lla
         return true;
     } catch (const std::exception & e) {
         SRV_WRN("kv_offload: refill exception: %s - fail-open\n", e.what());
+        kv_offload_refill_rollback(slot, n_full, off);
         return false;
     }
 }
