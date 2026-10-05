@@ -6638,7 +6638,7 @@ static bool kv_offload_refill(llama_context * ctx, server_slot & slot, const lla
 
     const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
 
-    std::string raw_text = sanitize_recalled_text(common_detokenize(ctx, toks, true),
+    std::string raw_text = sanitize_recalled_text(common_detokenize(ctx, toks),
                                                 recall_tag_names(vocab));
 
     // 3. Wrapper 구분자 감싸기
