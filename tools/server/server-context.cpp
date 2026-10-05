@@ -18,6 +18,8 @@
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
+#include "sanitize.cpp"
+
 #include <string>
 #include <vector>
 
@@ -6634,42 +6636,16 @@ static bool kv_offload_refill(llama_context * ctx, server_slot & slot, const lla
     const int32_t n_raw = (int32_t) toks.size();
     if (n_raw <= 0 || ctx == nullptr) return false;
 
-    // 1. 기존 복원 토큰(toks)을 텍스트로 Detokenize
-    std::string raw_text = common_detokenize(ctx, toks);
+    const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
 
-    // 2. 과거 툴콜/제어 태그 Sanitize (모델 오작동 및 턴 조기 종료 방지)
-    replace_all_tags(raw_text, "<tool_call>",      "[past_tool_call]");
-    replace_all_tags(raw_text, "</tool_call>",     "[past_end_tool_call]");
-    replace_all_tags(raw_text, "<function=",       "[past_function=");
-    replace_all_tags(raw_text, "</function>",      "[past_end_function]");
-    replace_all_tags(raw_text, "<parameter=",      "[past_parameter=");
-    replace_all_tags(raw_text, "</parameter>",     "[past_end_parameter]");
-    replace_all_tags(raw_text, "<|im_end|>",       "[past_im_end]");
-    replace_all_tags(raw_text, "<|im_start|>",     "[past_im_start]");
-
-    replace_all_tags(raw_text, "<think>",           "[past_think]");
-    replace_all_tags(raw_text, "</think>",          "[past_end_think]");
-    replace_all_tags(raw_text, "</thinking>",       "[past_end_thinking]");
-    replace_all_tags(raw_text, "<tool_response>",   "[past_tool_response]");
-    replace_all_tags(raw_text, "</tool_response>",  "[past_end_tool_response]");
-    replace_all_tags(raw_text, "<|endoftext|>",     "[past_endoftext]");
-    replace_all_tags(raw_text, "<focus ",           "[past_focus ");
-    replace_all_tags(raw_text, "<focus>",           "[past_focus]");
-    replace_all_tags(raw_text, "</focus>",          "[past_end_focus]");
-    replace_all_tags(raw_text, "<local>",           "[past_local]");
-    replace_all_tags(raw_text, "</local>",          "[past_end_local]");
-    replace_all_tags(raw_text, "<global>",          "[past_global]");
-    replace_all_tags(raw_text, "</global>",         "[past_end_global]");
-    replace_all_tags(raw_text, "<recap>",           "[past_recap]");
-    replace_all_tags(raw_text, "</recap>",          "[past_end_recap]");
-    replace_all_tags(raw_text, "<recall>",          "[past_recall]");
-    replace_all_tags(raw_text, "</recall>",         "[past_end_recall]");
-    replace_all_tags(raw_text, "<invoke>",          "[past_invoke]");
-    replace_all_tags(raw_text, "</invoke>",         "[past_end_invoke]");
+    std::string raw_text = sanitize_recalled_text(common_detokenize(ctx, toks, true),
+                                                recall_tag_names(vocab));
 
     // 3. Wrapper 구분자 감싸기
     std::string sanitized_wrapped_text =
         "\n[Recalled Chunk Start]\n" + raw_text + "\n[End of Recalled Chunk]\n";
+
+    SRV_INF("sanitize_recalled_text: %s\n", sanitized_wrapped_text.c_str());
 
     // 4. ctx를 직접 사용하여 안전해진 텍스트를 다시 토큰화 (수정 완료)
     llama_tokens wrapped_toks = common_tokenize(ctx, sanitized_wrapped_text, false, true);
