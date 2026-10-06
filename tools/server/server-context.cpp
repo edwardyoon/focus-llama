@@ -394,6 +394,29 @@ struct server_slot {
     // in the shared cache, not in the per-request slot state).
     std::vector<std::pair<llama_pos, llama_pos>> kv_hole_ranges;
     bool kv_holes_active = false;
+    // kv-offload-holes progressive apply (prefill-time hole cutting): per-hole
+    // progress while the prompt is being (re-)prefilled. applied_until: [lo,
+    // applied_until) is already cut from the KV. Request-scoped: cleared in
+    // reset() and at the STARTED block - the gate re-plans the same holes
+    // every request, so progress never carries over. The applied ledger
+    // (kv_hole_ranges) records only fully cut holes; a partial cut that
+    // survives to the next request is completed by the n_past batch path
+    // (re-cutting the full range is idempotent).
+    struct kv_hole_progress_entry {
+        llama_pos lo = 0;
+        llama_pos hi = 0;
+        llama_pos applied_until = 0; // [lo, applied_until) already cut
+        bool fail_logged = false;    // one-shot warn per rejected cut
+    };
+    std::vector<kv_hole_progress_entry> kv_hole_progress;
+    // peak KV-resident tokens (processed - cut) observed during the
+    // progressive prefill cut; 0 = not measured (no progressive cut this
+    // request). Logged once at the DONE_PROMPT -> GENERATING transition.
+    int32_t kv_hole_peak_resident = 0;
+    // set by the n_cache_reuse shift block: the shift moved the KV, so the
+    // pending hole coordinates (final token space) are stale - the n_past
+    // batch path and the progressive path both defer the holes.
+    bool kv_hole_shift_blocked = false;
     // kv-offload refill failure: a partial refill was written to the KV and
     // its attention-KV rollback failed (a recurrent-state hybrid cannot
     // partially roll back), so the slot's KV is inconsistent with
@@ -473,6 +496,7 @@ struct server_slot {
         // ledger is stale and must not survive into the next request
         kv_hole_ranges.clear();
         kv_holes_active = false;
+        kv_hole_progress.clear();
     }
 
     std::vector<common_adapter_lora_info> lora;
@@ -550,6 +574,12 @@ struct server_slot {
         // prompt cache at release(), so the flag must not leak into the next request
         // (unlike kv_holes_active, which persists in the shared cache).
         refill_poisoned = false;
+
+        // kv-offload-holes progressive apply: request-scoped progress (the
+        // applied ledger kv_hole_ranges persists in the shared cache)
+        kv_hole_progress.clear();
+        kv_hole_peak_resident = 0;
+        kv_hole_shift_blocked = false;
 
         llama_set_sampler(ctx_tgt, id, nullptr);
 
@@ -3342,6 +3372,12 @@ private:
 
                     // on successful decode, restore the original batch size
                     n_batch = llama_n_batch(ctx_tgt);
+
+                    // kv-offload-holes: cut the pending holes whose KV this
+                    // sub-batch completed (progressive apply - keeps the
+                    // prefill peak near the projected resident instead of the
+                    // raw prompt length)
+                    kv_holes_progressive_apply(off_next);
                 } else {
                     // try again with the updated n_batch
                     continue;
@@ -3694,7 +3730,12 @@ private:
                         // shift block moved KV this request - the pending hole
                         // coordinates (recorded in the final token space) would be
                         // stale, so the holes are deferred rather than applied.
-                        bool kv_hole_shift_blocked = false;
+                        // Slot member: the progressive (mid-prefill) path in
+                        // decode() reads it too. The progressive progress ledger
+                        // is request-scoped - fresh for every (re-)prefill.
+                        slot.kv_hole_shift_blocked = false;
+                        slot.kv_hole_progress.clear();
+                        slot.kv_hole_peak_resident = 0;
 
                         // empty prompt passed -> release the slot and send empty response
                         if (input_tokens.empty()) {
@@ -3804,7 +3845,7 @@ private:
                                             // Option B: the shift moved KV, so any pending
                                             // hole coordinates (recorded in the pre-shift
                                             // token space) are stale - defer them.
-                                            kv_hole_shift_blocked = true;
+                                            slot.kv_hole_shift_blocked = true;
 
                                             const int64_t kv_shift = (int64_t) head_p - (int64_t) head_c;
 
@@ -4009,7 +4050,7 @@ private:
                                 slot.kv_hole_ranges.clear();
                                 slot.kv_holes_active = false;
                             }
-                        } else if (!kv_hole_shift_blocked && !slot.task->params.kv_hole_pending.empty()) {
+                        } else if (!slot.kv_hole_shift_blocked && !slot.task->params.kv_hole_pending.empty()) {
                             std::vector<std::pair<int32_t, int32_t>> fresh;
                             for (const auto & r : slot.task->params.kv_hole_pending) {
                                 bool dup = false;
@@ -4067,6 +4108,20 @@ private:
                                             n_deferred, n_past);
                                 }
                             }
+                        }
+
+                        // progressive apply: seed the peak tracker with the
+                        // resident at prefill start (the matched prefix minus
+                        // the holes already cut out of it). The per-batch
+                        // progressive cut (kv_holes_progressive_apply) raises
+                        // it as the head advances; the end-of-prefill summary
+                        // reports it.
+                        {
+                            int32_t ledger_span = 0;
+                            for (const auto & r : slot.kv_hole_ranges) {
+                                ledger_span += r.second - r.first;
+                            }
+                            slot.kv_hole_peak_resident = n_past - ledger_span;
                         }
 
                         // this is to signal the client that the request has started processing
@@ -4490,6 +4545,140 @@ private:
         }
 
         return true;
+    }
+
+    // kv-offload-holes progressive apply (prefill-time hole cutting): after
+    // each successful prompt sub-batch, cut the pending holes whose KV has
+    // been written so far. Without this, a (re-)prefill of a prompt whose
+    // evicted text is kept (Option B) writes every token to cells before the
+    // holes are cut at the next request's n_past check - the prefill peak is
+    // the raw prompt length, which exceeds a decoupled buffer B < n_ctx and
+    // hard-fails in find_slot ("Context size has been exceeded", 2026-10-06
+    // production journal, 66025 tokens vs B = 65536). Cutting as the head
+    // passes keeps the peak near the projected resident + one batch.
+    //
+    // Per hole, [max(lo, applied_until), min(hi, done)) is cut, where done is
+    // this slot's processed prefix length (its max processed position + 1).
+    // The batch path (STARTED block) already cut the holes fully inside the
+    // matched prefix (hi <= n_past) - they are in the applied ledger and are
+    // excluded here; this path handles the holes in the freshly re-prefilled
+    // region that the batch path deferred (hi > n_past).
+    //
+    // The cut reuses the production hole path (common_memory::seq_rm_checked,
+    // fail-open): a rejected cut - e.g. a recurrent-state hybrid whose state
+    // cannot roll back that far (rollback bounded by n_rs_seq) - keeps the
+    // progress and is retried as the head passes the hole (once the head is
+    // past it the cut is a plain untag). If it never cuts, the n_past path
+    // applies it on the next request (the hole's KV is then fully inside the
+    // matched prefix). A fully cut hole joins the applied ledger (drives the
+    // release() cache policy, the dense n_kv_max override, and the
+    // per-request re-plan idempotency).
+    void kv_holes_progressive_apply(int32_t n_processed) {
+        iterate(slots, [&](server_slot & slot) {
+            if (slot.kv_hole_shift_blocked) {
+                return; // the shift moved the KV - the hole coordinates are stale
+            }
+            if (slot.state != SLOT_STATE_PROCESSING_PROMPT && slot.state != SLOT_STATE_DONE_PROMPT) {
+                return; // generation batches carry no prompt tokens
+            }
+            if (!slot.task || slot.task->params.kv_hole_pending.empty()) {
+                return; // no holes planned - zero overhead for plain traffic
+            }
+
+            // this slot's processed prefix length: the max position of its
+            // prompt tokens in the processed part of the batch (+1). The
+            // matched prefix [0, n_past) is not in the batch (its KV already
+            // exists), so the first token of the round sits at n_past.
+            llama_pos max_pos = -1;
+            for (int32_t i = 0; i < n_processed; ++i) {
+                const auto & t = batch.tokens[i];
+                if (t.id_slot == slot.kv_seq() && t.is_prompt && t.pos > max_pos) {
+                    max_pos = t.pos;
+                }
+            }
+            if (max_pos < 0) {
+                return; // nothing of this slot's prompt processed yet
+            }
+            const llama_pos done = max_pos + 1;
+
+            // lazily build the per-hole progress ledger for this request:
+            // the pending holes minus the ones already in the applied ledger
+            // (cut by the batch path this request or in a previous one).
+            if (slot.kv_hole_progress.empty()) {
+                for (const auto & r : slot.task->params.kv_hole_pending) {
+                    bool applied = false;
+                    for (const auto & a : slot.kv_hole_ranges) {
+                        if (a.first == r.first && a.second == r.second) {
+                            applied = true;
+                            break;
+                        }
+                    }
+                    if (!applied) {
+                        slot.kv_hole_progress.push_back({ r.first, r.second, r.first });
+                    }
+                }
+            }
+
+            // resident = processed - cut so far (applied ledger + partial
+            // progress cuts); each hole is counted exactly once
+            int32_t cut_total = 0;
+            for (const auto & a : slot.kv_hole_ranges) {
+                cut_total += a.second - a.first;
+            }
+            for (const auto & h : slot.kv_hole_progress) {
+                cut_total += (int32_t) (h.applied_until - h.lo);
+            }
+
+            // the cell pressure is at write time: this batch's cells are
+            // already resident, and the cuts below only free cells for the
+            // next batch - measure the peak before cutting
+            const int32_t resident_pre = (int32_t) done - cut_total;
+            if (resident_pre > slot.kv_hole_peak_resident) {
+                slot.kv_hole_peak_resident = resident_pre;
+            }
+
+            for (size_t i = 0; i < slot.kv_hole_progress.size(); ++i) {
+                auto & h = slot.kv_hole_progress[i];
+                const llama_pos a = std::max(h.lo, h.applied_until);
+                // cut up to done-1, not done: a range with p1 > cell.pos
+                // (cell.pos = done-1 after this batch) straddles the
+                // recurrent tail and enters the rollback branch, which a
+                // hybrid rejects for big holes (rollback bounded by
+                // n_rs_seq). The lagging last token is picked up by the next
+                // round or the final n_past cut.
+                const llama_pos b = std::min(h.hi, done - 1);
+                if (b <= a) {
+                    continue;
+                }
+                if (!slot.mem.seq_rm_checked(slot.kv_seq(), a, b)) {
+                    // fail-open: keep the progress, retry as the head passes
+                    if (!h.fail_logged) {
+                        h.fail_logged = true;
+                        SLT_WRN(slot, "kv-offload-holes: progressive cut of [%d, %d) rejected at done=%d (seq %d) - retrying as the head passes; if it never cuts, the n_past path applies it on the next request\n",
+                                (int) a, (int) b, (int) done, (int) slot.kv_seq());
+                    }
+                    continue;
+                }
+                h.applied_until = b;
+                cut_total += (int32_t) (b - a);
+                if (b == h.hi) {
+                    // fully cut - join the applied ledger and stop tracking
+                    slot.kv_hole_ranges.push_back({ h.lo, h.hi });
+                    slot.kv_holes_active = true;
+                    slot.kv_hole_progress.erase(slot.kv_hole_progress.begin() + i);
+                    --i;
+                    SLT_INF(slot, "kv-offload-holes: progressive cut completed [%d, %d) at done=%d (seq %d)\n",
+                            (int) h.lo, (int) h.hi, (int) done, (int) slot.kv_seq());
+                }
+            }
+
+            const int32_t resident = (int32_t) done - cut_total;
+            if (resident > slot.kv_hole_peak_resident) {
+                slot.kv_hole_peak_resident = resident;
+            }
+            SLT_INF(slot, "kv-offload-holes: prefill progress - done=%d resident=%d (cut %d, peak %d, buffer %d)\n",
+                    (int) done, resident, cut_total, slot.kv_hole_peak_resident, params_base.kv_cache_size);
+        });
     }
 
     // Declarative Attention (W2 physical reduction): the per-batch n_kv_max
@@ -5544,6 +5733,15 @@ private:
 
                 // prompt evaluated for next-token prediction
                 slot.state = SLOT_STATE_GENERATING;
+
+                // kv-offload-holes: one-line summary of the prefill's KV peak
+                // (the progressive cut's success criterion:
+                // peak <= buffer - 16384 headroom).
+                if (!slot.task->params.kv_hole_pending.empty()) {
+                    SLT_INF(slot, "kv-offload-holes: prefill done - peak resident %d (buffer %d, prompt %d, applied holes %zu)\n",
+                            slot.kv_hole_peak_resident, params_base.kv_cache_size,
+                            (int) slot.prompt.n_tokens(), slot.kv_hole_ranges.size());
+                }
 
                 // Declarative Attention: apply the removals that were not applied
                 // mid-prefill (da_rm_at < 0, prompts containing media, or the

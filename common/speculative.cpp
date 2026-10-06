@@ -2642,6 +2642,13 @@ common_speculative_init_result::common_speculative_init_result(
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
+    // the KV buffer decoupling (--kv-cache-size) is a target-context feature:
+    // the hole cutting (progressive / n_past) runs only on the target context,
+    // while the draft context re-prefills the whole prompt densely - with the
+    // inherited buffer size a long prompt would overflow it, so the draft
+    // keeps the full n_ctx_seq
+    cparams.kv_cache_size = 0;
+
     if (spec_mtp) {
         cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
     }
