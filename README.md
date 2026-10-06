@@ -2,7 +2,7 @@
 
 focus-llama: 256k context, ~64k of VRAM, and up to ~35% faster decode than vanilla llama.cpp at the same context depth, by decoupling the physical KV buffer from the context window, offloading old chunks to a store, and recalling them on demand.
 
-<img src="media/kv_buffer_vanilla_vs_focus_llama.svg" style="background:white" alt="focus-llama: KV buffer for a 200k-token prompt">
+<img src="media/kv_buffer_vanilla_vs_focus_llama.svg" alt="focus-llama: KV buffer for a 200k-token prompt">
 
 *KV buffer for a 200k-token prompt (-c 200000). The prompt text is identical in all three cases and lives in RAM. (A) Vanilla llama.cpp allocates 200k KV cells and fills all of them. (B) Before buffer decoupling, focus-llama still reserves 200k cells, but only the ~30k-token hot window is resident, so most of the allocation sits empty. (C) After decoupling, the physical buffer is capped at 80k cells: the 30k hot window plus 30k of retained headroom and free cells. Evicted text moves to the focus-memory store, is refilled on demand, and its session state is kept as Σ skill.state.*
 
