@@ -7212,9 +7212,20 @@ struct da_auto_layout {
     size_t n_source_msgs = 0;
 };
 
+// kv-offload (Option B, --kv-offload-holes): one evicted message's original-text
+// char range plus its one-line hint. da_auto_chunk records which magic chunk
+// number(s) each bound's message occupies and exposes them in the DA
+// instruction, so the model can pick the right chunk for
+// <focus magic_chunks="N"> instead of guessing (the 2026-10-06 848fe9ee leak:
+// magic_chunks="2" was a blind guess - the holed chunk headers are invisible).
+struct da_evict_bound {
+    size_t      lo = 0, hi = 0;
+    std::string hint;
+};
+
 static da_auto_layout da_auto_chunk(const llama_vocab * vocab, const std::string & text, int32_t da_chunk_tokens,
         const std::vector<std::string> & offloaded_hints = {},
-        const std::vector<std::pair<size_t, size_t>> & evict_bounds = {}) {
+        const std::vector<da_evict_bound> & evict_bounds = {}) {
     da_auto_layout out;
 
     // chat template message boundaries: <\|im_start\|>ROLE\n
@@ -7378,12 +7389,16 @@ static da_auto_layout da_auto_chunk(const llama_vocab * vocab, const std::string
     // the next chunk). evict_bounds are the evicted messages' char ranges in
     // the original text space; a piece is evicted when its content range sits
     // inside one of them (the content range is a subset of the message range).
-    const auto is_evicted = [&](size_t lo, size_t hi) -> bool {
-        for (const auto & eb : evict_bounds) {
-            if (eb.first <= lo && hi <= eb.second) return true;
+    const auto evict_index = [&](size_t lo, size_t hi) -> int32_t {
+        for (size_t i = 0; i < evict_bounds.size(); i++) {
+            if (evict_bounds[i].lo <= lo && hi <= evict_bounds[i].hi) return (int32_t) i;
         }
-        return false;
+        return -1;
     };
+    const auto is_evicted = [&](size_t lo, size_t hi) -> bool { return evict_index(lo, hi) >= 0; };
+    // chunk number span per evict bound: (first, last), {0,0} = not packed.
+    // Feeds the holed-chunk manifest in the DA instruction (Option B).
+    std::vector<std::pair<int32_t, int32_t>> evict_chunk_span(evict_bounds.size(), { 0, 0 });
 
     std::vector<std::pair<size_t, int32_t>> ins;  // (original pos, chunk number)
     int32_t n_chunks = 0;
@@ -7401,7 +7416,9 @@ static da_auto_layout da_auto_chunk(const llama_vocab * vocab, const std::string
         if (is_evicted(lo, hi)) {
             // evicted piece: its own chunk (close any open chunk first) so the
             // hole boundary coincides with the chunk boundary
+            const int32_t which = evict_index(lo, hi);
             close_cur();
+            const int32_t first_num = n_chunks + 1;
             if (n_tok(text.substr(lo, hi - lo)) <= hard_cap) {
                 n_chunks++;
                 ins.push_back({ lo, n_chunks });
@@ -7411,6 +7428,9 @@ static da_auto_layout da_auto_chunk(const llama_vocab * vocab, const std::string
                     n_chunks++;
                     ins.push_back({ r.first, n_chunks });
                 }
+            }
+            if (which >= 0) {
+                evict_chunk_span[(size_t) which] = { first_num, n_chunks };
             }
             continue;
         }
@@ -7479,6 +7499,32 @@ static da_auto_layout da_auto_chunk(const llama_vocab * vocab, const std::string
                          " were offloaded (their text is not shown above). Focus one to re-load it before reading:\n";
         for (int32_t i = 0; i < n_offloaded; i++) {
             offloaded_note += "  - chunk " + std::to_string(n_chunks + 1 + i) + ": " + offloaded_hints[(size_t) i] + "\n";
+        }
+    }
+    // kv-offload (Option B, --kv-offload-holes): the evicted messages stay in
+    // the prompt as real magic chunks, but their KV is holed - neither their
+    // text nor their [Magic Chunk N] headers is visible in global mode.
+    // Expose the holed chunk numbers + a preview so the model picks the right
+    // chunk for <focus magic_chunks="N"> (the holed re-prefill path re-loads
+    // it on demand). Without this the model focuses blindly - the 2026-10-06
+    // 848fe9ee leak (magic_chunks="2" guessed, wrong content re-prefilled).
+    if (!evict_bounds.empty()) {
+        int32_t lo_c = 0, hi_c = 0;
+        for (const auto & sp : evict_chunk_span) {
+            if (sp.first == 0) continue;
+            lo_c = (lo_c == 0) ? sp.first : std::min(lo_c, sp.first);
+            hi_c = std::max(hi_c, sp.second);
+        }
+        if (lo_c > 0) {
+            offloaded_note += "\nChunks " + std::to_string(lo_c) + "-" + std::to_string(hi_c) +
+                              " were offloaded (their text is not visible). Focus one to re-load it before reading:\n";
+            for (size_t i = 0; i < evict_bounds.size(); i++) {
+                const auto & sp = evict_chunk_span[i];
+                if (sp.first == 0) continue;
+                offloaded_note += (sp.first == sp.second)
+                        ? "  - chunk " + std::to_string(sp.first) + ": " + evict_bounds[i].hint + "\n"
+                        : "  - chunks " + std::to_string(sp.first) + "-" + std::to_string(sp.second) + ": " + evict_bounds[i].hint + "\n";
+            }
         }
     }
     const std::string instruction =
@@ -7919,14 +7965,15 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     }
                 }
                 // Option B (--kv-offload-holes): pass the evicted messages' char
-                // ranges so da_auto_chunk gives each evicted message its own
-                // chunk (the hole boundary then coincides with the chunk
-                // boundary). Empty otherwise - the packing is unchanged.
-                std::vector<std::pair<size_t, size_t>> evict_bounds;
+                // ranges + hints so da_auto_chunk gives each evicted message its
+                // own chunk (the hole boundary then coincides with the chunk
+                // boundary) and exposes the holed chunk numbers in the DA
+                // instruction. Empty otherwise - the packing is unchanged.
+                std::vector<da_evict_bound> evict_bounds;
                 if (params.kv_offload_holes) {
                     evict_bounds.reserve(evicted_segs.size());
                     for (const auto & seg : evicted_segs) {
-                        evict_bounds.push_back({ seg.range_lo, seg.range_hi });
+                        evict_bounds.push_back({ seg.range_lo, seg.range_hi, seg.hint });
                     }
                 }
                 const da_auto_layout layout =
