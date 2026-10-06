@@ -7213,7 +7213,8 @@ struct da_auto_layout {
 };
 
 static da_auto_layout da_auto_chunk(const llama_vocab * vocab, const std::string & text, int32_t da_chunk_tokens,
-        const std::vector<std::string> & offloaded_hints = {}) {
+        const std::vector<std::string> & offloaded_hints = {},
+        const std::vector<std::pair<size_t, size_t>> & evict_bounds = {}) {
     da_auto_layout out;
 
     // chat template message boundaries: <\|im_start\|>ROLE\n
@@ -7368,6 +7369,22 @@ static da_auto_layout da_auto_chunk(const llama_vocab * vocab, const std::string
         }
     }
 
+    // kv-offload (Option B, --kv-offload-holes): an evicted piece is always its
+    // own chunk, so the KV hole (the evicted message) aligns with the chunk
+    // boundary. Without this the greedy packing can pack an evicted message
+    // with an adjacent non-evicted one (e.g. the pinned task), and the hole
+    // cuts through the middle of the chunk - the 2026-10-06 context-loss
+    // incident (hole 1 cut the task chunk's tail, hole 2's head spilled into
+    // the next chunk). evict_bounds are the evicted messages' char ranges in
+    // the original text space; a piece is evicted when its content range sits
+    // inside one of them (the content range is a subset of the message range).
+    const auto is_evicted = [&](size_t lo, size_t hi) -> bool {
+        for (const auto & eb : evict_bounds) {
+            if (eb.first <= lo && hi <= eb.second) return true;
+        }
+        return false;
+    };
+
     std::vector<std::pair<size_t, int32_t>> ins;  // (original pos, chunk number)
     int32_t n_chunks = 0;
     size_t cur_lo = 0;
@@ -7381,6 +7398,22 @@ static da_auto_layout da_auto_chunk(const llama_vocab * vocab, const std::string
     };
     for (const auto & pc : pieces) {
         const size_t lo = pc.first, hi = pc.second;
+        if (is_evicted(lo, hi)) {
+            // evicted piece: its own chunk (close any open chunk first) so the
+            // hole boundary coincides with the chunk boundary
+            close_cur();
+            if (n_tok(text.substr(lo, hi - lo)) <= hard_cap) {
+                n_chunks++;
+                ins.push_back({ lo, n_chunks });
+            } else {
+                // one piece alone over the hard cap: split hierarchically
+                for (auto & r : split_range(lo, hi, 0)) {
+                    n_chunks++;
+                    ins.push_back({ r.first, n_chunks });
+                }
+            }
+            continue;
+        }
         if (cur_open && n_tok(text.substr(cur_lo, hi - cur_lo)) <= da_chunk_tokens) {
             continue;  // fits: extend the open chunk over the message boundary
         }
@@ -7885,8 +7918,19 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                                 (int) params.kv_offload, (int) params.focus_memory_host.empty());
                     }
                 }
+                // Option B (--kv-offload-holes): pass the evicted messages' char
+                // ranges so da_auto_chunk gives each evicted message its own
+                // chunk (the hole boundary then coincides with the chunk
+                // boundary). Empty otherwise - the packing is unchanged.
+                std::vector<std::pair<size_t, size_t>> evict_bounds;
+                if (params.kv_offload_holes) {
+                    evict_bounds.reserve(evicted_segs.size());
+                    for (const auto & seg : evicted_segs) {
+                        evict_bounds.push_back({ seg.range_lo, seg.range_hi });
+                    }
+                }
                 const da_auto_layout layout =
-                        da_auto_chunk(ctx_server.vocab, da_prompt, params.da_chunk_tokens, offloaded_hints);
+                        da_auto_chunk(ctx_server.vocab, da_prompt, params.da_chunk_tokens, offloaded_hints, evict_bounds);
                 if (layout.ok) {
                     const llama_tokens  toks = common_tokenize(ctx_server.vocab, layout.modified, true, true);
                     const std::vector<size_t> offs = da_token_offsets_lenient(ctx_server.vocab, layout.modified, toks);
