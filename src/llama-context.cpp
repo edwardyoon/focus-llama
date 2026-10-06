@@ -130,6 +130,7 @@ llama_context::llama_context(
     cparams.pooling_type      = params.pooling_type;
 
     cparams.n_ctx            = params.n_ctx           == 0    ? hparams.n_ctx_train           : params.n_ctx;
+    cparams.kv_cache_size    = params.kv_cache_size;
     cparams.rope_freq_base   = params.rope_freq_base  == 0.0f ? hparams.rope_freq_base_train  : params.rope_freq_base;
     cparams.rope_freq_scale  = params.rope_freq_scale == 0.0f ? hparams.rope_freq_scale_train : params.rope_freq_scale;
 
@@ -3697,6 +3698,7 @@ llama_context_params llama_context_default_params() {
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
+        /*.kv_cache_size               =*/ 0,
     };
 
     return result;

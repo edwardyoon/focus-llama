@@ -1585,6 +1585,38 @@ private:
             SRV_TRC("%s", "speculative decoding will use checkpoints\n");
         }
 
+        // kv-offload buffer decoupling: startup validation.
+        // (3c) a decoupled buffer (B > 0) smaller than the logical context only
+        //      works with the eviction mechanism (kv_offload + focus-memory host);
+        //      without it nothing can be evicted, so a prompt longer than B
+        //      hard-fails in find_slot - reject. (B >= n_ctx needs no eviction:
+        //      the buffer covers the whole position range.)
+        if (params_base.kv_cache_size > 0 &&
+                params_base.kv_cache_size < params_base.n_ctx &&
+                !(params_base.kv_offload && !params_base.focus_memory_host.empty())) {
+            SRV_ERR("kv_offload: buffer %d cells < n_ctx %d without the eviction path (--kv-offload-threshold + --fm-offload host) - prompts longer than the buffer hard-fail (find_slot); enable eviction or raise --kv-cache-size\n",
+                    params_base.kv_cache_size, params_base.n_ctx);
+            return false;
+        }
+        // (a) the buffer must hold the hot window (threshold) + headroom even with
+        //     retain = 0; below that no retain value is safe - reject.
+        if (params_base.kv_offload && params_base.kv_cache_size > 0 &&
+                params_base.kv_cache_size < params_base.kv_offload_threshold + 16384) {
+            SRV_ERR("kv_offload: buffer %d cells < threshold %d + headroom 16384 - the hot window alone exceeds the buffer (find_slot failure); raise --kv-cache-size or lower --kv-offload-threshold\n",
+                    params_base.kv_cache_size, params_base.kv_offload_threshold);
+            return false;
+        }
+        // (c) the buffer cannot hold threshold + retain + headroom: the runtime
+        //     clamp shrinks the effective retain - warn with the clamped value.
+        if (params_base.kv_offload && params_base.kv_cache_size > 0 &&
+                params_base.kv_cache_size <
+                params_base.kv_offload_threshold + params_base.kv_retain_tokens + 16384) {
+            SRV_WRN("kv_offload: buffer %d cells < threshold %d + retain %d + headroom 16384 - effective retain clamped to %d (find_slot failure risk if pin is large)\n",
+                    params_base.kv_cache_size, params_base.kv_offload_threshold,
+                    params_base.kv_retain_tokens,
+                    params_base.kv_cache_size - 16384 - params_base.kv_offload_threshold);
+        }
+
         // setup slots
         SRV_INF("initializing, n_slots = %d, n_ctx_slot = %d, kv_unified = '%s'\n",
                 params_base.n_parallel, n_ctx_slot(), params_base.kv_unified ? "true" : "false");
@@ -6622,7 +6654,7 @@ static std::string rc_tag_ident(const char * t) {
 static const std::unordered_set<std::string> & recall_tag_names(const llama_vocab * vocab) {
     static const std::unordered_set<std::string> names = [vocab]() {
         std::unordered_set<std::string> s = {
-            "tool_call", "tool_response", "tools", "function", "parameter",
+            "tool_call", "tool_response", "tools", "function", "parameter",  "functions",
             "think", "thinking", "invoke",
             "function_calls", "function_results", "tool_use", "tool_result",
             "focus", "local", "global", "recap", "recall",
@@ -6883,8 +6915,9 @@ static bool kv_offload_evict(
         int32_t total_tokens,
         int32_t threshold,
         std::vector<kv_offload_evict_segment> & out_segments,
-        bool release_pin = false) {
-    if (threshold <= 0 || total_tokens <= threshold) return false;
+        bool release_pin = false,
+        int32_t retain = 0) {
+    if (threshold <= 0 || total_tokens <= threshold + retain) return false;
 
     struct msg_t { size_t start; size_t role_end; std::string role; };
     std::vector<msg_t> msgs;
@@ -6919,7 +6952,8 @@ static bool kv_offload_evict(
         return { lo, hi };
     };
 
-    // Evict from the oldest middle message forward until under the threshold.
+    // Evict from the oldest middle message forward until under the threshold
+    // + retain margin (retain = minimum recent tokens kept in the KV, 0 = current).
     // The system message (index 0) is never evicted. The first user message
     // (the task anchor) is pinned by default - eviction starts after it;
     // with release_pin it becomes a normal candidate (eviction starts at it).
@@ -6928,7 +6962,7 @@ static bool kv_offload_evict(
     int32_t remaining = total_tokens;
     std::vector<size_t> evict_idx;
     for (size_t i = evict_start; i < last_user; i++) {
-        if (remaining <= threshold) break;
+        if (remaining <= threshold + retain) break;
         auto [lo, hi] = msg_range(i);
         if (hi <= lo) continue;
         evict_idx.push_back(i);
@@ -7457,21 +7491,65 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                                     kv_session.c_str());
                         }
                     }
+                    // task 15: clamp the evict stop target (threshold + retain) to the
+                    // physical buffer capacity minus headroom, so we never plan to keep
+                    // more cells in the KV than the buffer can hold. B = kv_cache_size
+                    // (0 = default, no clamp); headroom = 16384. The clamped target is
+                    // fed back as an effective retain (target - threshold) for
+                    // kv_offload_evict.
+                    const int32_t kv_target_unclamped = params.kv_offload_threshold + params.kv_retain_tokens;
+                    // 10-06 fix: lower bound at the threshold (N) - when B - 16384 < N
+                    // the clamp must not push the stop target below the hot window
+                    // (evicting below the threshold would break the gate).
+                    const int32_t kv_target = (params.kv_cache_size > 0)
+                            ? std::max(std::min(kv_target_unclamped, params.kv_cache_size - 16384),
+                                       params.kv_offload_threshold)
+                            : kv_target_unclamped;
+                    if (kv_target < kv_target_unclamped) {
+                        static std::atomic<bool> kv_offload_target_clamped_warned{false};
+                        if (!kv_offload_target_clamped_warned.exchange(true)) {
+                            SRV_INF("kv_offload: retain target clamped %d -> %d (buffer=%d, headroom=16384) - buffer limits KV-resident tokens\n",
+                                    kv_target_unclamped, kv_target, params.kv_cache_size);
+                        }
+                    }
+                    int32_t kv_retain_eff = kv_target - params.kv_offload_threshold;
                     // Diagnostic: config state + current token count vs threshold, so
                     // the journal shows exactly why eviction does or does not fire
                     // (was the flag parsed? threshold reached? host set? pin released?).
-                    SRV_INF("kv_offload: gate - threshold=%d host=%s tokens=%d session=%s pin_released=%d\n",
-                            params.kv_offload_threshold, params.focus_memory_host.c_str(),
-                            (int) task.tokens.size(), kv_session.c_str(), (int) release_pin);
+                    // task 17: gate log now carries the effective retain/target and the
+                    // physical buffer so the journal shows the full evict budget.
+                    SRV_INF("kv_offload: gate - threshold=%d retain=%d target=%d buffer=%d tokens=%d host=%s session=%s pin_released=%d\n",
+                            params.kv_offload_threshold, kv_retain_eff, kv_target, params.kv_cache_size,
+                            (int) task.tokens.size(), params.focus_memory_host.c_str(),
+                            kv_session.c_str(), (int) release_pin);
                     std::vector<kv_offload_evict_segment> evict_segs;
                     if (kv_offload_evict(ctx_server.vocab, da_prompt, (int32_t) task.tokens.size(),
-                                         params.kv_offload_threshold, evict_segs, release_pin)) {
+                                         params.kv_offload_threshold, evict_segs, release_pin,
+                                         kv_retain_eff)) {
                         // Diagnostic: the eviction plan (n segments, tokens each).
                         {
                             int32_t plan_tokens = 0;
                             for (auto & seg : evict_segs) plan_tokens += seg.tokens;
                             SRV_INF("kv_offload: evict plan - %zu segment(s), ~%d token(s) to offload\n",
                                     evict_segs.size(), plan_tokens);
+                            // task 16 (10-06 fix): buffer pressure judged from the
+                            // post-plan projection, not the raw prompt size. In holes
+                            // mode the evicted text stays in the prompt, so the raw
+                            // prompt count grows without bound while the KV-resident
+                            // cells stay near the target - a raw-prompt pre-plan
+                            // override would fire forever and kill retain. The clamp
+                            // already bounds the stop target to B - 16384, so this
+                            // fires only when the plan cannot reach the target (pin +
+                            // hot window + delta exceed the buffer): the unrecoverable
+                            // case. One-shot warning.
+                            if (params.kv_cache_size > 0 &&
+                                (int64_t) task.tokens.size() - plan_tokens > (int64_t) params.kv_cache_size - 16384) {
+                                static std::atomic<bool> kv_offload_pressure_warned{false};
+                                if (!kv_offload_pressure_warned.exchange(true)) {
+                                    SRV_WRN("kv_offload: buffer pressure (projected resident=%d > buffer=%d - headroom=16384) - pin + hot window + delta exceed the buffer even after the evict plan (find_slot failure risk)\n",
+                                            (int) ((int64_t) task.tokens.size() - plan_tokens), params.kv_cache_size);
+                                }
+                            }
                         }
                         std::vector<std::pair<size_t, size_t>> evicted_ranges;
                         // Per-session uploaded-key cache (Option B re-PUT elimination):
@@ -7520,6 +7598,18 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                                 evicted_segs.push_back(seg);
                             } else {
                                 SRV_WRN("kv_offload: PUT failed for key=%s - keeping segment in prompt\n", seg.key.c_str());
+                                // 3a (10-06): store-down + decoupled buffer - the
+                                // failed segment stays in the prompt (fail-open), so
+                                // the full prompt must fit the physical buffer B.
+                                // With B < n_ctx a long prompt hard-fails in
+                                // find_slot: the store is a hard dependency in
+                                // decoupled mode. One-shot warning.
+                                if (params.kv_cache_size > 0) {
+                                    static std::atomic<bool> kv_offload_store_down_warned{false};
+                                    if (!kv_offload_store_down_warned.exchange(true)) {
+                                        SRV_WRN("kv_offload: store down with a decoupled buffer (B=%d) - failed segments stay in the prompt and the full prompt must fit B (find_slot failure risk); FocusMemory store is a hard dependency in decoupled mode\n", params.kv_cache_size);
+                                    }
+                                }
                             }
                         }
                         if (!evicted_ranges.empty()) {

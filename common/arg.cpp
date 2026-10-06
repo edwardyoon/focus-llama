@@ -1773,6 +1773,26 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_OFFLOAD_THRESHOLD").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
+        {"--kv-cache-size"}, "N",
+        "physical KV buffer size in cells for the attention cache (0 = default: n_ctx_seq); decoupled from the logical position range - cells wrap while positions extend to -c",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("error: --kv-cache-size must be >= 0 (got " + std::to_string(value) + ")");
+            }
+            params.kv_cache_size = value;
+        }
+    ).set_env("LLAMA_ARG_KV_CACHE_SIZE").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        {"--kv-retain-tokens"}, "N",
+        "kv_offload: minimum number of recent tokens to keep in the KV cache beyond --kv-offload-threshold when evicting (0 = current behavior: evict down to the threshold only; default: 0)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("error: --kv-retain-tokens must be >= 0 (got " + std::to_string(value) + ")");
+            }
+            params.kv_retain_tokens = value;
+        }
+    ).set_env("LLAMA_ARG_KV_RETAIN_TOKENS").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
         {"--kv-offload-holes"},
         {"--no-kv-offload-holes"},
         "kv_offload Option B: keep the evicted segments in the prompt and cut their KV out of the main sequence (seq_rm holes) instead of reducing the prompt text - the client keeps sending the full prompt and the next request re-prefills 1 token instead of the evicted tail (default: disabled)",

@@ -417,6 +417,11 @@ extern "C" {
         // a source/target/parent context
         // can be utilized in various ways, for example by sharing results or llama_memory between 2 contexts
         struct llama_context * ctx_other;
+
+        // physical KV buffer size in cells for the attention cache (0 = default: n_ctx_seq).
+        // decoupled from the logical position range: the buffer is allocated at this size and
+        // cells wrap around while positions may extend up to n_ctx
+        uint32_t kv_cache_size;
     };
 
     struct llama_model_tensor_override {

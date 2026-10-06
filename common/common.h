@@ -653,6 +653,8 @@ struct common_params {
     // prefills them on demand. focus_memory_host empty = feature off (fail-open).
     bool        kv_offload           = false;
     int32_t     kv_offload_threshold = 150000; // evict oldest chunks at this prompt length (tokens)
+    int32_t     kv_cache_size        = 0;      // physical KV buffer budget in cells (0 = default: n_ctx_seq); decoupled from the logical position range
+    int32_t     kv_retain_tokens     = 0;      // kv_offload: minimum recent tokens kept beyond the evict threshold (0 = unlimited, current behavior)
     std::string focus_memory_host    = "";     // FocusMemory base URL (e.g. http://127.0.0.1:3900)
     std::string focus_memory_token   = "";     // FocusMemory Bearer token for evict/recall (empty = no auth header)
     // Option B (seq_rm hole kv offload): when set with --fm-offload, the evicted
