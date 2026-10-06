@@ -1774,6 +1774,19 @@ private:
                     params_base.kv_retain_tokens,
                     params_base.kv_cache_size - 16384 - params_base.kv_offload_threshold);
         }
+        // (d) the buffer cannot even hold threshold + gen tail + headroom: the
+        //     clamp degenerates (effective retain -> 0) and the reject gate fails
+        //     every request regardless of eviction - warn with the minimum
+        //     required buffer.
+        if (params_base.kv_offload && params_base.kv_cache_size > 0 &&
+                params_base.kv_cache_size <
+                params_base.kv_offload_threshold + params_base.n_predict + 16384) {
+            SRV_WRN("kv_offload: buffer %d cells < threshold %d + n_predict %d + headroom 16384 - minimum required buffer is %d; even with perfect eviction the generation tail exceeds the budget (400 on every request); raise --kv-cache-size to >= %d or lower --kv-offload-threshold/--n-predict\n",
+                    params_base.kv_cache_size, params_base.kv_offload_threshold,
+                    params_base.n_predict,
+                    params_base.kv_offload_threshold + params_base.n_predict + 16384,
+                    params_base.kv_offload_threshold + params_base.n_predict + 16384);
+        }
 
         // setup slots
         SRV_INF("initializing, n_slots = %d, n_ctx_slot = %d, kv_unified = '%s'\n",
@@ -8153,13 +8166,26 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     // fed back as an effective retain (target - threshold) for
                     // kv_offload_evict.
                     const int32_t kv_target_unclamped = params.kv_offload_threshold + params.kv_retain_tokens;
+                    // gen budget: same expression as the reject lambda below (request
+                    // n_predict if > 0, else params.n_predict).
+                    const int64_t n_predict_eff = task.params.n_predict != -1 ? task.params.n_predict : params.n_predict;
+                    const int64_t gen_cost = n_predict_eff > 0 ? n_predict_eff : 0;
                     // 10-06 fix: lower bound at the threshold (N) - when B - 16384 < N
                     // the clamp must not push the stop target below the hot window
                     // (evicting below the threshold would break the gate).
-                    const int32_t kv_target = (params.kv_cache_size > 0)
-                            ? std::max(std::min(kv_target_unclamped, params.kv_cache_size - 16384),
-                                       params.kv_offload_threshold)
-                            : kv_target_unclamped;
+                    int32_t kv_target;
+                    if (params.kv_cache_size > 0) {
+                        // 10-07 fix: the clamp must also reserve the gen tail so the
+                        // eviction target matches the reject gate's projection
+                        // (target + gen <= B - 16384); without it a prompt with
+                        // resident in (B - 16384 - gen, N + M] skipped eviction
+                        // (nothing to recall) and was then rejected.
+                        const int64_t resident_ceiling = (int64_t) params.kv_cache_size - 16384 - gen_cost;
+                        kv_target = std::max((int32_t) std::min<int64_t>(kv_target_unclamped, resident_ceiling),
+                                             params.kv_offload_threshold);
+                    } else {
+                        kv_target = kv_target_unclamped;
+                    }
                     if (kv_target < kv_target_unclamped) {
                         static std::atomic<bool> kv_offload_target_clamped_warned{false};
                         if (!kv_offload_target_clamped_warned.exchange(true)) {
@@ -8191,8 +8217,8 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                         for (const auto & seg : evicted_segs) {
                             if (seg.tokens > recall_cost) recall_cost = seg.tokens;
                         }
-                        const int64_t n_predict_eff = task.params.n_predict != -1 ? task.params.n_predict : params.n_predict;
-                        const int64_t gen_cost = n_predict_eff > 0 ? n_predict_eff : 0;
+                        // n_predict_eff / gen_cost are the hoisted clamp-scope values
+                        // (single source of truth shared with the eviction clamp).
                         const int64_t resident = (int64_t) task.tokens.size() - evicted_tokens;
                         const int64_t projected = resident + recall_cost + gen_cost;
                         if (projected <= (int64_t) params.kv_cache_size - 16384) return false;
@@ -8211,9 +8237,11 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                                 ERROR_TYPE_UNAVAILABLE));
                         } else {
                             res->error(format_error_response(
-                                string_format("prompt does not fit the decoupled KV buffer: %d projected tokens (resident %d + max recall %d + generation %d) exceed --kv-cache-size %d minus the 16384 headroom (pin + hot window + delta too large). Increase --kv-cache-size or lower --kv-offload-threshold/--kv-retain-tokens.",
+                                string_format("prompt does not fit the decoupled KV buffer: %d projected tokens (resident %d + max recall %d + generation %d) exceed --kv-cache-size %d minus the 16384 headroom (pin + hot window + delta too large). Minimum required buffer is %d (threshold %d + n_predict %d + headroom 16384); raise --kv-cache-size to at least that, or lower --kv-offload-threshold/--n-predict - lowering --kv-retain-tokens alone is often ineffective because the clamp already bounds the resident target.",
                                               (int) projected, (int) resident, (int) recall_cost, (int) gen_cost,
-                                              params.kv_cache_size),
+                                              params.kv_cache_size,
+                                              (int) ((int64_t) params.kv_offload_threshold + n_predict_eff + 16384),
+                                              (int) params.kv_offload_threshold, (int) n_predict_eff),
                                 ERROR_TYPE_EXCEED_CONTEXT_SIZE));
                         }
                         return true;
