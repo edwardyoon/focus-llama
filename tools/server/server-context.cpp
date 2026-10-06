@@ -7522,35 +7522,43 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                             params.kv_offload_threshold, kv_retain_eff, kv_target, params.kv_cache_size,
                             (int) task.tokens.size(), params.focus_memory_host.c_str(),
                             kv_session.c_str(), (int) release_pin);
+                    // Returns true if the request was rejected (res already holds the error).
+                    auto reject_if_over_buffer = [&](int64_t evicted_tokens, int32_t planned_tokens, bool put_failed) -> bool {
+                        if (params.kv_cache_size <= 0) return false;
+                        const int64_t projected = (int64_t) task.tokens.size() - evicted_tokens;
+                        if (projected <= (int64_t) params.kv_cache_size - 16384) return false;
+
+                        SRV_WRN("kv_offload: rejecting request - projected KV-resident %d tokens exceeds buffer %d - headroom 16384 (evicted %d of planned %d, put_failed=%d, session=%s)\n",
+                                (int) projected, params.kv_cache_size, (int) evicted_tokens,
+                                (int) planned_tokens, (int) put_failed, kv_session.c_str());
+
+                        if (put_failed) {
+                            // store problem: retryable, must not look like "context too long"
+                            res->error(format_error_response(
+                                string_format("FocusMemory store unavailable: %d KV-resident tokens exceed --kv-cache-size %d minus the 16384 headroom because evicted segments could not be offloaded. Restore the store and retry.",
+                                              (int) projected, params.kv_cache_size),
+                                ERROR_TYPE_UNAVAILABLE));
+                        } else {
+                            res->error(format_error_response(
+                                string_format("prompt does not fit the decoupled KV buffer: projected KV-resident %d tokens exceeds --kv-cache-size %d minus the 16384 headroom (pin + hot window + delta too large). Increase --kv-cache-size or lower --kv-offload-threshold/--kv-retain-tokens.",
+                                              (int) projected, params.kv_cache_size),
+                                ERROR_TYPE_EXCEED_CONTEXT_SIZE));
+                        }
+                        return true;
+                    };
                     std::vector<kv_offload_evict_segment> evict_segs;
+                    // Optimistic pre-PUT projection (all planned segments evicted).
+                    // The authoritative capacity check after the evict if/else uses
+                    // the actually-evicted count instead, so a failed PUT (segment
+                    // kept in the prompt, fail-open) is reflected in the judgment.
+                    int32_t plan_tokens = 0;
                     if (kv_offload_evict(ctx_server.vocab, da_prompt, (int32_t) task.tokens.size(),
                                          params.kv_offload_threshold, evict_segs, release_pin,
                                          kv_retain_eff)) {
                         // Diagnostic: the eviction plan (n segments, tokens each).
-                        {
-                            int32_t plan_tokens = 0;
-                            for (auto & seg : evict_segs) plan_tokens += seg.tokens;
-                            SRV_INF("kv_offload: evict plan - %zu segment(s), ~%d token(s) to offload\n",
-                                    evict_segs.size(), plan_tokens);
-                            // task 16 (10-06 fix): buffer pressure judged from the
-                            // post-plan projection, not the raw prompt size. In holes
-                            // mode the evicted text stays in the prompt, so the raw
-                            // prompt count grows without bound while the KV-resident
-                            // cells stay near the target - a raw-prompt pre-plan
-                            // override would fire forever and kill retain. The clamp
-                            // already bounds the stop target to B - 16384, so this
-                            // fires only when the plan cannot reach the target (pin +
-                            // hot window + delta exceed the buffer): the unrecoverable
-                            // case. One-shot warning.
-                            if (params.kv_cache_size > 0 &&
-                                (int64_t) task.tokens.size() - plan_tokens > (int64_t) params.kv_cache_size - 16384) {
-                                static std::atomic<bool> kv_offload_pressure_warned{false};
-                                if (!kv_offload_pressure_warned.exchange(true)) {
-                                    SRV_WRN("kv_offload: buffer pressure (projected resident=%d > buffer=%d - headroom=16384) - pin + hot window + delta exceed the buffer even after the evict plan (find_slot failure risk)\n",
-                                            (int) ((int64_t) task.tokens.size() - plan_tokens), params.kv_cache_size);
-                                }
-                            }
-                        }
+                        for (auto & seg : evict_segs) plan_tokens += seg.tokens;
+                        SRV_INF("kv_offload: evict plan - %zu segment(s), ~%d token(s) to offload\n",
+                                evict_segs.size(), plan_tokens);
                         std::vector<std::pair<size_t, size_t>> evicted_ranges;
                         // Per-session uploaded-key cache (Option B re-PUT elimination):
                         // the PUT is idempotent (key = FNV-1a content hash of the segment
@@ -7612,6 +7620,28 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                                 }
                             }
                         }
+                        // Authoritative post-PUT capacity check (replaces the
+                        // optimistic pre-PUT projection): only the segments whose
+                        // PUT succeeded (or were cached) are actually evicted; a
+                        // failed PUT keeps its segment in the prompt (fail-open),
+                        // so the projected KV-resident count is larger than the
+                        // plan assumed. If it exceeds the buffer minus the 16k
+                        // headroom, the request cannot fit the decoupled KV
+                        // buffer - reject now with a clear error instead of dying
+                        // later in find_slot ("no slot available"). Covers both
+                        // the store-down case (PUTs fail, full prompt must fit B)
+                        // and the pin+hot+delta > B case (nothing evictable is
+                        // enough).
+                        int64_t evicted_tokens = 0;
+                        for (auto & seg : evicted_segs) evicted_tokens += seg.tokens;
+                        // Temporary diagnostic: verify evicted_segs is cumulative (cache-hit
+                        // keys re-planned each request must be counted) - planned == evicted
+                        // in normal sessions. Remove once confirmed.
+                        SRV_INF("kv_offload: evict result - planned=%d evicted=%d segs=%zu/%zu\n",
+                                (int) plan_tokens, (int) evicted_tokens, evicted_segs.size(), evict_segs.size());
+                        if (reject_if_over_buffer(evicted_tokens, plan_tokens, evicted_tokens < plan_tokens)) {
+                            return res;
+                        }
                         if (!evicted_ranges.empty()) {
                             if (params.kv_offload_holes) {
                                 // Option B: keep the evicted text in the prompt. The
@@ -7641,6 +7671,11 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                         // or no evictable middle messages) - the common steady state.
                         SRV_INF("kv_offload: no eviction planned (tokens=%d, threshold=%d)\n",
                                 (int) task.tokens.size(), params.kv_offload_threshold);
+                        // Nothing evicted: everything stays resident (pin / last turn
+                        // alone may exceed B) - run the same capacity check.
+                        if (reject_if_over_buffer(0, 0, false)) {
+                            return res;
+                        }
                     }
                 } else {
                     // Diagnostic (one-time): kv-offload configured off - the flag was
