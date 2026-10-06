@@ -4161,6 +4161,15 @@ llama_pos llama_memory_seq_pos_max(
     return mem->seq_pos_max(seq_id);
 }
 
+int32_t llama_memory_n_free_cells(
+        llama_memory_t mem) {
+    if (!mem) {
+        return -1;
+    }
+
+    return mem->n_free_cells();
+}
+
 bool llama_memory_can_shift(llama_memory_t mem) {
     if (!mem) {
         return false;

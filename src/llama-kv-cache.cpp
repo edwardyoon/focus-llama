@@ -682,6 +682,20 @@ llama_pos llama_kv_cache::seq_pos_max(llama_seq_id seq_id) const {
     return cells.seq_pos_max(seq_id);
 }
 
+int32_t llama_kv_cache::n_free_cells() const {
+    // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
+    if (other) {
+        return other->n_free_cells();
+    }
+
+    int32_t n_free = 0;
+    for (size_t s = 0; s < v_cells.size(); s++) {
+        n_free += (int32_t) v_cells[s].size() - (int32_t) v_cells[s].get_used();
+    }
+
+    return n_free;
+}
+
 std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> ret;
     for (const auto & [ctx, buf] : ctxs_bufs) {
@@ -1078,7 +1092,8 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
             }
 
             if (n_tested >= cells.size()) {
-                //LLAMA_LOG_ERROR("%s: failed to find a slot for %d tokens\n", __func__, n_tokens);
+                LLAMA_LOG_ERROR("%s: failed to find a slot for %u tokens (seq=%d stream=%d size=%u used=%u head=%u n_tested=%u)\n",
+                                __func__, n_tokens, (int) seq_id, (int) seq_to_stream[seq_id], cells.size(), cells.get_used(), head_cur, n_tested);
                 return { };
             }
         }

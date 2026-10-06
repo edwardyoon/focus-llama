@@ -815,6 +815,11 @@ extern "C" {
             llama_memory_t mem,
               llama_seq_id seq_id);
 
+    // Returns the number of free cells in the memory
+    // Return -1 if the memory does not track cell occupancy
+    LLAMA_API int32_t llama_memory_n_free_cells(
+            llama_memory_t mem);
+
     // Check if the memory supports shifting
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
 

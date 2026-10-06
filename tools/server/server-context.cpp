@@ -138,7 +138,11 @@ static bool kv_offload_get(
 // token of the final llama_decode, i.e. the logits row to sample the next
 // generated token from (B1: the deferred refill must be the last decode
 // before the slot's next sample).
-static bool kv_offload_refill(llama_context * ctx, server_slot & slot, const llama_tokens & toks, int32_t * out_last_idx = nullptr);
+// on_retry_idle (optional): called on a decode/draft failure - free an idle
+// slot's KV cells (mirrors decode()'s try_clear_idle_slots); return true if a
+// slot was cleared (the same sub-batch is retried).
+static bool kv_offload_refill(llama_context * ctx, server_slot & slot, const llama_tokens & toks, int32_t * out_last_idx = nullptr,
+                              const std::function<bool()> & on_retry_idle = nullptr);
 
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (params.embedding ||
@@ -4195,6 +4199,28 @@ private:
                         //     no cross-hole dependency). All-or-nothing livelocked
                         //     a growing session: one hole in the re-prefilled tail
                         //     blocked all ~80 (2026-09-26 production journal).
+                        // Item 4: expire stale ledger entries before (re)applying.
+                        // A hole with hi > n_past sits in the re-prefilled region, so
+                        // its KV was freshly written and is not reliably cut. Keeping
+                        // it inflates the resident projection (n_past - ledger_span)
+                        // and lets the dedup below skip a re-plan that needs the cut.
+                        // Expire it; the gate re-plans and the apply path re-cuts
+                        // once hi <= n_past.
+                        if (n_past > 0 && !slot.kv_hole_ranges.empty()) {
+                            auto it = slot.kv_hole_ranges.begin();
+                            while (it != slot.kv_hole_ranges.end()) {
+                                if (it->second > n_past) {
+                                    SLT_INF(slot, "kv-offload-holes: expiring stale hole [%d, %d) (hi > n_past=%d) - KV re-prefilled, re-plan will re-apply\n",
+                                            (int) it->first, (int) it->second, n_past);
+                                    it = slot.kv_hole_ranges.erase(it);
+                                } else {
+                                    ++it;
+                                }
+                            }
+                            if (slot.kv_hole_ranges.empty()) {
+                                slot.kv_holes_active = false;
+                            }
+                        }
                         if (n_past == 0) {
                             if (slot.kv_holes_active || !slot.kv_hole_ranges.empty()) {
                                 SLT_INF(slot, "kv-offload-holes: n_past=0 (sequence wiped) - clearing hole ledger (%zu applied)\n",
@@ -4205,9 +4231,17 @@ private:
                         } else if (!slot.kv_hole_shift_blocked && !slot.task->params.kv_hole_pending.empty()) {
                             std::vector<std::pair<int32_t, int32_t>> fresh;
                             for (const auto & r : slot.task->params.kv_hole_pending) {
+                                // Item 4: overlap-aware dedup. The gate re-plans the
+                                // same holes every request; a re-plan whose range
+                                // overlaps an already-applied entry (even with a
+                                // +-1 coordinate shift) must be skipped - re-cutting
+                                // is a no-op, but recording it again would
+                                // double-count the span (the projection assumes a
+                                // larger cut than physically happened, so it can
+                                // admit a request that overflows the buffer).
                                 bool dup = false;
                                 for (const auto & a : slot.kv_hole_ranges) {
-                                    if (a.first == r.first && a.second == r.second) {
+                                    if (a.first < r.second && r.first < a.second) {
                                         dup = true;
                                         break;
                                     }
@@ -4270,8 +4304,16 @@ private:
                         // reports it.
                         {
                             int32_t ledger_span = 0;
+                            size_t n_stale = 0;
                             for (const auto & r : slot.kv_hole_ranges) {
                                 ledger_span += r.second - r.first;
+                                if (r.second > n_past) {
+                                    n_stale++;
+                                }
+                            }
+                            if (ledger_span > n_past || n_stale > 0) {
+                                SLT_WRN(slot, "kv-offload-holes: ledger polluted - span=%d, n_past=%d, %zu stale hole(s) with hi>n_past (overlapping/stale entries inflate the resident projection)\n",
+                                        ledger_span, n_past, n_stale);
                             }
                             slot.kv_hole_peak_resident = n_past - ledger_span;
                         }
@@ -5808,6 +5850,10 @@ private:
                             for (const auto & h : slot.kv_hole_ranges) {
                                 holed += std::max(0, std::min(chunks[n].second, (int32_t) h.second) - std::max(chunks[n].first, (int32_t) h.first));
                             }
+                            if (holed > chunks[n].second - chunks[n].first) {
+                                SLT_WRN(slot, "da: L3 holed=%d > len=%d for keep chunk %d [%d,%d) - ledger spans exceed the chunk (stale/overlapping holes)\n",
+                                        holed, chunks[n].second - chunks[n].first, (int) (n + base), chunks[n].first, chunks[n].second);
+                            }
                             da_trace("slot=%d task=%d L3 B keep chunk=%d [%d,%d) len=%d holed=%d did_refill=%d da_seq=[%d,%d] bound=%d n_full=%d\n",
                                      (int) slot.id, (int) slot.task->id,
                                      (int) (n + base), chunks[n].first, chunks[n].second, chunks[n].second - chunks[n].first, holed, (int) did_refill,
@@ -6014,10 +6060,29 @@ private:
             // the closing token's row.
             if (!slot.da_pending_refill.empty()) {
                 int32_t last_idx = -1;
-                if (kv_offload_refill(slot.ctx_tgt, slot, slot.da_pending_refill, &last_idx)) {
+                if (kv_offload_refill(slot.ctx_tgt, slot, slot.da_pending_refill, &last_idx,
+                                      [this] { return try_clear_idle_slots(); })) {
                     slot.da_refill_out_idx = last_idx;
                 } else {
-                    SLT_WRN(slot, "%s", "kv_offload: deferred refill failed - fail-open (continuing without the recalled block)\n");
+                    // A failed refill leaves the ctx logits buffer holding the
+                    // refill's sub-batch rows, so the closing token's row
+                    // (slot.i_batch - off) is stale or out of the current
+                    // output_ids range -> sampling it hits the
+                    // logits==nullptr assert (Case 1). Re-decoding the closing
+                    // token to recover its logits is NOT safe in the cell-based
+                    // KV cache: find_slot() allocates a fresh cell for the
+                    // already-cached (seq,pos) (cell reuse is disabled), and
+                    // the KQ mask attends to every cell with that (seq,pos),
+                    // so the closing token's K/V would be double-counted in
+                    // this and every later decode. Abort the slot instead of
+                    // sampling a stale row (the recalled block is dropped).
+                    SLT_ERR(slot, "%s", "kv_offload: deferred refill failed - aborting slot (dropping the recalled block to avoid sampling a stale logits row)\n");
+                    send_error(slot, "kv_offload: deferred refill failed - the slot was aborted (the recalled block was dropped to avoid sampling a stale logits row)");
+                    slot.da_pending_refill.clear();
+                    slot.i_batch = -1;
+                    slot.release();
+                    slot.prompt_clear();
+                    return;
                 }
                 slot.da_pending_refill.clear();
             }
@@ -7249,7 +7314,8 @@ static void kv_offload_refill_rollback(server_slot & slot, int32_t n_full, int32
 // proceeds without the chunk). The slot's prompt tokens are advanced so
 // pos_next() reflects the new length. HIGH RISK: mid-decode prefill - must be
 // validated by the offload probe before trusting.
-static bool kv_offload_refill(llama_context * ctx, server_slot & slot, const llama_tokens & toks, int32_t * out_last_idx) {
+static bool kv_offload_refill(llama_context * ctx, server_slot & slot, const llama_tokens & toks, int32_t * out_last_idx,
+                              const std::function<bool()> & on_retry_idle) {
     const int32_t n_raw = (int32_t) toks.size();
     if (n_raw <= 0 || ctx == nullptr) return false;
 
@@ -7300,11 +7366,31 @@ static bool kv_offload_refill(llama_context * ctx, server_slot & slot, const lla
     int32_t off = 0;
     const int64_t t_refill_start = ggml_time_us();
     try {
+        // Log the physical free-cell count before the refill: if it is below
+        // the wrapped token count, find_slot will fail mid-refill (cell
+        // shortage) - correlate with the find_slot ERROR in llama-kv-cache.cpp
+        // and the ledger WARN in the hole-apply block.
+        {
+            const int32_t n_free = llama_memory_n_free_cells(llama_get_memory(ctx));
+            da_trace("slot=%d task=%d L2 refill free cells: n_free=%d n_wrapped=%d\n",
+                     (int) slot.id, (int) (slot.task ? slot.task->id : -1), n_free, n);
+            if (n_free >= 0 && n_free < n) {
+                SLT_WRN(slot, "kv_offload: refill free-cell shortage - n_free=%d < n_wrapped=%d (find_slot failure likely)\n", n_free, n);
+            }
+        }
+        // Dense forcing: the refill is a prefill and this function calls
+        // llama_decode directly (bypassing update_da_n_kv_max, which the main
+        // decode runs before each decode). A stale sparse bound from the last
+        // main decode must not persist into the refill - force n_kv_max=0
+        // (dense). The next main decode recomputes the bound via
+        // update_da_n_kv_max.
+        llama_set_n_kv_max(ctx, 0);
         // The re-prefilled chunk can be larger than n_batch, and llama_decode
         // asserts n_tokens <= n_batch (it does not sub-batch), so split the
         // refill into n_batch-sized sub-batches.
+        int32_t sub_batch = n_batch;
         while (off < n) {
-            const int32_t m = std::min(n_batch, n - off);
+            const int32_t m = std::min(sub_batch, n - off);
 
             // B1: the final sub-batch's last row is the only output token of
             // the whole refill - the caller samples the next token from it
@@ -7341,15 +7427,24 @@ static bool kv_offload_refill(llama_context * ctx, server_slot & slot, const lla
             SRV_INF("kv_offload: refill sub-batch [%d,%d) of %d token(s) ret=%d\n",
                     off, off + m, n, ret);
 
-            if (ret != 0) {
-                SRV_WRN("kv_offload: refill decode failed (ret=%d, tokens %d..%d of %d) - fail-open\n",
-                        ret, off, off + m, n);
-                kv_offload_refill_rollback(slot, n_full, off);
-                return false;
-            }
-            if (!spec_ok) {
-                SRV_WRN("kv_offload: refill draft process failed (tokens %d..%d of %d) - fail-open\n",
-                        off, off + m, n);
+            if (ret != 0 || !spec_ok) {
+                // Retry (mirrors decode()): free an idle slot's cells, or
+                // halve the sub-batch. Terminal guard: sub_batch == 1 and no
+                // slot to clear -> fail-open (rollback + return false).
+                bool cleared = on_retry_idle ? on_retry_idle() : false;
+                if (cleared) {
+                    SRV_WRN("kv_offload: refill %s failed (ret=%d, tokens %d..%d of %d) - cleared idle slot, retrying\n",
+                            ret != 0 ? "decode" : "draft process", ret, off, off + m, n);
+                    continue;
+                }
+                if (sub_batch > 1) {
+                    sub_batch /= 2;
+                    SRV_WRN("kv_offload: refill %s failed (ret=%d, tokens %d..%d of %d) - halving sub_batch to %d, retrying\n",
+                            ret != 0 ? "decode" : "draft process", ret, off, off + m, n, sub_batch);
+                    continue;
+                }
+                SRV_WRN("kv_offload: refill %s failed (ret=%d, tokens %d..%d of %d, sub_batch=%d) - fail-open\n",
+                        ret != 0 ? "decode" : "draft process", ret, off, off + m, n, sub_batch);
                 kv_offload_refill_rollback(slot, n_full, off);
                 return false;
             }
@@ -8085,23 +8180,40 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     // Returns true if the request was rejected (res already holds the error).
                     auto reject_if_over_buffer = [&](int64_t evicted_tokens, int32_t planned_tokens, bool put_failed) -> bool {
                         if (params.kv_cache_size <= 0) return false;
-                        const int64_t projected = (int64_t) task.tokens.size() - evicted_tokens;
+                        // The gate must also reserve what grows the KV after prefill:
+                        // focus recall (kv_offload_refill) re-prefills a focused
+                        // segment on top of the resident KV (bounded by the largest
+                        // evicted segment), and a finite n_predict grows the KV by the
+                        // generated tail. Case 1 (plans/bug.md): 44,886 resident +
+                        // 10,492 recall overflowed the 49,152 cap the resident-only
+                        // projection had passed.
+                        int64_t recall_cost = 0;
+                        for (const auto & seg : evicted_segs) {
+                            if (seg.tokens > recall_cost) recall_cost = seg.tokens;
+                        }
+                        const int64_t n_predict_eff = task.params.n_predict != -1 ? task.params.n_predict : params.n_predict;
+                        const int64_t gen_cost = n_predict_eff > 0 ? n_predict_eff : 0;
+                        const int64_t resident = (int64_t) task.tokens.size() - evicted_tokens;
+                        const int64_t projected = resident + recall_cost + gen_cost;
                         if (projected <= (int64_t) params.kv_cache_size - 16384) return false;
 
-                        SRV_WRN("kv_offload: rejecting request - projected KV-resident %d tokens exceeds buffer %d - headroom 16384 (evicted %d of planned %d, put_failed=%d, session=%s)\n",
-                                (int) projected, params.kv_cache_size, (int) evicted_tokens,
+                        SRV_WRN("kv_offload: rejecting request - projected %d tokens (resident %d + recall %d + gen %d) exceeds buffer %d - headroom 16384 (evicted %d of planned %d, put_failed=%d, session=%s)\n",
+                                (int) projected, (int) resident, (int) recall_cost, (int) gen_cost,
+                                params.kv_cache_size, (int) evicted_tokens,
                                 (int) planned_tokens, (int) put_failed, kv_session.c_str());
 
                         if (put_failed) {
                             // store problem: retryable, must not look like "context too long"
                             res->error(format_error_response(
-                                string_format("FocusMemory store unavailable: %d KV-resident tokens exceed --kv-cache-size %d minus the 16384 headroom because evicted segments could not be offloaded. Restore the store and retry.",
-                                              (int) projected, params.kv_cache_size),
+                                string_format("FocusMemory store unavailable: %d projected tokens (resident %d + max recall %d + generation %d) exceed --kv-cache-size %d minus the 16384 headroom because evicted segments could not be offloaded. Restore the store and retry.",
+                                              (int) projected, (int) resident, (int) recall_cost, (int) gen_cost,
+                                              params.kv_cache_size),
                                 ERROR_TYPE_UNAVAILABLE));
                         } else {
                             res->error(format_error_response(
-                                string_format("prompt does not fit the decoupled KV buffer: projected KV-resident %d tokens exceeds --kv-cache-size %d minus the 16384 headroom (pin + hot window + delta too large). Increase --kv-cache-size or lower --kv-offload-threshold/--kv-retain-tokens.",
-                                              (int) projected, params.kv_cache_size),
+                                string_format("prompt does not fit the decoupled KV buffer: %d projected tokens (resident %d + max recall %d + generation %d) exceed --kv-cache-size %d minus the 16384 headroom (pin + hot window + delta too large). Increase --kv-cache-size or lower --kv-offload-threshold/--kv-retain-tokens.",
+                                              (int) projected, (int) resident, (int) recall_cost, (int) gen_cost,
+                                              params.kv_cache_size),
                                 ERROR_TYPE_EXCEED_CONTEXT_SIZE));
                         }
                         return true;

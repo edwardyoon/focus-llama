@@ -116,6 +116,10 @@ struct llama_memory_i {
     virtual llama_pos seq_pos_min(llama_seq_id seq_id) const = 0;
     virtual llama_pos seq_pos_max(llama_seq_id seq_id) const = 0;
 
+    // number of free cells in the memory
+    // return -1 if the memory does not track cell occupancy
+    virtual int32_t n_free_cells() const { return -1; }
+
     virtual std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const = 0;
 
     //
