@@ -116,6 +116,18 @@ struct llama_memory_i {
     virtual llama_pos seq_pos_min(llama_seq_id seq_id) const = 0;
     virtual llama_pos seq_pos_max(llama_seq_id seq_id) const = 0;
 
+    // maximum position of the recurrent (stateful) side of a hybrid memory
+    // return -1 if the memory has no recurrent component, or the sequence is empty
+    virtual llama_pos seq_pos_max_recr(llama_seq_id /* seq_id */) const { return -1; }
+
+    // the position at which a PARTIAL_ONLY state snapshot of the sequence can be
+    // resumed - the label a checkpoint of the partial state must record.
+    // default: the overall maximum position (the partial snapshot covers the whole cache);
+    // override when the partial snapshot covers only part of the memory
+    // (e.g. the recurrent state of a hybrid memory, which can be ahead of the
+    // hole-cut or truncated attention side)
+    virtual llama_pos seq_pos_max_partial(llama_seq_id seq_id) const { return seq_pos_max(seq_id); }
+
     // number of free cells in the memory
     // return -1 if the memory does not track cell occupancy
     virtual int32_t n_free_cells() const { return -1; }

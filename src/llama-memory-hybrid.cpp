@@ -181,6 +181,19 @@ llama_pos llama_memory_hybrid::seq_pos_max(llama_seq_id seq_id) const {
     return std::min(mem_attn->seq_pos_max(seq_id), mem_recr->seq_pos_max(seq_id));
 }
 
+llama_pos llama_memory_hybrid::seq_pos_max_recr(llama_seq_id seq_id) const {
+    return mem_recr->seq_pos_max(seq_id);
+}
+
+llama_pos llama_memory_hybrid::seq_pos_max_partial(llama_seq_id seq_id) const {
+    // a PARTIAL_ONLY snapshot serializes the recurrent state only, so it can be
+    // resumed at the recurrent position. Not seq_pos_max() (min(attn, recr)):
+    // the attention side is lower than the state whenever it is hole-cut or
+    // truncated to n_past by a checkpoint restore, which would poison the
+    // checkpoint label (plans/2026-10-07-kv-400-incident2.md)
+    return mem_recr->seq_pos_max(seq_id);
+}
+
 int32_t llama_memory_hybrid::n_free_cells() const {
     // the recurrent state has no cells; the free-cell count is that of the attention cache
     return mem_attn->n_free_cells();

@@ -4248,6 +4248,26 @@ llama_pos llama_memory_seq_pos_max(
     return mem->seq_pos_max(seq_id);
 }
 
+llama_pos llama_memory_seq_pos_max_recr(
+        llama_memory_t mem,
+          llama_seq_id seq_id) {
+    if (!mem) {
+        return -1;
+    }
+
+    return mem->seq_pos_max_recr(seq_id);
+}
+
+llama_pos llama_memory_seq_pos_max_partial(
+        llama_memory_t mem,
+          llama_seq_id seq_id) {
+    if (!mem) {
+        return -1;
+    }
+
+    return mem->seq_pos_max_partial(seq_id);
+}
+
 int32_t llama_memory_n_free_cells(
         llama_memory_t mem) {
     if (!mem) {

@@ -68,6 +68,8 @@ public:
 
     llama_pos seq_pos_min(llama_seq_id seq_id) const override;
     llama_pos seq_pos_max(llama_seq_id seq_id) const override;
+    llama_pos seq_pos_max_recr(llama_seq_id seq_id) const override;
+    llama_pos seq_pos_max_partial(llama_seq_id seq_id) const override;
 
     int32_t n_free_cells() const override;
 

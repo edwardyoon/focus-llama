@@ -820,6 +820,25 @@ extern "C" {
             llama_memory_t mem,
               llama_seq_id seq_id);
 
+    // Returns the largest position of the recurrent (stateful) side of a hybrid memory
+    // For a checkpoint that serializes only the recurrent state, the position label
+    // must match this value for the checkpoint to be resumable at that position
+    // Return -1 if the memory has no recurrent component, or the sequence is empty
+    LLAMA_API llama_pos llama_memory_seq_pos_max_recr(
+            llama_memory_t mem,
+              llama_seq_id seq_id);
+
+    // Returns the position at which a PARTIAL_ONLY state snapshot of the
+    // specified sequence can be resumed - the label a context checkpoint of the
+    // partial state must record. For memory whose partial snapshot covers only
+    // the recurrent state, this is the recurrent position, which can be higher
+    // than llama_memory_seq_pos_max() (min of attention and recurrent) when the
+    // attention side is hole-cut or otherwise truncated.
+    // Return -1 if the sequence is empty
+    LLAMA_API llama_pos llama_memory_seq_pos_max_partial(
+            llama_memory_t mem,
+              llama_seq_id seq_id);
+
     // Returns the number of free cells in the memory
     // Return -1 if the memory does not track cell occupancy
     LLAMA_API int32_t llama_memory_n_free_cells(
