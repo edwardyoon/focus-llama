@@ -8262,16 +8262,26 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                             kv_session.c_str(), (int) release_pin);
                     // Returns true if the request was rejected (res already holds the error).
                     // Two tiers (10-07):
-                    //  - HARD: the prefill peak cannot fit the physical buffer. In holes
-                    //    mode (Option B) the evicted text stays in the prompt and the
-                    //    holes are cut only AFTER the prefill, so the prefill peak is the
-                    //    FULL prompt regardless of the eviction plan; in Option C the
-                    //    evicted text is removed, so the peak is the resident. No plan can
-                    //    fix this - reject before it hard-fails in find_slot mid-stream
-                    //    (slot abort + KV clear, worse than a clean 400). This also closes
-                    //    the old gate's small-segment gap: projected = resident + LARGEST
-                    //    segment + gen could pass while the full prompt was above the
-                    //    buffer (many segments: evicted_total >> max segment).
+                    //  - HARD: the prefill peak (the maximum number of KV cells LIVE at
+                    //    any moment during the prompt prefill) cannot fit the physical
+                    //    buffer. No eviction plan can fix it, so reject before it
+                    //    hard-fails in find_slot mid-stream (slot abort + KV clear,
+                    //    worse than a clean 400). The peak is a live-cell count, not a
+                    //    physical-memory figure (the cell pool is fixed at B; seq_rm
+                    //    only recycles slots, it never shrinks the pool).
+                    //    * Option C (default): the evicted text is removed from the
+                    //      prompt, so the peak is the resident (prompt - evicted).
+                    //    * Holes mode (Option B): the evicted text stays in the prompt,
+                    //      but the progressive cut (kv_holes_progressive_apply) cuts
+                    //      each hole's KV as the prefill head passes it, so the live
+                    //      count never reaches the raw prompt length - the peak is the
+                    //      final resident plus at most one in-flight sub-batch. The old
+                    //      "peak = full prompt" model predated the progressive cut
+                    //      (9a06c0385) and rejected every request whose prompt crossed
+                    //      B - 16384 even though the live cells stayed near the evict
+                    //      target (2026-10-07: prompt 69287 / evicted 23485 / actual
+                    //      peak ~46.8k vs cap 68920 - spurious 400 loop, see
+                    //      plans/2026-10-07-kv-400-incident.md).
                     //  - SOFT: the steady-state projection (resident + largest evicted
                     //    segment + gen tail) exceeds the cap, but the prefill fits.
                     //    Proceed - every runtime overflow is graceful: generation stops
@@ -8286,7 +8296,11 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                         if (params.kv_cache_size <= 0) return false;
                         const int64_t cap = (int64_t) params.kv_cache_size - 16384;
                         const int64_t prompt = (int64_t) task.tokens.size();
-                        const int64_t prefill_peak = params.kv_offload_holes ? prompt : prompt - evicted_tokens;
+                        const int64_t resident = prompt - evicted_tokens;
+                        // Holes mode: progressive cut keeps the live-cell peak at the
+                        // final resident + one in-flight sub-batch (NOT the raw prompt).
+                        // Option C: the evicted text is gone, so the peak is the resident.
+                        const int64_t prefill_peak = params.kv_offload_holes ? resident + params.n_batch : resident;
                         if (prefill_peak > cap) {
                             SRV_WRN("kv_offload: rejecting request - prefill peak %d tokens is above buffer %d - headroom 16384 (holes=%d, evicted %d of planned %d, put_failed=%d, session=%s)\n",
                                     (int) prefill_peak, params.kv_cache_size, (int) params.kv_offload_holes,
@@ -8307,7 +8321,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                         }
                         // n_predict_eff / gen_cost are the hoisted clamp-scope values
                         // (single source of truth shared with the eviction clamp).
-                        const int64_t resident = prompt - evicted_tokens;
+                        // resident is defined above (shared with the HARD peak).
                         const int64_t projected = resident + recall_cost + gen_cost;
                         if (projected > cap) {
                             SRV_INF("kv_offload: projected demand %d (resident %d + max recall %d + gen %d) above buffer cap %d - proceeding (buffer-cap stop + refill rollback + get fail-open are the runtime safety nets; evicted %d of planned %d, put_failed=%d, session=%s)\n",
