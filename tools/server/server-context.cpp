@@ -8298,11 +8298,11 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                                 ERROR_TYPE_UNAVAILABLE));
                         } else {
                             res->error(format_error_response(
-                                string_format("request does not fit the decoupled KV buffer: projected demand %d (resident %d + max recall %d + generation %d) is above --kv-cache-size %d minus the 16384 headroom (pin + hot window + delta too big). Minimum required buffer is %d (threshold %d + gen tail %d + headroom 16384); raise --kv-cache-size to at least that, or lower --kv-offload-threshold/--n-predict - lowering --kv-retain-tokens alone is often ineffective because the clamp already bounds the resident target.",
+                                string_format("request does not fit the decoupled KV buffer: projected demand %d (resident %d + max recall %d + generation %d) is above --kv-cache-size %d minus the 16384 headroom (pin + hot window + delta too big). Minimum required buffer is %d (threshold %d + max recall %d + gen tail %d + headroom 16384); raise --kv-cache-size to at least that, or lower --kv-offload-threshold/--n-predict - lowering --kv-retain-tokens alone is often ineffective because the clamp already bounds the resident target.",
                                               (int) projected, (int) resident, (int) recall_cost, (int) gen_cost,
                                               params.kv_cache_size,
-                                              (int) ((int64_t) params.kv_offload_threshold + gen_cost + 16384),
-                                              (int) params.kv_offload_threshold, (int) gen_cost),
+                                              (int) ((int64_t) params.kv_offload_threshold + recall_cost + gen_cost + 16384),
+                                              (int) params.kv_offload_threshold, (int) recall_cost, (int) gen_cost),
                                 ERROR_TYPE_EXCEED_CONTEXT_SIZE));
                         }
                         return true;
@@ -8318,6 +8318,42 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                                          kv_retain_eff)) {
                         // Diagnostic: the eviction plan (n segments, tokens each).
                         for (auto & seg : evict_segs) plan_tokens += seg.tokens;
+                        // 10-07 fix (2nd 400, session 051dfdf9): the clamp above
+                        // reserves the gen tail but not the max recall segment -
+                        // focus recall re-prefills the largest evicted message on
+                        // top of the resident KV, so the reject gate's projection
+                        // (resident + max_seg + gen) can exceed B - 16384 even when
+                        // the evict target (<= B - 16384 - gen) was met. Observed:
+                        // B=75304, resident 42442 + max_seg 8381 + gen 8192 =
+                        // 59015 > 58920 (short by 95). Re-plan with a target that
+                        // also reserves the largest planned segment. Each pass
+                        // evicts a superset (the target strictly decreases), so
+                        // max_seg only grows and the loop converges in 1-2 passes
+                        // (cap: 3). If the hot window (threshold) alone cannot
+                        // carry the projection, the gate rejects below.
+                        if (params.kv_cache_size > 0) {
+                            for (int pass = 0; pass < 3 && !evict_segs.empty(); ++pass) {
+                                int64_t max_seg = 0;
+                                for (const auto & seg : evict_segs) max_seg = std::max<int64_t>(max_seg, seg.tokens);
+                                const int64_t resident_after = (int64_t) task.tokens.size() - plan_tokens;
+                                if (resident_after + max_seg + gen_cost <= (int64_t) params.kv_cache_size - 16384) break;
+                                const int64_t deeper_ceiling = (int64_t) params.kv_cache_size - 16384 - gen_cost - max_seg;
+                                const int32_t kv_target2 = std::max((int32_t) std::min<int64_t>(kv_target, deeper_ceiling),
+                                                                    params.kv_offload_threshold);
+                                if (kv_target2 >= kv_target) break;  // infeasible at the hot window - the gate rejects
+                                SRV_INF("kv_offload: evict re-plan pass %d - target %d -> %d (resident %d + max recall %d + gen %d > buffer %d - headroom 16384)\n",
+                                        pass + 1, kv_target, kv_target2, (int) resident_after, (int) max_seg,
+                                        (int) gen_cost, params.kv_cache_size);
+                                kv_target = kv_target2;
+                                std::vector<kv_offload_evict_segment> replan_segs;
+                                if (!kv_offload_evict(ctx_server.vocab, da_prompt, (int32_t) task.tokens.size(),
+                                                      params.kv_offload_threshold, replan_segs, release_pin,
+                                                      kv_target2 - params.kv_offload_threshold)) break;
+                                evict_segs = std::move(replan_segs);
+                                plan_tokens = 0;
+                                for (auto & seg : evict_segs) plan_tokens += seg.tokens;
+                            }
+                        }
                         SRV_INF("kv_offload: evict plan - %zu segment(s), ~%d token(s) to offload\n",
                                 evict_segs.size(), plan_tokens);
                         std::vector<std::pair<size_t, size_t>> evicted_ranges;
