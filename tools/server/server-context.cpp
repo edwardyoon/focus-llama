@@ -125,6 +125,15 @@ static int dbg_count(const std::string & s, const std::string & needle, size_t e
     return n;
 }
 
+// Upper bound on the generation tail (in KV cells) that the decoupled-KV
+// reject gate and eviction clamp reserve. Reserving the full request n_predict
+// (often 32768) makes resident + recall + gen exceed the buffer for most real
+// prompts and causes spurious 400s; actual generation is far shorter. If a
+// generation does outgrow this reservation, the buffer-cap graceful stop
+// (process_token) ends it with finish_reason=length instead of a hard decode
+// failure, so the full n_predict need not be reserved.
+static const int64_t KV_GEN_TAIL_CAP = 8192;
+
 // kv-offload (auto-compact replacement): forward declarations. The full
 // definitions live below (before da_auto_chunk); apply_da_tag (mid-decode)
 // calls kv_offload_get / kv_offload_refill, so they must be declared first.
@@ -1777,15 +1786,21 @@ private:
         // (d) the buffer cannot even hold threshold + gen tail + headroom: the
         //     clamp degenerates (effective retain -> 0) and the reject gate fails
         //     every request regardless of eviction - warn with the minimum
-        //     required buffer.
-        if (params_base.kv_offload && params_base.kv_cache_size > 0 &&
-                params_base.kv_cache_size <
-                params_base.kv_offload_threshold + params_base.n_predict + 16384) {
-            SRV_WRN("kv_offload: buffer %d cells < threshold %d + n_predict %d + headroom 16384 - minimum required buffer is %d; even with perfect eviction the generation tail exceeds the budget (400 on every request); raise --kv-cache-size to >= %d or lower --kv-offload-threshold/--n-predict\n",
-                    params_base.kv_cache_size, params_base.kv_offload_threshold,
-                    params_base.n_predict,
-                    params_base.kv_offload_threshold + params_base.n_predict + 16384,
-                    params_base.kv_offload_threshold + params_base.n_predict + 16384);
+        //     required buffer. The gen tail is the capped reservation (the runtime
+        //     gate/clamp reserve min(n_predict, KV_GEN_TAIL_CAP), not the full
+        //     n_predict).
+        {
+            const int64_t gen_tail = params_base.n_predict > 0 ?
+                std::min<int64_t>(params_base.n_predict, KV_GEN_TAIL_CAP) : 0;
+            if (params_base.kv_offload && params_base.kv_cache_size > 0 &&
+                    params_base.kv_cache_size <
+                    params_base.kv_offload_threshold + gen_tail + 16384) {
+                SRV_WRN("kv_offload: buffer %d cells < threshold %d + gen tail %d + headroom 16384 - minimum required buffer is %d; even with perfect eviction the generation tail exceeds the budget (400 on every request); raise --kv-cache-size to >= %d or lower --kv-offload-threshold/--n-predict\n",
+                        params_base.kv_cache_size, params_base.kv_offload_threshold,
+                        (int) gen_tail,
+                        (int) (params_base.kv_offload_threshold + gen_tail + 16384),
+                        (int) (params_base.kv_offload_threshold + gen_tail + 16384));
+            }
         }
 
         // setup slots
@@ -2467,14 +2482,35 @@ private:
             slot.has_next_token = true;
         }
 
-        // if context shifting is disabled, make sure that we don't run out of context
-        if (!params_base.ctx_shift && slot.prompt.n_tokens() + 1 >= slot.n_ctx) {
-            slot.truncated      = true;
-            slot.stop           = STOP_TYPE_LIMIT;
-            slot.has_next_token = false;
+        // if context shifting is disabled, make sure that we don't run out of context.
+        // Decoupled-KV mode: the physical buffer (kv_cache_size) fills before the
+        // logical n_ctx, so also cap on the buffer minus the 16384 headroom the
+        // reject gate reserves for recall + pin + delta. This turns an over-long
+        // generation (which would otherwise hard-fail in llama_decode with "Context
+        // size has been exceeded" + slot abort + KV clear) into a clean
+        // finish_reason=length. prompt.n_tokens() upper-bounds the resident KV
+        // (resident = prompt minus cut holes), so capping on it is safe.
+        {
+            const int64_t buf_cap = params_base.kv_cache_size > 0 ?
+                (int64_t) params_base.kv_cache_size - 16384 : (int64_t) slot.n_ctx;
+            const int64_t ctx_limit = std::min<int64_t>(slot.n_ctx, buf_cap);
+            if (!params_base.ctx_shift && (int64_t) slot.prompt.n_tokens() + 1 >= ctx_limit) {
+                slot.truncated      = true;
+                slot.stop           = STOP_TYPE_LIMIT;
+                slot.has_next_token = false;
 
-            SLT_DBG(slot, "stopped due to running out of context capacity, prompt.n_tokens() = %d, task.n_tokens = %d, n_gen = %d, n_ctx = %d\n",
-                    slot.prompt.n_tokens(), slot.task->n_tokens(), (int) slot.stats.n_gen, slot.n_ctx);
+                if (buf_cap < slot.n_ctx) {
+                    // INFO (not DBG): the client sees finish_reason=length and halts,
+                    // so the journal must record that the KV buffer (not the model
+                    // n_ctx) capped generation - distinct from a normal n_ctx stop.
+                    SRV_INF("slot %d: generation stopped at KV buffer cap - prompt %d >= buffer %d - 16384 (n_ctx %d, n_gen %d) -> finish_reason=length\n",
+                            (int) slot.id, (int) slot.prompt.n_tokens(), params_base.kv_cache_size,
+                            slot.n_ctx, (int) slot.stats.n_gen);
+                } else {
+                    SLT_DBG(slot, "stopped due to running out of context capacity, prompt.n_tokens() = %d, task.n_tokens = %d, n_gen = %d, n_ctx = %d\n",
+                            slot.prompt.n_tokens(), slot.task->n_tokens(), (int) slot.stats.n_gen, slot.n_ctx);
+                }
+            }
         }
 
         // check the limits
@@ -8169,9 +8205,14 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     // kv_offload_evict.
                     const int32_t kv_target_unclamped = params.kv_offload_threshold + params.kv_retain_tokens;
                     // gen budget: same expression as the reject lambda below (request
-                    // n_predict if > 0, else params.n_predict).
+                    // n_predict if > 0, else params.n_predict). The reserved tail is
+                    // capped at KV_GEN_TAIL_CAP - reserving the full n_predict (often
+                    // 32768) makes resident + recall + gen exceed the buffer for most
+                    // real prompts (spurious 400s). An over-long generation is ended
+                    // by the buffer-cap graceful stop (process_token) with
+                    // finish_reason=length, so the full n_predict need not be reserved.
                     const int64_t n_predict_eff = task.params.n_predict != -1 ? task.params.n_predict : params.n_predict;
-                    const int64_t gen_cost = n_predict_eff > 0 ? n_predict_eff : 0;
+                    const int64_t gen_cost = n_predict_eff > 0 ? std::min<int64_t>(n_predict_eff, KV_GEN_TAIL_CAP) : 0;
                     // 10-06 fix: lower bound at the threshold (N) - when B - 16384 < N
                     // the clamp must not push the stop target below the hot window
                     // (evicting below the threshold would break the gate).
@@ -8243,11 +8284,11 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                                 ERROR_TYPE_UNAVAILABLE));
                         } else {
                             res->error(format_error_response(
-                                string_format("request does not fit the decoupled KV buffer: projected demand %d (resident %d + max recall %d + generation %d) is above --kv-cache-size %d minus the 16384 headroom (pin + hot window + delta too big). Minimum required buffer is %d (threshold %d + n_predict %d + headroom 16384); raise --kv-cache-size to at least that, or lower --kv-offload-threshold/--n-predict - lowering --kv-retain-tokens alone is often ineffective because the clamp already bounds the resident target.",
+                                string_format("request does not fit the decoupled KV buffer: projected demand %d (resident %d + max recall %d + generation %d) is above --kv-cache-size %d minus the 16384 headroom (pin + hot window + delta too big). Minimum required buffer is %d (threshold %d + gen tail %d + headroom 16384); raise --kv-cache-size to at least that, or lower --kv-offload-threshold/--n-predict - lowering --kv-retain-tokens alone is often ineffective because the clamp already bounds the resident target.",
                                               (int) projected, (int) resident, (int) recall_cost, (int) gen_cost,
                                               params.kv_cache_size,
-                                              (int) ((int64_t) params.kv_offload_threshold + n_predict_eff + 16384),
-                                              (int) params.kv_offload_threshold, (int) n_predict_eff),
+                                              (int) ((int64_t) params.kv_offload_threshold + gen_cost + 16384),
+                                              (int) params.kv_offload_threshold, (int) gen_cost),
                                 ERROR_TYPE_EXCEED_CONTEXT_SIZE));
                         }
                         return true;
