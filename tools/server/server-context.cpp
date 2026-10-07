@@ -8261,51 +8261,61 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                             (int) task.tokens.size(), params.focus_memory_host.c_str(),
                             kv_session.c_str(), (int) release_pin);
                     // Returns true if the request was rejected (res already holds the error).
+                    // Two tiers (10-07):
+                    //  - HARD: the prefill peak cannot fit the physical buffer. In holes
+                    //    mode (Option B) the evicted text stays in the prompt and the
+                    //    holes are cut only AFTER the prefill, so the prefill peak is the
+                    //    FULL prompt regardless of the eviction plan; in Option C the
+                    //    evicted text is removed, so the peak is the resident. No plan can
+                    //    fix this - reject before it hard-fails in find_slot mid-stream
+                    //    (slot abort + KV clear, worse than a clean 400). This also closes
+                    //    the old gate's small-segment gap: projected = resident + LARGEST
+                    //    segment + gen could pass while the full prompt was above the
+                    //    buffer (many segments: evicted_total >> max segment).
+                    //  - SOFT: the steady-state projection (resident + largest evicted
+                    //    segment + gen tail) exceeds the cap, but the prefill fits.
+                    //    Proceed - every runtime overflow is graceful: generation stops
+                    //    at the buffer cap (finish_reason=length, process_token), a
+                    //    recall whose refill cannot fit rolls back (kv_offload_refill),
+                    //    and a store GET failure fails open (get-on-focus). A 400 here
+                    //    only interrupted the client turn (and pre-301cf5abc drove the
+                    //    qwen-code compaction loop). The store-down case (PUT failed,
+                    //    segment kept resident) degrades the same way: no recall for the
+                    //    failed segments, generation capped by the buffer-cap stop.
                     auto reject_if_over_buffer = [&](int64_t evicted_tokens, int32_t planned_tokens, bool put_failed) -> bool {
                         if (params.kv_cache_size <= 0) return false;
-                        // The gate must also reserve what grows the KV after prefill:
-                        // focus recall (kv_offload_refill) re-prefills a focused
-                        // segment on top of the resident KV (bounded by the largest
-                        // evicted segment), and a finite n_predict grows the KV by the
-                        // generated tail. Case 1 (plans/bug.md): 44,886 resident +
-                        // 10,492 recall overflowed the 49,152 cap the resident-only
-                        // projection had passed.
+                        const int64_t cap = (int64_t) params.kv_cache_size - 16384;
+                        const int64_t prompt = (int64_t) task.tokens.size();
+                        const int64_t prefill_peak = params.kv_offload_holes ? prompt : prompt - evicted_tokens;
+                        if (prefill_peak > cap) {
+                            SRV_WRN("kv_offload: rejecting request - prefill peak %d tokens is above buffer %d - headroom 16384 (holes=%d, evicted %d of planned %d, put_failed=%d, session=%s)\n",
+                                    (int) prefill_peak, params.kv_cache_size, (int) params.kv_offload_holes,
+                                    (int) evicted_tokens, (int) planned_tokens, (int) put_failed, kv_session.c_str());
+                            // NOTE: message wording is constrained - the client (qwen-code) pattern-matches
+                            // the error text for context overflow ("input|prompt|message|context" + "tokens"
+                            // + "exceed" within 120 chars triggers reactive compaction with a wrong
+                            // originalTokenCount). Keep those word combinations out.
+                            res->error(format_error_response(
+                                string_format("conversation is larger than this server's KV buffer capacity: %d tokens > %d cell budget (--kv-cache-size %d minus 16384 headroom). Compact the conversation and retry, or raise --kv-cache-size.",
+                                              (int) prefill_peak, (int) cap, params.kv_cache_size),
+                                ERROR_TYPE_EXCEED_CONTEXT_SIZE));
+                            return true;
+                        }
                         int64_t recall_cost = 0;
                         for (const auto & seg : evicted_segs) {
                             if (seg.tokens > recall_cost) recall_cost = seg.tokens;
                         }
                         // n_predict_eff / gen_cost are the hoisted clamp-scope values
                         // (single source of truth shared with the eviction clamp).
-                        const int64_t resident = (int64_t) task.tokens.size() - evicted_tokens;
+                        const int64_t resident = prompt - evicted_tokens;
                         const int64_t projected = resident + recall_cost + gen_cost;
-                        if (projected <= (int64_t) params.kv_cache_size - 16384) return false;
-
-                        SRV_WRN("kv_offload: rejecting request - projected %d tokens (resident %d + recall %d + gen %d) exceeds buffer %d - headroom 16384 (evicted %d of planned %d, put_failed=%d, session=%s)\n",
-                                (int) projected, (int) resident, (int) recall_cost, (int) gen_cost,
-                                params.kv_cache_size, (int) evicted_tokens,
-                                (int) planned_tokens, (int) put_failed, kv_session.c_str());
-
-                        // NOTE: message wording is constrained - the client (qwen-code) pattern-matches
-                        // the error text for context overflow ("input|prompt|message|context" + "tokens"
-                        // + "exceed" within 120 chars triggers reactive compaction with a wrong
-                        // originalTokenCount). Keep those word combinations out of both branches.
-                        if (put_failed) {
-                            // store problem: retryable, must not look like "context too long"
-                            res->error(format_error_response(
-                                string_format("FocusMemory store unavailable: projected demand %d (resident %d + max recall %d + generation %d) is above --kv-cache-size %d minus the 16384 headroom because evicted segments could not be offloaded. Restore the store and retry.",
-                                              (int) projected, (int) resident, (int) recall_cost, (int) gen_cost,
-                                              params.kv_cache_size),
-                                ERROR_TYPE_UNAVAILABLE));
-                        } else {
-                            res->error(format_error_response(
-                                string_format("request does not fit the decoupled KV buffer: projected demand %d (resident %d + max recall %d + generation %d) is above --kv-cache-size %d minus the 16384 headroom (pin + hot window + delta too big). Minimum required buffer is %d (threshold %d + max recall %d + gen tail %d + headroom 16384); raise --kv-cache-size to at least that, or lower --kv-offload-threshold/--n-predict - lowering --kv-retain-tokens alone is often ineffective because the clamp already bounds the resident target.",
-                                              (int) projected, (int) resident, (int) recall_cost, (int) gen_cost,
-                                              params.kv_cache_size,
-                                              (int) ((int64_t) params.kv_offload_threshold + recall_cost + gen_cost + 16384),
-                                              (int) params.kv_offload_threshold, (int) recall_cost, (int) gen_cost),
-                                ERROR_TYPE_EXCEED_CONTEXT_SIZE));
+                        if (projected > cap) {
+                            SRV_INF("kv_offload: projected demand %d (resident %d + max recall %d + gen %d) above buffer cap %d - proceeding (buffer-cap stop + refill rollback + get fail-open are the runtime safety nets; evicted %d of planned %d, put_failed=%d, session=%s)\n",
+                                    (int) projected, (int) resident, (int) recall_cost, (int) gen_cost,
+                                    (int) cap, (int) evicted_tokens, (int) planned_tokens,
+                                    (int) put_failed, kv_session.c_str());
                         }
-                        return true;
+                        return false;
                     };
                     std::vector<kv_offload_evict_segment> evict_segs;
                     // Optimistic pre-PUT projection (all planned segments evicted).
