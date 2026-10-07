@@ -2488,13 +2488,27 @@ private:
         // reject gate reserves for recall + pin + delta. This turns an over-long
         // generation (which would otherwise hard-fail in llama_decode with "Context
         // size has been exceeded" + slot abort + KV clear) into a clean
-        // finish_reason=length. prompt.n_tokens() upper-bounds the resident KV
-        // (resident = prompt minus cut holes), so capping on it is safe.
+        // finish_reason=length.
+        // The resident base must be the PHYSICAL KV size, not prompt.n_tokens():
+        // in holes mode (Option B) the evicted text stays in the prompt while its
+        // KV cells are cut (kv_hole_ranges ledger), so the prompt length overstates
+        // the resident by the cut span. Capping on the raw prompt length killed
+        // valid generations at n_gen=1 whenever the prompt alone exceeded the
+        // buffer cap (2026-10-07: prompt 59358 / resident 46865, 12055 cells free).
+        // n_gen must be in the projection too: the prompt length is constant during
+        // generation, so without it an over-long generation could never trip this.
         {
             const int64_t buf_cap = params_base.kv_cache_size > 0 ?
                 (int64_t) params_base.kv_cache_size - 16384 : (int64_t) slot.n_ctx;
             const int64_t ctx_limit = std::min<int64_t>(slot.n_ctx, buf_cap);
-            if (!params_base.ctx_shift && (int64_t) slot.prompt.n_tokens() + 1 >= ctx_limit) {
+            int64_t holes_cut = 0;
+            for (const auto & r : slot.kv_hole_ranges) holes_cut += (int64_t) (r.second - r.first);
+            int64_t resident_base = (int64_t) slot.prompt.n_tokens() - holes_cut;
+            if (holes_cut == 0 && slot.kv_holes_active && slot.kv_hole_peak_resident > 0) {
+                resident_base = slot.kv_hole_peak_resident;
+            }
+            const int64_t projected = resident_base + (int64_t) slot.stats.n_gen + 1;
+            if (!params_base.ctx_shift && projected >= ctx_limit) {
                 slot.truncated      = true;
                 slot.stop           = STOP_TYPE_LIMIT;
                 slot.has_next_token = false;
@@ -2503,9 +2517,9 @@ private:
                     // INFO (not DBG): the client sees finish_reason=length and halts,
                     // so the journal must record that the KV buffer (not the model
                     // n_ctx) capped generation - distinct from a normal n_ctx stop.
-                    SRV_INF("slot %d: generation stopped at KV buffer cap - prompt %d >= buffer %d - 16384 (n_ctx %d, n_gen %d) -> finish_reason=length\n",
-                            (int) slot.id, (int) slot.prompt.n_tokens(), params_base.kv_cache_size,
-                            slot.n_ctx, (int) slot.stats.n_gen);
+                    SRV_INF("slot %d: generation stopped at KV buffer cap - resident %d (prompt %d - holes cut %d) + n_gen %d >= buffer %d - 16384 (n_ctx %d) -> finish_reason=length\n",
+                            (int) slot.id, (int) resident_base, (int) slot.prompt.n_tokens(), (int) holes_cut,
+                            (int) slot.stats.n_gen, params_base.kv_cache_size, slot.n_ctx);
                 } else {
                     SLT_DBG(slot, "stopped due to running out of context capacity, prompt.n_tokens() = %d, task.n_tokens = %d, n_gen = %d, n_ctx = %d\n",
                             slot.prompt.n_tokens(), slot.task->n_tokens(), (int) slot.stats.n_gen, slot.n_ctx);
