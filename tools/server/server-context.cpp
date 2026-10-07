@@ -4972,7 +4972,29 @@ private:
                                         // restore the draft's speculative state
                                         common_speculative_set_state(spec.get(), slot.id, cur.data_spec);
 
-                                        SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, reuse.n_past, (float) cur.size() / 1024 / 1024);
+                                        // validate the restored state (hybrid/recurrent memory only):
+                                        // a context checkpoint serializes the recurrent state, but its
+                                        // position label was recorded as min(attn, recr). If the attention
+                                        // side was hole-cut - or left stale by an earlier PARTIAL_ONLY
+                                        // restore - when the checkpoint was saved, the label is lower than
+                                        // the recurrent position the state actually holds. Resuming at the
+                                        // label is impossible (the recurrent state cannot roll back beyond
+                                        // n_rs_seq), so discard the checkpoint and re-prefill from 0
+                                        // (plans/2026-10-07-kv-400-incident2.md).
+                                        // The label is compared against the actual recurrent position, not
+                                        // n_tokens - 1: the label == n_tokens - 1 identity holds in the
+                                        // incident logs, but it is not a general invariant - hole/evict
+                                        // paths can diverge n_tokens from position, which would
+                                        // false-positive healthy checkpoints.
+                                        const llama_pos recr_pos = llama_memory_seq_pos_max_recr(llama_get_memory(ctx_tgt), slot.id);
+                                        if (recr_pos >= 0 && recr_pos != cur.pos_max) {
+                                            SLT_WRN(slot, "context checkpoint label (pos_max = %d) does not match the restored recurrent position (%d) - discarding checkpoint, wiping sequence and re-prefilling from 0\n",
+                                                    cur.pos_max, (int) recr_pos);
+                                            slot.mem.seq_rm_checked(slot.id, -1, -1);
+                                            reuse = {};
+                                        } else {
+                                            SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, reuse.n_past, (float) cur.size() / 1024 / 1024);
+                                        }
                                     }
                                 }
 
@@ -5184,7 +5206,24 @@ private:
 
                     SLT_TRC(slot, "cached n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
 
-                    slot.mem.seq_rm(slot.kv_seq(), p0, -1);
+                    if (!slot.mem.seq_rm_checked(slot.kv_seq(), p0, -1)) {
+                        // fail-open (the server never aborts on a cache inconsistency): the
+                        // recurrent state cannot be rolled back to n_past - e.g. a context
+                        // checkpoint whose recurrent state is newer than its position label
+                        // (see plans/2026-10-07-kv-400-incident2.md). The cached prefix is
+                        // unusable: wipe the whole sequence (target + draft) and re-prefill
+                        // from 0. Full removal always succeeds (rm_all).
+                        SLT_WRN(slot, "truncate seq_rm failed (p0=%d) - recurrent state cannot roll back to n_past; wiping sequence and re-prefilling from 0\n", p0);
+                        slot.mem.seq_rm_checked(slot.kv_seq(), -1, -1);
+                        slot.prompt.tokens.clear();
+                        slot.stats.n_prompt_cached = 0;
+                        // the wiped KV invalidates the applied holes; the request-scoped
+                        // pending holes survive and are re-cut progressively during the
+                        // re-prefill
+                        slot.kv_hole_ranges.clear();
+                        slot.kv_holes_active = false;
+                        slot.kv_hole_peak_resident = 0;
+                    }
 
                     // shared prompt prefix: once it is processed, the children continue from it with their own prompt
                     bool wait_shared = false;
@@ -5444,7 +5483,13 @@ private:
                     }
 
                     const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
-                    const auto pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+                    // the label a PARTIAL_ONLY checkpoint must record: the position at which
+                    // the serialized state can be resumed. For hybrid memory the state is the
+                    // recurrent state only, so this is the recurrent position - not
+                    // seq_pos_max() (min(attn, recr)), which is lower whenever the attention
+                    // side is hole-cut or truncated to n_past by a checkpoint restore and
+                    // would poison the label below the state (plans/2026-10-07-kv-400-incident2.md)
+                    const auto pos_max = llama_memory_seq_pos_max_partial(llama_get_memory(ctx_tgt), slot.id);
 
                     // nothing to checkpoint yet
                     // TODO: is this check needed?
