@@ -7284,7 +7284,8 @@ static const std::unordered_set<std::string> & recall_tag_names(const llama_voca
             "think", "thinking", "invoke",
             "function_calls", "function_results", "tool_use", "tool_result",
             "focus", "local", "global", "recap", "recall",
-            "qwen:user-prompt-submit-context"
+            "qwen:user-prompt-submit-context",
+            "system-reminder"
         };
         const int32_t n = llama_vocab_n_tokens(vocab);
         for (int32_t i = 0; i < n; i++) {
