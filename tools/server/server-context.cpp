@@ -8230,16 +8230,20 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                                 params.kv_cache_size, (int) evicted_tokens,
                                 (int) planned_tokens, (int) put_failed, kv_session.c_str());
 
+                        // NOTE: message wording is constrained - the client (qwen-code) pattern-matches
+                        // the error text for context overflow ("input|prompt|message|context" + "tokens"
+                        // + "exceed" within 120 chars triggers reactive compaction with a wrong
+                        // originalTokenCount). Keep those word combinations out of both branches.
                         if (put_failed) {
                             // store problem: retryable, must not look like "context too long"
                             res->error(format_error_response(
-                                string_format("FocusMemory store unavailable: %d projected tokens (resident %d + max recall %d + generation %d) exceed --kv-cache-size %d minus the 16384 headroom because evicted segments could not be offloaded. Restore the store and retry.",
+                                string_format("FocusMemory store unavailable: projected demand %d (resident %d + max recall %d + generation %d) is above --kv-cache-size %d minus the 16384 headroom because evicted segments could not be offloaded. Restore the store and retry.",
                                               (int) projected, (int) resident, (int) recall_cost, (int) gen_cost,
                                               params.kv_cache_size),
                                 ERROR_TYPE_UNAVAILABLE));
                         } else {
                             res->error(format_error_response(
-                                string_format("prompt does not fit the decoupled KV buffer: %d projected tokens (resident %d + max recall %d + generation %d) exceed --kv-cache-size %d minus the 16384 headroom (pin + hot window + delta too large). Minimum required buffer is %d (threshold %d + n_predict %d + headroom 16384); raise --kv-cache-size to at least that, or lower --kv-offload-threshold/--n-predict - lowering --kv-retain-tokens alone is often ineffective because the clamp already bounds the resident target.",
+                                string_format("request does not fit the decoupled KV buffer: projected demand %d (resident %d + max recall %d + generation %d) is above --kv-cache-size %d minus the 16384 headroom (pin + hot window + delta too big). Minimum required buffer is %d (threshold %d + n_predict %d + headroom 16384); raise --kv-cache-size to at least that, or lower --kv-offload-threshold/--n-predict - lowering --kv-retain-tokens alone is often ineffective because the clamp already bounds the resident target.",
                                               (int) projected, (int) resident, (int) recall_cost, (int) gen_cost,
                                               params.kv_cache_size,
                                               (int) ((int64_t) params.kv_offload_threshold + n_predict_eff + 16384),
