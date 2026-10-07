@@ -2761,8 +2761,8 @@ private:
                     dbg_count(g, "<tool_call>", E) != dbg_count(g, "</tool_call>", E) ||
                     dbg_count(g, "<function=", E) != dbg_count(g, "</function>", E) ||
                     dbg_count(g, "<parameter=", E) != dbg_count(g, "</parameter>", E);
-                SLT_INF(slot, "da_trace: final n_gen=%d stop=%d unbalanced=%d tail='%s'\n",
-                        (int) slot.stats.n_gen, (int) slot.stop, (int) unbalanced, dbg_esc(g.substr(E > 300 ? E - 300 : 0), 320).c_str());
+                //SLT_INF(slot, "da_trace: final n_gen=%d stop=%d unbalanced=%d tail='%s'\n",
+                //        (int) slot.stats.n_gen, (int) slot.stop, (int) unbalanced, dbg_esc(g.substr(E > 300 ? E - 300 : 0), 320).c_str());
                 if (unbalanced) SLT_WRN(slot, "%s", "da_trace: DERAIL-SUSPECT (tool-call tags unbalanced)\n");
             }
 
@@ -8375,8 +8375,8 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                             }
                             if (was_cached) {
                                 put_ok = true;
-                                SRV_INF("kv_offload: PUT skip (cached) key=%s tokens=%d (%s)\n",
-                                        seg.key.c_str(), seg.tokens, seg.hint.c_str());
+                                //SRV_INF("kv_offload: PUT skip (cached) key=%s tokens=%d (%s)\n",
+                                //        seg.key.c_str(), seg.tokens, seg.hint.c_str());
                             } else {
                                 put_ok = kv_offload_put(params.focus_memory_host, params.focus_memory_token,
                                                         kv_session, seg.key, seg.text, seg.tokens);
