@@ -23,7 +23,7 @@ if [ -z "$cur" ] || [ "$cur" = "$BASE" ]; then
   exit 1
 fi
 
-git rev-list --reverse --format='%H' "$BASE".."$UPSTREAM" 2>/dev/null > "$OUT/behind_ordered.txt"
+git rev-list --reverse "$BASE".."$UPSTREAM" 2>/dev/null > "$OUT/behind_ordered.txt"
 : > "$OUT/cp_conflicts.txt"
 : > "$OUT/cp_conflict_files.txt"
 ok=0; empty=0; conf=0; err=0
