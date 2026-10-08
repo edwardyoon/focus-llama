@@ -8235,6 +8235,14 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                 std::string kv_session;  // FocusMemory session id (set if kv_offload ran)
                 if (params.kv_offload && !params.focus_memory_host.empty()) {
                     kv_session = kv_offload_resolve_session(req, data);
+                    // Record the session's logical (full prompt) token count for
+                    // GET /kv_state. resident is derived as logical - offloaded.
+                    // Per-session (keyed by kv_session), so parallel slots running
+                    // different sessions never mix their values.
+                    {
+                        std::lock_guard<std::mutex> lk(kv_offload_put_mutex);
+                        kv_session_logical[kv_session] = (int64_t) task.tokens.size();
+                    }
                     // B4 pin release: the FocusMemory state worker sets the
                     // session's pin_released flag when the user cancelled or
                     // superseded the original first task. Sticky: a cached
@@ -8453,12 +8461,12 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                                 if (put_ok) {
                                     std::lock_guard<std::mutex> lk(kv_offload_put_mutex);
                                     auto & keys = kv_offload_uploaded[kv_session];
-                                    // Memory ceiling: bound the per-session key set. Evict
-                                    // the lexicographically smallest key (std::set has no
-                                    // insertion order) - worst case that key is re-PUT
+                                    // Memory ceiling: bound the per-session key map. Evict
+                                    // the lexicographically smallest key (std::map is
+                                    // ordered by key) - worst case that key is re-PUT
                                     // later (idempotent).
                                     if (keys.size() >= 4096) keys.erase(keys.begin());
-                                    keys.insert(seg.key);
+                                    keys[seg.key] = seg.tokens;
                                     SRV_INF("kv_offload: PUT ok key=%s tokens=%d (%s)\n",
                                             seg.key.c_str(), seg.tokens, seg.hint.c_str());
                                 }
@@ -8882,6 +8890,37 @@ std::unique_ptr<server_res_generator> server_routes::create_response(bool bypass
     return std::make_unique<server_res_generator>(queue_tasks, queue_results, params.sleep_idle_seconds, bypass_sleep);
 }
 
+json server_routes::build_kv_state_json(const std::string & session) const {
+    // Assumes kv_offload_put_mutex is held by the caller.
+    const auto it_logical = kv_session_logical.find(session);
+    const auto it_ledger  = kv_offload_uploaded.find(session);
+    if (it_logical == kv_session_logical.end() && it_ledger == kv_offload_uploaded.end()) {
+        return nullptr; // unknown session
+    }
+    int64_t logical   = (it_logical != kv_session_logical.end()) ? it_logical->second : 0;
+    int64_t offloaded = 0;
+    int64_t evictions = 0;
+    if (it_ledger != kv_offload_uploaded.end()) {
+        evictions = (int64_t) it_ledger->second.size();
+        for (const auto & kv : it_ledger->second) {
+            offloaded += kv.second;
+        }
+    }
+    // In both offload modes (holes keeps evicted text in the prompt and cuts the
+    // KV cells; the default removes the text) the KV-resident count is the full
+    // logical size minus the offloaded tokens.
+    int64_t resident = logical - offloaded;
+    if (resident < 0) resident = 0;
+    return {
+        {"session",   session},
+        {"logical",   logical},
+        {"resident",  resident},
+        {"offloaded", offloaded},
+        {"evictions", evictions},
+        {"buffer",    (int64_t) params.kv_cache_size},
+    };
+}
+
 server_routes::server_routes(const common_params & params, server_context & ctx_server)
         : params(params),
           ctx_server(*ctx_server.impl),
@@ -9121,6 +9160,33 @@ void server_routes::init_routes() {
         }
 
         res->ok(res_task->to_json());
+        return res;
+    };
+
+    this->get_kv_state = [this](const server_http_req & req) {
+        // Per-session KV state for the FocusMemory client. Reads in-memory
+        // state only (no model / task queue), so it works during sleep too.
+        auto res = create_response(true);
+        const std::string session = req.get_param("session");
+        std::lock_guard<std::mutex> lk(kv_offload_put_mutex);
+        if (session.empty()) {
+            // No session: return the state of every known session.
+            json sessions = json::object();
+            std::set<std::string> all;
+            for (const auto & kv : kv_offload_uploaded) all.insert(kv.first);
+            for (const auto & kv : kv_session_logical)  all.insert(kv.first);
+            for (const auto & s : all) {
+                sessions[s] = build_kv_state_json(s);
+            }
+            res->ok(sessions);
+            return res;
+        }
+        json state = build_kv_state_json(session);
+        if (state.is_null()) {
+            res->error(format_error_response("kv_state: session not found: " + session, ERROR_TYPE_NOT_FOUND));
+            return res;
+        }
+        res->ok(state);
         return res;
     };
 
