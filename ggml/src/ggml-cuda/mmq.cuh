@@ -381,6 +381,12 @@ static __host__ bool ggml_cuda_mmq_needs_fallback(const int64_t nrows_x) {
     return nrows_x % 128 != 0;
 }
 
+// Whether one CUDA block per tile (tiling) fills the SMs well enough that stream-k is not needed.
+static __host__ bool ggml_cuda_mmq_tiling_is_efficient(const int64_t ntiles, const int nsm) {
+    const int64_t nwaves = (ntiles + nsm - 1) / nsm;
+    return 100*ntiles / (nsm*nwaves) >= 90;
+}
+
 static constexpr __device__ int ggml_cuda_mmq_get_rows_per_warp(ggml_type type, int J, bool fallback, ggml_prec prec_src1) {
     return ggml_cuda_mmq_get_config(type, J, fallback, prec_src1).rows_per_warp();
 }
@@ -580,49 +586,6 @@ static __device__ __forceinline__ void ggml_cuda_mmq_write_back_mma(
     }
 
     GGML_UNUSED_VARS(y_scale_used, glu_op, glu_limit, x_scale, gate_scale, scale_up, scale_gate);
-}
-
-// Fused gate/up/GLU write-back: accumulators l and l + 2 hold the up and gate values of the same output row and column.
-template<ggml_type type, int J, bool fallback, ggml_prec prec_src1>
-static __device__ __forceinline__ void ggml_cuda_mmq_write_back_mma_glu(
-            const float * __restrict__ sum, const ggml_glu_op glu_op, const float glu_limit,
-            const int * __restrict__ ids_dst, float * __restrict__ dst, const int stride, const int i_max, const int j_max) {
-#ifdef TURING_MMA_AVAILABLE
-    typedef tile<16, 8, int> tile_C;
-    static_assert(tile_C::I == 2*GGML_CUDA_MMQ_FUSION_ROWS, "each C tile must hold one chunk of up rows and one of gate rows");
-
-    constexpr int rows_per_warp = ggml_cuda_mmq_get_rows_per_warp(type, J, fallback, prec_src1);
-    constexpr int ntx           = rows_per_warp/tile_C::I; // Number of x minitiles per warp.
-
-    const int i0 = (threadIdx.y / ntx) * (ntx*tile_C::I);
-
-#pragma unroll
-    for (int j0 = 0; j0 < J; j0 += ntx*tile_C::J) {
-#pragma unroll
-        for (int n = 0; n < ntx; ++n) {
-#pragma unroll
-            for (int l = 0; l < tile_C::ne/2; ++l) {
-                const int j = j0 + (threadIdx.y % ntx) * tile_C::J + tile_C::get_j(l);
-
-                if (j > j_max) {
-                    continue;
-                }
-
-                const int i = (i0 + n*tile_C::I)/2 + tile_C::get_i(l);
-
-                if (fallback && i > i_max) {
-                    continue;
-                }
-
-                const int sum_index = (j0/tile_C::J + n)*tile_C::ne + l;
-                dst[ids_dst[j]*stride + i] = ggml_cuda_op_glu_single(glu_op, sum[sum_index + 2], sum[sum_index], glu_limit);
-            }
-        }
-    }
-#else
-    GGML_UNUSED_VARS(sum, glu_op, glu_limit, ids_dst, dst, stride, i_max, j_max);
-    NO_DEVICE_CODE;
-#endif // TURING_MMA_AVAILABLE
 }
 
 // -------------------------------------------------------------------------------------------------------------------------------------
@@ -1050,12 +1013,6 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
         __syncthreads();
     }
-
-    if constexpr (has_fusion) {
-        ggml_cuda_mmq_write_back_mma_glu<type, J, fallback, prec_src1>(sum, glu_op, glu_limit, ids_dst, dst, stride_col_dst, tile_x_i_max, tile_y_j_sup);
-        return;
-    }
-    GGML_UNUSED_VARS(glu_op, glu_limit);
 
     if (fixup) {
         write_back(sum, ids_dst, tmp_fixup + blockIdx.x*(J*I), y_scale, I, I, J, glu_op, glu_limit, x_scale, gate_scale);

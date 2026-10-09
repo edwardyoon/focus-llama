@@ -527,7 +527,7 @@ template <ggml_type type, int J, bool fallback, bool has_fusion> static __device
     for (int i0 = 0; i0 < I; i0 += nrows*nwarps) {
         int i = i0 + (nrows == 1 ? threadIdx.y : threadIdx.y*nrows + threadIdx.x/threads_per_row);
 
-        if (fallback && !has_fusion) {
+        if (fallback) {
             i = min(i, i_max);
         }
 
@@ -550,7 +550,7 @@ template <ggml_type type, int J, bool fallback, bool has_fusion> static __device
     for (int i0 = 0; i0 < I; i0 += nwarps * rows_per_warp) {
         int i = i0 + threadIdx.y * rows_per_warp + threadIdx.x / blocks_per_tile_x_row;
 
-        if (fallback && !has_fusion) {
+        if (fallback) {
             i = min(i, i_max);
         }
 
@@ -768,7 +768,7 @@ template <ggml_type type, int J, bool fallback, bool has_fusion> static __device
     for (int i0 = 0; i0 < I; i0 += nrows*nwarps) {
         int i = i0 + (nrows == 1 ? threadIdx.y : threadIdx.y*nrows + threadIdx.x/threads_per_row);
 
-        if (fallback && !has_fusion) {
+        if (fallback) {
             i = min(i, i_max);
         }
 
@@ -797,7 +797,7 @@ template <ggml_type type, int J, bool fallback, bool has_fusion> static __device
         int i = (i0 + threadIdx.y*rows_per_warp + threadIdx.x/2) % I;
         {
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
-            if (fallback && !has_fusion) {
+            if (fallback) {
                 i = min(i, i_max);
             }
 
@@ -825,7 +825,7 @@ template <ggml_type type, int J, bool fallback, bool has_fusion> static __device
     for (int i0 = 0; i0 < I; i0 += nwarps*warp_size) {
         int i = (i0 + threadIdx.y*warp_size + threadIdx.x) % I;
 
-        if (fallback && !has_fusion) {
+        if (fallback) {
             i = min(i, i_max);
         }
 
@@ -838,7 +838,7 @@ template <ggml_type type, int J, bool fallback, bool has_fusion> static __device
     for (int i0 = 0; i0 < I; i0 += nwarps*rows_per_warp) {
         int i = (i0 + threadIdx.y*rows_per_warp + threadIdx.x/(MMQ_TILE_NE_K/8)) % I;
 
-        if (fallback && !has_fusion) {
+        if (fallback) {
             i = min(i, i_max);
         }
 
@@ -879,7 +879,7 @@ template <ggml_type type, int J, bool fallback, bool has_fusion> static __device
     for (int i0 = 0; i0 < I; i0 += nrows*nwarps) {
         int i = i0 + (nrows == 1 ? threadIdx.y : threadIdx.y*nrows + threadIdx.x/threads_per_row);
 
-        if (fallback && !has_fusion) {
+        if (fallback) {
             i = min(i, i_max);
         }
 
@@ -920,7 +920,7 @@ template <ggml_type type, int J, bool fallback, bool has_fusion> static __device
         int i = (i0 + threadIdx.y*rows_per_warp + threadIdx.x/2) % I;
         {
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
-            if (fallback && !has_fusion) {
+            if (fallback) {
                 i = min(i, i_max);
             }
 
@@ -948,7 +948,7 @@ template <ggml_type type, int J, bool fallback, bool has_fusion> static __device
     for (int i0 = 0; i0 < I; i0 += nwarps*warp_size) {
         int i = (i0 + threadIdx.y*warp_size + threadIdx.x) % I;
 
-        if (fallback && !has_fusion) {
+        if (fallback) {
             i = min(i, i_max);
         }
 
@@ -962,7 +962,7 @@ template <ggml_type type, int J, bool fallback, bool has_fusion> static __device
     for (int i0 = 0; i0 < I; i0 += nwarps*rows_per_warp) {
         int i = (i0 + threadIdx.y*rows_per_warp + threadIdx.x/(MMQ_TILE_NE_K/8)) % I;
 
-        if (fallback && !has_fusion) {
+        if (fallback) {
             i = min(i, i_max);
         }
 
@@ -1004,7 +1004,7 @@ template <ggml_type type, int J, bool fallback, bool has_fusion> static __device
     for (int i0 = 0; i0 < I; i0 += nrows*nwarps) {
         int i = i0 + (nrows == 1 ? threadIdx.y : threadIdx.y*nrows + threadIdx.x/threads_per_row);
 
-        if (fallback && !has_fusion) {
+        if (fallback) {
             i = min(i, i_max);
         }
 
@@ -1034,7 +1034,7 @@ template <ggml_type type, int J, bool fallback, bool has_fusion> static __device
     for (int i0 = 0; i0 < I; i0 += nwarps*warp_size) {
         int i = (i0 + threadIdx.y*warp_size + threadIdx.x) % I;
 
-        if (fallback && !has_fusion) {
+        if (fallback) {
             i = min(i, i_max);
         }
 
@@ -1052,7 +1052,7 @@ template <ggml_type type, int J, bool fallback, bool has_fusion> static __device
     for (int i0 = 0; i0 < I; i0 += nwarps*rows_per_warp) {
         int i = (i0 + threadIdx.y*rows_per_warp + threadIdx.x/(MMQ_TILE_NE_K/8)) % I;
 
-        if (fallback && !has_fusion) {
+        if (fallback) {
             i = min(i, i_max);
         }
 
@@ -1496,7 +1496,7 @@ template <ggml_type type, int J, bool fallback, bool has_fusion> static __device
     for (int i0 = 0; i0 < I; i0 += nrows*nwarps) {
         int i = i0 + (nrows == 1 ? threadIdx.y : threadIdx.y*nrows + threadIdx.x/threads_per_row);
 
-        if (fallback && !has_fusion) {
+        if (fallback) {
             i = min(i, i_max);
         }
 
@@ -1520,7 +1520,7 @@ template <ggml_type type, int J, bool fallback, bool has_fusion> static __device
     for (int i0 = 0; i0 < I; i0 += nwarps * rows_per_warp) {
         int i = i0 + threadIdx.y * rows_per_warp + threadIdx.x / (MMQ_TILE_NE_K/4);
 
-        if (fallback && !has_fusion) {
+        if (fallback) {
             i = min(i, i_max);
         }
 
