@@ -283,10 +283,47 @@ decides *which* middle messages leave the KV and *how* to bring one back on dema
 still owns the re-chunking. It requires `--da-auto` + `--kv-unified` (the eviction runs inside
 the auto-chunk gate) and a store reachable at `--focus-memory-host`.
 
+**High/low watermark (hysteresis, holes mode).** With the plain gate, a session that has
+crossed the threshold re-runs the evict plan + store PUT + hole re-apply on *every*
+subsequent turn - each run shaving only the per-turn increment, so the planning/refill
+cost repeats for the life of the session. `--kv-offload-high` turns the gate into a
+high/low watermark cycle:
+
+- **High (the trigger).** The gate measures the session's **KV-resident** count - the
+  full logical prompt minus the *cumulative* evicted, from the per-session PUT ledger
+  (the same source `GET /kv_state` reports). Holes mode keeps the evicted text in the
+  prompt, so the raw token count overstates the resident; only the resident is the gate.
+  When `resident >= --kv-offload-high`, the engine runs **one** evict cycle: it plans the
+  oldest middle messages, PUTs them, and hole-punches the KV down to the **low target**
+  (`--kv-offload-threshold`, plus `--kv-retain-tokens` when set) in a single shot.
+- **Idle band (low < resident < high).** While the resident sits between the two
+  watermarks the gate does nothing: no evict plan, no PUT, no hole re-apply - zero
+  per-turn work. The already-cut holes persist in the KV (the `kv_hole_ranges` ledger,
+  never re-derived from an evict plan), so the resident stays low; recall of offloaded
+  chunks is unaffected because the Sigma anchor (the offloaded-chunks note) is fetched on
+  the *cumulative* evicted, not the current turn's. The buffer-cap check still runs on
+  idle turns, so a store-down / pin overflow is still caught.
+- **Re-arm.** As the conversation grows past the low target, the cycle simply waits for
+  the high watermark again - each crossing costs one drain, not one per turn.
+
+The low watermark is a **stop target, not a trigger** - eviction never fires below the
+high. `--kv-offload-high 0` (the default) keeps the legacy per-turn gate, so the
+watermark is an explicit opt-in. It is **holes mode only**: the default (Option C) mode
+needs the evict plan on every request to shrink the prompt text itself, so there is no
+band to wait in - with `--kv-offload-holes` off the server warns at startup and ignores
+the flag. Startup validation also refuses `--kv-offload-high < --kv-offload-threshold`,
+and with a `--kv-cache-size` set requires `high + n_batch + gen tail <= kv_cache_size -
+16384`: a request sitting just below the high watermark (the idle band's worst case)
+must still fit the buffer before eviction can trigger.
+
 **Status: verified (v2.0)** - see *Verified: lossless evict/recall* above.
 Running in production (qwen3.8-27B MROPE, `-c 200000 --kv-offload-threshold 38672`,
 since 09-26) with `--kv-offload-holes`: evictions PUT to the store and holes cut the KV on
-every turn of a live session.
+every turn of a live session. The watermark gate (`--kv-offload-high`, `b98be7033`) is
+verified by the startup checks (high < low refused, over-cap refused with the allowed max
+shown, non-holes warned and ignored) and the multi-turn journal: `kv_offload: gate`
+carries `resident=`/`high=` every turn, `kv_offload: watermark idle` marks the band
+turns, and `kv_offload: evict plan` appears only on the crossing turn.
 
 > **Flag naming.** The engine flag is `--fm-offload` (env `LLAMA_ARG_FM_OFFLOAD`), not
 > `--kv-offload`: the stock llama.cpp `-kvo/--kv-offload` flag (KV-cache offloading) already
@@ -310,10 +347,11 @@ llama-server \
   --spec-type draft-mtp-adaptive \
   --spec-draft-n-max 4 \
   --spec-draft-ngl all \
-  --kv-cache-size 85536 \
+  --kv-cache-size 115536 \
   --fm-offload \
   --kv-offload-holes \
   --kv-offload-threshold 38672 \
+  --kv-offload-high 55000 \
   --kv-retain-tokens 6000 \
   --focus-memory-host http://<store-host>:3900 \
   --focus-memory-token <CONTEXT_API_TOKEN>
@@ -342,9 +380,10 @@ Backend A vs B below.)
 | `--spec-type draft-mtp` | **Speculative decoding** with the model's MTP draft head | Speed-up on top of DA. Spec and DA **coexist**: while a slot is in DA mode (`da_seq` active) spec is paused automatically and resumes on the return to global attention - so spec stays ON without breaking DA |
 | `--spec-draft-n-max 4` | Up to 4 draft tokens per step | Enough to overlap decode with drafting, without so many that rejections waste work |
 | `--spec-draft-ngl all` | Puts the whole draft model on the GPU | The draft model is small; keeping it fully on-GPU avoids CPU round-trips that would erase the spec gain |
-| `--kv-cache-size 85536` | Physical KV buffer size in cells; decoupled from the logical position range - cells wrap while positions extend to `-c` (0 = default: n_ctx_seq) | Sized at threshold + retain + 16384 headroom with slack (38672 + 6000 + 16384 = 61056 ≤ 85536): eviction keeps the resident cells inside the buffer, and an over-buffer request is rejected before a find_slot failure |
+| `--kv-cache-size 85536` | Physical KV buffer size in cells; decoupled from the logical position range - cells wrap while positions extend to `-c` (0 = default: n_ctx_seq) | Sized for the watermark worst case - high + n_batch + gen tail + 16384 headroom (60000 + 2048 + 16384 = 78432 ≤ 85536, enforced at startup) - so a request sitting just below the high watermark still fits before eviction can trigger; an over-buffer request is rejected before a find_slot failure |
 | `--fm-offload` | **kv-offload**: evict the oldest middle messages to the focus-memory store once the prompt exceeds `--kv-offload-threshold`, and re-prefill them on demand when the model focuses an offloaded chunk | Replaces lossy auto-compaction with a lossless evict/refill cycle (see *kv-offload* above). Optional - off by default |
-| `--kv-offload-threshold 38672` | Token count at which kv-offload eviction engages | Size it at ~8-9 × `--da-chunk-tokens` (4096 → 38672): high enough that short sessions never evict, low enough that eviction engages long before the client's auto-compaction point, so the prompt stays a few chunks over the threshold instead of ballooning |
+| `--kv-offload-threshold 38672` | Token count at which kv-offload eviction engages (the **low** watermark when `--kv-offload-high` is set - the drain target, not a trigger) | Size it at ~8-9 × `--da-chunk-tokens` (4096 → 38672): high enough that short sessions never evict, low enough that eviction engages long before the client's auto-compaction point, so the prompt stays a few chunks over the threshold instead of ballooning |
+| `--kv-offload-high 60000` | kv-offload holes-mode **high watermark**: the only eviction trigger - when the session's KV-resident (full prompt minus cumulative evicted) reaches 60k, drain to the low target (`--kv-offload-threshold` + `--kv-retain-tokens`) in one shot; between low and high the gate is idle (no per-turn plan/PUT/hole work). 0 = legacy per-turn gate | Without it a session past the threshold re-runs the evict plan + PUT + hole re-apply every turn, shaving only the per-turn increment; the watermark makes each crossing cost a single drain. Sized under the buffer cap: `high + n_batch + gen tail <= 85536 - 16384` (60000 + 2048 fits, verified at startup) |
 | `--kv-retain-tokens 6000` | kv-offload: minimum recent tokens kept in the KV cache beyond `--kv-offload-threshold` when evicting (0 = evict down to the threshold only; default 0) | Keeps the active tail resident after each eviction so the hottest context never goes to the store; the buffer is sized to honor it, so retain is never clamped (see `--kv-cache-size`) |
 | `--focus-memory-host` | Base URL of the focus-memory KV store (`PUT`/`GET` `/v1/kv-offload/chunk`) | Empty = kv-offload disabled even with `--fm-offload` on (fail-open) |
 | `--focus-memory-token` | Bearer token for the store API (`CONTEXT_API_TOKEN`) | Empty = no auth header; set it to match the store |
@@ -388,8 +427,9 @@ journalctl -u qwen3.8-focus --since "10 min ago" | grep -E 'da_scan:|da_auto:|da
 - `da_scan:` - the prompt scanner found the `[[da:N]]`/`<da:N>` markers and built the chunk-to-range map (marker path)
 - `da_auto:` - auto-chunking split the prompt (the recommended production line runs `--da-auto`)
 - `da_tag:` - a `<focus>`/`<local>` tag was parsed and the attention restriction applied
-- `kv_offload: gate` - kv-offload engaged for the request: logs the threshold, store host, current token count, and session
-- `kv_offload: evict plan` / `PUT ok` / `evicted N segment(s)` - the eviction sequence: the plan, each successful store PUT, and the prompt shrink
+- `kv_offload: gate` - kv-offload engaged for the request: logs threshold, retain/target, buffer, raw token count, the KV-resident count (`resident=`), the high watermark (`high=`; 0 = legacy per-turn gate), store host, and session - one line per turn
+- `kv_offload: watermark idle` - a holes-mode turn inside the watermark band (`resident < high`): no evict plan, PUT, or hole work this turn; the already-cut holes persist
+- `kv_offload: evict plan` / `PUT ok` / `evicted N segment(s)` - the eviction sequence: the plan, each successful store PUT, and the KV cut (holes mode) or prompt shrink (default mode); with the watermark on, only on the turn the resident crosses the high watermark
 - `kv_offload: get-on-focus` / `GET ok ... re-prefilling` - the model focused an offloaded chunk and it was fetched + re-prefilled at the tail
 - `kv_offload: disabled` (one-time warning) - `--fm-offload` was not parsed or `--focus-memory-host` is empty, so eviction can never engage
 
