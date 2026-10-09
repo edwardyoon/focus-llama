@@ -5118,6 +5118,34 @@ private:
             : n_prompt;
     }
 
+    // Subtract [sub_lo, sub_hi) from a list of token ranges. For each range
+    // that overlaps the subtraction range, the overlapping part is removed
+    // (splitting the range into left and right parts when the subtraction
+    // range is in the middle). Ranges that do not overlap are kept unchanged.
+    // Used to guarantee that the Σ anchor range is NOT removed (stays in the
+    // keep set) regardless of the layout scan's classification.
+    static void da_subtract_range(std::vector<std::pair<int32_t, int32_t>> & ranges, int32_t sub_lo, int32_t sub_hi) {
+        if (sub_hi <= sub_lo) {
+            return;
+        }
+        std::vector<std::pair<int32_t, int32_t>> out;
+        for (const auto & r : ranges) {
+            const int32_t lo = r.first;
+            const int32_t hi = r.second;
+            if (hi <= sub_lo || lo >= sub_hi) {
+                out.emplace_back(lo, hi);  // no overlap
+                continue;
+            }
+            if (lo < sub_lo) {
+                out.emplace_back(lo, sub_lo);  // left part
+            }
+            if (hi > sub_hi) {
+                out.emplace_back(sub_hi, hi);  // right part
+            }
+        }
+        ranges = std::move(out);
+    }
+
     // Declarative Attention: remove the given prompt token ranges from the KV
     // cache of the target context (and the draft context, when speculative
     // decoding is active). The removal is a no-op for positions whose KV does
@@ -5142,7 +5170,25 @@ private:
         SLT_INF(slot, "da_rm: applying %zu range(s) (%s) - bound=%d, n_prompt=%d\n",
                 ranges.size(), when, bound, n_prompt);
 
-        for (const auto & range : ranges) {
+        // Subtract the Σ anchor range from the removal ranges so it is
+        // guaranteed to stay (not removed). The Σ block is server-injected
+        // text (not in the client history) that must remain visible to the
+        // model after a removal, regardless of how the layout scan classifies
+        // the region after the filler.
+        std::vector<std::pair<int32_t, int32_t>> rm_ranges = ranges;
+        {
+            const auto & sig = slot.task->params.da_sigma;
+            if (sig.first >= 0) {
+                const int32_t s_lo = std::max(sig.first, 0);
+                const int32_t s_hi = std::min(sig.second, bound);
+                if (s_hi > s_lo) {
+                    da_subtract_range(rm_ranges, s_lo, s_hi);
+                    SLT_INF(slot, "da_rm: sigma tokens [%d, %d) kept (subtracted from removal ranges)\n", s_lo, s_hi);
+                }
+            }
+        }
+
+        for (const auto & range : rm_ranges) {
             int32_t lo = range.first;
             int32_t hi = range.second;
 
@@ -5337,6 +5383,23 @@ private:
                 rm_merged.back().second = std::max(rm_merged.back().second, r.second);
             } else {
                 rm_merged.emplace_back(r);
+            }
+        }
+
+        // Subtract the Σ anchor range from the removal ranges so it is
+        // guaranteed to stay in the keep set. The Σ block is server-injected
+        // text (not in the client history) that must remain visible to the
+        // model after a B switch, regardless of how the layout scan classifies
+        // the region after the filler.
+        {
+            const auto & sig = slot.task->params.da_sigma;
+            if (sig.first >= 0) {
+                const int32_t s_lo = std::max(sig.first, 0);
+                const int32_t s_hi = std::min(sig.second, bound);
+                if (s_hi > s_lo) {
+                    da_subtract_range(rm_merged, s_lo, s_hi);
+                    SLT_INF(slot, "da_b: sigma tokens [%d, %d) kept (subtracted from removal ranges)\n", s_lo, s_hi);
+                }
             }
         }
 
@@ -7732,6 +7795,7 @@ struct da_auto_layout {
     std::vector<size_t> header_pos;  // final char offsets of the [Magic Chunk N] lines
     size_t tail_pos = 0;             // final char offset of the last user message start
     std::pair<size_t, size_t> filler = { 0, 0 };  // final char range of the appended instruction
+    std::pair<size_t, size_t> sigma  = { 0, 0 };  // final char range of the Σ anchor (after the filler)
     size_t n_source_msgs = 0;
 };
 
@@ -8051,18 +8115,19 @@ static da_auto_layout da_auto_chunk(const llama_vocab * vocab, const std::string
             }
         }
     }
-    // kv-offload (mid-turn Σ, 2026-10-09): append the session's state anchor
-    // (fetched by the caller, 200ms cap, fail-open) as the LAST part of the
-    // offloaded note. The note sits in the DA instruction, which is inserted
-    // at the end of the last user message (the filler, before the im_end
-    // terminator) — a changing anchor only touches the prompt tail, so
-    // --cache-reuse keeps the prefix. Framing: a RECORD of the session's
-    // state, not a task — the latest user message still defines the work.
+    // kv-offload (mid-turn Σ, 2026-10-09): the session's state anchor goes in
+    // the SCAFFOLD (kept in FOCUS mode), NOT the filler (removed in FOCUS
+    // mode). It is inserted AFTER the DA instruction, so the filler range
+    // covers only the instruction. A changing anchor only touches the prompt
+    // tail, so --cache-reuse keeps the prefix. Framing: a RECORD of the
+    // session's state, not a task — the latest user message still defines the
+    // work.
+    std::string sigma_block;
     if (!sigma_anchor.empty()) {
-        offloaded_note += "\nSession state record (FocusMemory Σ, updated mid-turn as history leaves the KV) - "
-                          "a RECORD of this session, not a new task: the latest user message still defines the work. "
-                          "Re-ground on it before concluding or changing direction:\n"
-                         + sigma_anchor + "\n";
+        sigma_block = "\nSession state record (FocusMemory Σ, updated mid-turn as history leaves the KV) - "
+                      "a RECORD of this session, not a new task: the latest user message still defines the work. "
+                      "Re-ground on it before concluding or changing direction:\n"
+                     + sigma_anchor + "\n";
     }
     const std::string instruction =
         "\n\nInstructions (Declarative Attention):\n"
@@ -8112,8 +8177,15 @@ static da_auto_layout da_auto_chunk(const llama_vocab * vocab, const std::string
     }
     out.filler = { instr_pos, instr_pos + instruction.size() };
     modified.insert(instr_pos, instruction);
-
-
+    // Insert the Σ anchor AFTER the instruction — in the scaffold (kept in
+    // FOCUS mode), not the filler (removed in FOCUS mode). The filler range
+    // above covers only the instruction. Record its char range so the caller
+    // can map it to tokens and the B/A paths can union it into the keep set
+    // (explicit, independent of the layout scan's classification).
+    if (!sigma_block.empty()) {
+        out.sigma = { instr_pos + instruction.size(), instr_pos + instruction.size() + sigma_block.size() };
+        modified.insert(instr_pos + instruction.size(), sigma_block);
+    }
 
     // all header insertions sit before the last user message, so its start
     // shifts by the total header length
@@ -8671,12 +8743,27 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                             filler = { lo, hi };
                         }
                     }
+                    std::pair<int32_t, int32_t> sigma = { -1, -1 };
+                    if (ok && layout.sigma.second > layout.sigma.first) {
+                        const int32_t lo = da_char_to_token_nearest(offs, layout.sigma.first);
+                        const int32_t hi = da_char_to_token_nearest(offs, layout.sigma.second);
+                        if (lo < 0 || hi < 0 || hi <= lo) {
+                            // A sigma mapping failure must not disable DA for
+                            // the whole request (keeping vanilla): drop the
+                            // sigma protection ({-1,-1}) and continue with the
+                            // rest of the layout.
+                            SRV_WRN("%s", "da_auto: sigma range does not map to token boundaries - continuing without sigma protection\n");
+                        } else {
+                            sigma = { lo, hi };
+                        }
+                    }
                     if (!ok) {
                         SRV_WRN("%s", "da_auto: layout does not map to token boundaries - keeping vanilla\n");
                     } else {
                         task.tokens  = server_tokens(toks, false);
                         task.params.da_chunks = std::move(chunks);
                         task.params.da_filler = filler;
+                        task.params.da_sigma  = sigma;
                         task.params.da_b      = params.kv_unified;
                         // kv-offload (Option C): assign the virtual chunk numbers to
                         // the evicted segments (M+1..M+K) so get-on-focus can look

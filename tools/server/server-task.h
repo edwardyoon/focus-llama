@@ -94,6 +94,11 @@ struct task_params {
     // Filler segment range [lo, hi), removed together with the non-kept
     // chunks. {-1, -1} when the layout has no filler.
     std::pair<int32_t, int32_t> da_filler = { -1, -1 };
+    // Σ anchor range [lo, hi) (the FocusMemory session-state record appended
+    // after the filler). Explicitly unioned into the keep set in apply_da_b /
+    // apply_da_rm so it survives a B switch regardless of the layout scan's
+    // classification of the region after the filler. {-1, -1} when absent.
+    std::pair<int32_t, int32_t> da_sigma = { -1, -1 };
     // First chunk number of the scanned layout block (the FocusMemory hook
     // numbers chunks monotonically per session, so a later turn's block may
     // start at k > 1). The tag state machine maps magic_chunks="N" to
