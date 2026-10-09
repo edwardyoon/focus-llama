@@ -1756,6 +1756,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.da_measure_only = value;
         }
     ).set_env("LLAMA_ARG_DA_MEASURE_ONLY").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        {"--da-tail-keep"}, "N",
+        "Declarative Attention tail floor: the most recent N tokens before the removal boundary are always kept in the DA keep set (the union of the tag selection, the Sigma anchor and the tail), so the work in progress survives a B switch even when no magic_chunks tag covers it. 0 = legacy behavior (no floor) (default: 8192)",
+        [](common_params & params, int value) {
+            params.da_tail_keep = value;
+        }
+    ).set_env("LLAMA_ARG_DA_TAIL_KEEP").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        {"--da-b-min-remove"}, "N",
+        "Declarative Attention 2-stream (B): skip the B switch when fewer than N tokens would be removed (the switch cost - seq_cp, a second sequence id, the restore copy at release - outweighs a tiny removal; the output stays vanilla). 0 = always switch (default: 0)",
+        [](common_params & params, int value) {
+            params.da_b_min_remove = value;
+        }
+    ).set_env("LLAMA_ARG_DA_B_MIN_REMOVE").set_examples({ LLAMA_EXAMPLE_SERVER }));
     // NOTE: named --fm-offload (not --kv-offload): the standard llama.cpp
     // -kvo/--kv-offload flag (KV cache offloading) already owns that name and
     // the LLAMA_ARG_KV_OFFLOAD env var, so a --kv-offload here was silently

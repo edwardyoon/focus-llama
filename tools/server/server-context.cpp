@@ -547,6 +547,21 @@ struct server_slot {
     // tag state machine + logging can measure g (tag position) and emission
     // rate on real traffic without touching the KV cache.
     bool da_measure_only = false;
+    // DA tail floor (plans/continous_work2.md): the most recent da_tail_keep
+    // tokens before the removal boundary are always kept - subtracted from the
+    // removal ranges in apply_da_rm/apply_da_b next to the Sigma anchor. The
+    // keep set is the union of the tag selection, the Sigma anchor and the
+    // tail: without the floor, the work region the model was just in (not
+    // covered by any magic_chunks tag) is masked out at a B switch and the
+    // model forgets what it just did. Server-level, copied at slot init
+    // (0 = legacy behavior).
+    int32_t da_tail_keep = 8192;
+    // DA 2-stream (B) no-benefit skip threshold (plans/continous_work2.md,
+    // optional item): when > 0, apply_da_b skips the switch if fewer than
+    // this many tokens would be removed - the switch cost outweighs a tiny
+    // removal and the output stays vanilla. 0 = always switch (legacy).
+    // Server-level, copied at slot init.
+    int32_t da_b_min_remove = 0;
     // Phase 0: generated-token index at which the first <focus>/<local> tag
     // closed (-1 = no restriction tag emitted yet). release() logs it together
     // with the total n_gen to give g = first_tag / total (the global-step
@@ -1867,6 +1882,8 @@ private:
             slot.spec    = spec.get();
             slot.n_ctx   = n_ctx_slot();
             slot.da_measure_only = params_base.da_measure_only;
+            slot.da_tail_keep    = params_base.da_tail_keep;
+            slot.da_b_min_remove = params_base.da_b_min_remove;
 
             slot.mctx                   = mctx;
             slot.prompt.tokens.has_mtmd = mctx != nullptr;
@@ -5152,6 +5169,69 @@ private:
         ranges = std::move(out);
     }
 
+    // Total span covered by a range list. Exact on merged lists; on
+    // overlapping lists an overlap is counted once per range (fine for the
+    // newly-kept estimate in da_apply_keep_floor - the floor range is
+    // disjoint from the Sigma anchor, so both call sites see near-merged
+    // ranges).
+    static size_t da_ranges_total(const std::vector<std::pair<int32_t, int32_t>> & ranges) {
+        size_t total = 0;
+        for (const auto & r : ranges) {
+            total += (size_t) (r.second - r.first);
+        }
+        return total;
+    }
+
+    // DA tail floor (plans/continous_work2.md): subtract [bound-K, bound)
+    // from the removal ranges so the most recent K tokens before the removal
+    // boundary are always kept. The keep set is the union of the tag
+    // selection, the Sigma anchor and the tail: without the floor, the work
+    // region the model was just in (not covered by any magic_chunks tag) is
+    // masked out at a B switch and the model forgets what it just did (the
+    // 10-09 12:43 amnesia: ~21k tokens of [42060,63370) masked whole).
+    // Reuses da_subtract_range; the floor is clamped to [0, bound], so
+    // bound < K keeps everything. K <= 0 or bound <= 0: no-op (legacy
+    // behavior). Logs the applied floor, the newly-kept token count and the
+    // remaining removals bucketed by distance from the tail (bound), so the
+    // floor's read-reduction trade is visible in the same log group as the
+    // switch summary.
+    static void da_apply_keep_floor(const server_slot & slot,
+                                    std::vector<std::pair<int32_t, int32_t>> & rm_ranges,
+                                    int32_t bound,
+                                    const char * when) {
+        const int32_t K = slot.da_tail_keep;
+        if (K <= 0 || bound <= 0) {
+            return;
+        }
+        const int32_t lo = std::max(bound - K, 0);
+        const int32_t hi = bound;
+        const size_t before = da_ranges_total(rm_ranges);
+        da_subtract_range(rm_ranges, lo, hi);
+        const size_t newly_kept = before - da_ranges_total(rm_ranges);
+        SLT_INF(slot, "da: tail_keep=[%d, %d) - %zu token(s) newly kept (K=%d, %s)\n",
+                lo, hi, newly_kept, K, when);
+        // bucket the remaining removals by the distance of the range end
+        // from the tail: how much of what was removed sat close to the work
+        // in progress (0 = touching the boundary)
+        if (!rm_ranges.empty()) {
+            const int32_t edges[] = { 1024, 4096, 8192, 16384, 32768 };
+            size_t bkt[6] = { 0, 0, 0, 0, 0, 0 };
+            for (const auto & r : rm_ranges) {
+                int32_t dist = bound - r.second;
+                if (dist < 0) {
+                    dist = 0;
+                }
+                int b = 0;
+                while (b < 5 && dist >= edges[b]) {
+                    ++b;
+                }
+                bkt[b] += (size_t) (r.second - r.first);
+            }
+            SLT_INF(slot, "da: removed by distance from tail (%s): <1k=%zu 1-4k=%zu 4-8k=%zu 8-16k=%zu 16-32k=%zu 32k+=%zu\n",
+                    when, bkt[0], bkt[1], bkt[2], bkt[3], bkt[4], bkt[5]);
+        }
+    }
+
     // Declarative Attention: remove the given prompt token ranges from the KV
     // cache of the target context (and the draft context, when speculative
     // decoding is active). The removal is a no-op for positions whose KV does
@@ -5193,6 +5273,10 @@ private:
                 }
             }
         }
+
+        // Tail floor (plans/continous_work2.md): the most recent K tokens
+        // before the boundary are always kept, next to the Sigma anchor.
+        da_apply_keep_floor(slot, rm_ranges, bound, when);
 
         for (const auto & range : rm_ranges) {
             int32_t lo = range.first;
@@ -5409,6 +5493,10 @@ private:
             }
         }
 
+        // Tail floor (plans/continous_work2.md): the most recent K tokens
+        // before the boundary are always kept, next to the Sigma anchor.
+        da_apply_keep_floor(slot, rm_merged, bound, when);
+
         std::vector<std::pair<int32_t, int32_t>> keep;
         {
             int32_t cur = 0;
@@ -5431,6 +5519,19 @@ private:
 
         if (n_remove == 0) {
             SLT_WRN(slot, "da_b: removal ranges cover nothing in [0, %d) after clamping - nothing to remove, staying on seq %d (%s)\n", bound, slot.id, when);
+            return;
+        }
+
+        // no-benefit skip (plans/continous_work2.md, optional): when the
+        // removal is tiny, the switch cost (seq_cp, a second sequence id,
+        // the restore copy at release) outweighs the read reduction - stay
+        // on the original sequence, output stays vanilla. The caller only
+        // moves the mode state machine when da_seq >= 0, so the slot stays
+        // GLOBAL. Opt-in via --da-b-min-remove (0 = always switch, so the
+        // small-prompt da_b_smoke mechanism checks keep passing).
+        if (slot.da_b_min_remove > 0 && n_remove < (size_t) slot.da_b_min_remove) {
+            SLT_WRN(slot, "da_b: only %zu token(s) would be removed (< %d) - skipping the switch, staying on seq %d (%s)\n",
+                    n_remove, slot.da_b_min_remove, slot.id, when);
             return;
         }
 
