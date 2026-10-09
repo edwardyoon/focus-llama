@@ -7257,6 +7257,40 @@ static bool kv_offload_session_get(
     }
 }
 
+// kv-offload (mid-turn Σ, 2026-10-09): fetch the session's state anchor from
+// FocusMemory. The Stop/UserPromptSubmit hooks only refresh Σ at TURN
+// boundaries, so a long autonomous turn (an hour of reason/read without a
+// stop) runs on a frozen state record while the eviction PUTs keep distilling
+// new state server-side. The caller appends the anchor to the DA scaffold's
+// offloaded-chunks note so the model re-grounds on every request. This runs
+// on the request path: 200ms cap total, fail-open (empty anchor = nothing to
+// inject) — it must never delay a generation.
+static bool kv_offload_get_sigma(
+        const std::string & host, const std::string & token,
+        const std::string & session_id, std::string & out_anchor) {
+    if (host.empty() || session_id.empty()) return false;
+    try {
+        auto [cli, parts] = common_http_client(host);
+        cli.set_connection_timeout(0, 200000); // 200ms — request-path budget
+        cli.set_read_timeout(0, 200000);
+        if (!token.empty()) {
+            cli.set_default_headers({ { "Authorization", "Bearer " + token } });
+        }
+        std::string path = "/v1/kv-offload/session/sigma?session_id=" + kv_offload_url_encode(session_id);
+        if (!parts.path.empty() && parts.path != "/") path = parts.path + path;
+        auto res = cli.Get(path);
+        if (!res || res->status != 200) return false;
+        json j = json::parse(res->body);
+        if (j.contains("anchor") && j["anchor"].is_string()) {
+            out_anchor = j["anchor"].get<std::string>();
+            return true;
+        }
+        return false;
+    } catch (const std::exception &) {
+        return false;
+    }
+}
+
 static inline bool rc_is_ident(unsigned char c) { 
     return std::isalnum(c) || c == '_' || c == ':' || c == '-'; 
 }
@@ -7714,7 +7748,8 @@ struct da_evict_bound {
 
 static da_auto_layout da_auto_chunk(const llama_vocab * vocab, const std::string & text, int32_t da_chunk_tokens,
         const std::vector<std::string> & offloaded_hints = {},
-        const std::vector<da_evict_bound> & evict_bounds = {}) {
+        const std::vector<da_evict_bound> & evict_bounds = {},
+        const std::string & sigma_anchor = {}) {
     da_auto_layout out;
 
     // chat template message boundaries: <\|im_start\|>ROLE\n
@@ -8015,6 +8050,19 @@ static da_auto_layout da_auto_chunk(const llama_vocab * vocab, const std::string
                         : "  - chunks " + std::to_string(sp.first) + "-" + std::to_string(sp.second) + ": " + evict_bounds[i].hint + "\n";
             }
         }
+    }
+    // kv-offload (mid-turn Σ, 2026-10-09): append the session's state anchor
+    // (fetched by the caller, 200ms cap, fail-open) as the LAST part of the
+    // offloaded note. The note sits in the DA instruction, which is inserted
+    // at the end of the last user message (the filler, before the im_end
+    // terminator) — a changing anchor only touches the prompt tail, so
+    // --cache-reuse keeps the prefix. Framing: a RECORD of the session's
+    // state, not a task — the latest user message still defines the work.
+    if (!sigma_anchor.empty()) {
+        offloaded_note += "\nSession state record (FocusMemory Σ, updated mid-turn as history leaves the KV) - "
+                          "a RECORD of this session, not a new task: the latest user message still defines the work. "
+                          "Re-ground on it before concluding or changing direction:\n"
+                         + sigma_anchor + "\n";
     }
     const std::string instruction =
         "\n\nInstructions (Declarative Attention):\n"
@@ -8574,8 +8622,22 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                         evict_bounds.push_back({ seg.range_lo, seg.range_hi, seg.hint });
                     }
                 }
+                // kv-offload (mid-turn Σ, 2026-10-09): while history is
+                // offloaded the offloaded-chunks note is non-empty — fetch the
+                // session's state anchor (200ms cap, fail-open) and append it
+                // to the DA scaffold so a long autonomous turn keeps its
+                // ground. Nothing offloaded → the full history is in the KV →
+                // no anchor needed (no fetch, no cost).
+                std::string sigma_anchor;
+                if ((!offloaded_hints.empty() || !evict_bounds.empty()) &&
+                        params.kv_offload && !params.focus_memory_host.empty() && !kv_session.empty()) {
+                    if (kv_offload_get_sigma(params.focus_memory_host, params.focus_memory_token, kv_session, sigma_anchor)) {
+                        SRV_INF("kv_offload: sigma anchor for DA scaffold (%zu chars, session=%s)\n",
+                                sigma_anchor.size(), kv_session.c_str());
+                    }
+                }
                 const da_auto_layout layout =
-                        da_auto_chunk(ctx_server.vocab, da_prompt, params.da_chunk_tokens, offloaded_hints, evict_bounds);
+                        da_auto_chunk(ctx_server.vocab, da_prompt, params.da_chunk_tokens, offloaded_hints, evict_bounds, sigma_anchor);
                 if (layout.ok) {
                     const llama_tokens  toks = common_tokenize(ctx_server.vocab, layout.modified, true, true);
                     const std::vector<size_t> offs = da_token_offsets_lenient(ctx_server.vocab, layout.modified, toks);
