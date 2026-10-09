@@ -150,8 +150,14 @@ static bool kv_offload_get(
 // on_retry_idle (optional): called on a decode/draft failure - free an idle
 // slot's KV cells (mirrors decode()'s try_clear_idle_slots); return true if a
 // slot was cleared (the same sub-batch is retried).
+// out_safe_failopen (optional): set true while no decode has run yet - a
+// failure at that point (e.g. the free-cell hard gate) leaves the ctx output
+// buffer holding the MAIN batch's rows, so the caller can fail-open (drop the
+// recall, sample the closing token's row, keep the slot and its cache). Flipped
+// to false once the decode loop starts (the buffer is overwritten; a failure
+// then must abort the slot).
 static bool kv_offload_refill(llama_context * ctx, server_slot & slot, const llama_tokens & toks, int32_t * out_last_idx = nullptr,
-                              const std::function<bool()> & on_retry_idle = nullptr);
+                              const std::function<bool()> & on_retry_idle = nullptr, bool * out_safe_failopen = nullptr);
 
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (params.embedding ||
@@ -6148,6 +6154,88 @@ private:
         // the stale-logits probe can name the cause in its error.
         bool refill_ran_this_iter = false;
 
+        // Shared sampling path (probe + sample + accept + stats + process_token)
+        // for the main (non-spec) decode row. Extracted so the deferred-refill
+        // pass (below) can sample a refilling slot from the refill's last row
+        // without duplicating the logic. Returns false if the slot was aborted
+        // or released (the caller must then return from its iterate).
+        auto sample_main_path = [&](server_slot & slot, int32_t tok_idx) -> bool {
+            // Defensive line (2026-10-09 12:43 crash): a decode that ran after
+            // this slot's main-batch row was computed overwrote the ctx output
+            // buffer, so the row no longer resolves and common_sampler's
+            // GGML_ASSERT would abort the whole server. Probe first and abort
+            // this slot with an error instead. The step is unrecoverable:
+            // re-decoding the token is unsafe in the cell-based KV cache
+            // (double-counted K/V).
+            if (llama_get_logits_ith(slot.ctx_tgt, tok_idx) == nullptr) {
+                SLT_ERR(slot, "kv_offload: stale logits row at sampling (a decode ran after this slot's batch row)%s - aborting slot\n",
+                        refill_ran_this_iter ? " (a deferred refill ran this iteration)" : "");
+                send_error(slot, "kv_offload: stale logits row - the slot was aborted (the in-flight step was dropped)");
+                slot.da_pending_refill.clear();
+                slot.i_batch = -1;
+                slot.da_refill_out_idx = -1;
+                slot.release();
+                slot.prompt_clear();
+                return false;
+            }
+
+            llama_token id;
+            {
+                scoped_timer timer(t_sampl, n_sampl);
+                id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
+            }
+
+            slot.i_batch = -1;
+            slot.da_refill_out_idx = -1;  // consumed
+
+            // L4: top-5 probabilities of the token just sampled - the B1
+            // check reads the continuation right after [End of Recalled Chunk]
+            if (slot.da_trace_left > 0) {
+                std::string s;
+                for (const auto & c : get_token_probabilities(slot.ctx_tgt, tok_idx, 5)) {
+                    s += string_format("%d:'%s':%.3f ", (int) c.id, dbg_esc(common_token_to_piece(slot.ctx_tgt, c.id, true), 20).c_str(), c.p);
+                }
+                da_trace("slot=%d task=%d L4 top5 sampled=%d [%s]\n",
+                         (int) slot.id, (int) slot.task->id, (int) id, s.c_str());
+            }
+
+            common_sampler_accept(slot.smpl.get(), id, true);
+
+            // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
+            const int64_t t_now = ggml_time_us();
+
+            slot.stats.n_gen += 1;
+            slot.da_count_generated_token();
+
+            if (slot.stats.n_gen == 1) {
+                slot.stats.update_prompt_last();
+                slot.t_print_last = t_now;
+                slot.n_gen_last = 0;
+            }
+
+            slot.stats.update_gen_last();
+
+            completion_token_output result;
+            result.tok          = id;
+            result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
+            result.prob         = 1.0f; // TODO: set it here instead of doing inside populate_token_probs
+
+            if (slot.task->params.sampling.n_probs > 0) {
+                populate_token_probs(slot, result, slot.task->params.post_sampling_probs, params_base.special, tok_idx);
+            }
+
+            if (!process_token(result, slot)) {
+                // release slot because of stop condition
+                slot.print_timings();
+                send_final_response(slot);
+                slot.release();
+                return false;
+            }
+
+            slot.print_timings_tg();
+            return true;
+        };
+
         iterate(slots, [&](server_slot & slot) {
             // optionally send prompt processing progress
             if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT) {
@@ -6230,121 +6318,22 @@ private:
                 return; // sample using speculative decoding
             }
 
-            // B1: apply the refill queued at tag close (apply_da_tag). The
-            // closing token is committed to the KV by this point (the decode
-            // above), so the recalled block lands AFTER it and the tag stays
-            // intact. The refill's final sub-batch is now the last decode, so
-            // the next token is sampled from its last logits row, not from
-            // the closing token's row.
+            // B1 (2026-10-09 12:43 crash root cause): a slot with a queued
+            // refill (apply_da_tag) is DEFERRED to the refill pass below. Its
+            // sampling must run AFTER the refill (it samples from the refill's
+            // last row), and the refill must run AFTER every other slot has
+            // sampled - the refill's llama_decode overwrites the ctx output
+            // buffer, and running it inside this loop stale the other slots'
+            // main-batch rows (the GGML_ASSERT abort). Skip it here; the refill
+            // pass (after the spec iterate) runs the refill and samples it.
             if (!slot.da_pending_refill.empty()) {
-                int32_t last_idx = -1;
-                if (kv_offload_refill(slot.ctx_tgt, slot, slot.da_pending_refill, &last_idx,
-                                      [this] { return try_clear_idle_slots(); })) {
-                    slot.da_refill_out_idx = last_idx;
-                    refill_ran_this_iter = true;
-                } else {
-                    // A failed refill leaves the ctx logits buffer holding the
-                    // refill's sub-batch rows, so the closing token's row
-                    // (slot.i_batch - off) is stale or out of the current
-                    // output_ids range -> sampling it hits the
-                    // logits==nullptr assert (Case 1). Re-decoding the closing
-                    // token to recover its logits is NOT safe in the cell-based
-                    // KV cache: find_slot() allocates a fresh cell for the
-                    // already-cached (seq,pos) (cell reuse is disabled), and
-                    // the KQ mask attends to every cell with that (seq,pos),
-                    // so the closing token's K/V would be double-counted in
-                    // this and every later decode. Abort the slot instead of
-                    // sampling a stale row (the recalled block is dropped).
-                    SLT_ERR(slot, "%s", "kv_offload: deferred refill failed - aborting slot (dropping the recalled block to avoid sampling a stale logits row)\n");
-                    send_error(slot, "kv_offload: deferred refill failed - the slot was aborted (the recalled block was dropped to avoid sampling a stale logits row)");
-                    slot.da_pending_refill.clear();
-                    slot.i_batch = -1;
-                    slot.release();
-                    slot.prompt_clear();
-                    return;
-                }
-                slot.da_pending_refill.clear();
-            }
-
-            // shifted according to the current sub-batch (or the refill's
-            // final sub-batch when a deferred refill just ran)
-            const int tok_idx = slot.da_refill_out_idx >= 0 ? slot.da_refill_out_idx : slot.i_batch - off;
-
-            // Defensive line (2026-10-09 12:43 crash): a decode that ran after
-            // this slot's main-batch row was computed (a deferred refill in
-            // another slot's iterate - successful or failed) overwrote the ctx
-            // output buffer, so the row no longer resolves and
-            // common_sampler's GGML_ASSERT would abort the whole server.
-            // Probe first and abort this slot with an error instead. The step
-            // is unrecoverable: re-decoding the token is unsafe in the
-            // cell-based KV cache (double-counted K/V).
-            if (llama_get_logits_ith(slot.ctx_tgt, tok_idx) == nullptr) {
-                SLT_ERR(slot, "kv_offload: stale logits row at sampling (a decode ran after this slot's batch row)%s - aborting slot\n",
-                        refill_ran_this_iter ? " (a deferred refill ran this iteration)" : "");
-                send_error(slot, "kv_offload: stale logits row - the slot was aborted (the in-flight step was dropped)");
-                slot.da_pending_refill.clear();
-                slot.i_batch = -1;
-                slot.da_refill_out_idx = -1;
-                slot.release();
-                slot.prompt_clear();
                 return;
             }
 
-            llama_token id;
-            {
-                scoped_timer timer(t_sampl, n_sampl);
-                id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
-            }
-
-            slot.i_batch = -1;
-            slot.da_refill_out_idx = -1;  // consumed
-
-            // L4: top-5 probabilities of the token just sampled - the B1
-            // check reads the continuation right after [End of Recalled Chunk]
-            if (slot.da_trace_left > 0) {
-                std::string s;
-                for (const auto & c : get_token_probabilities(slot.ctx_tgt, tok_idx, 5)) {
-                    s += string_format("%d:'%s':%.3f ", (int) c.id, dbg_esc(common_token_to_piece(slot.ctx_tgt, c.id, true), 20).c_str(), c.p);
-                }
-                da_trace("slot=%d task=%d L4 top5 sampled=%d [%s]\n",
-                         (int) slot.id, (int) slot.task->id, (int) id, s.c_str());
-            }
-
-            common_sampler_accept(slot.smpl.get(), id, true);
-
-            // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
-            const int64_t t_now = ggml_time_us();
-
-            slot.stats.n_gen += 1;
-            slot.da_count_generated_token();
-
-            if (slot.stats.n_gen == 1) {
-                slot.stats.update_prompt_last();
-                slot.t_print_last = t_now;
-                slot.n_gen_last = 0;
-            }
-
-            slot.stats.update_gen_last();
-
-            completion_token_output result;
-            result.tok          = id;
-            result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
-            result.prob         = 1.0f; // TODO: set it here instead of doing inside populate_token_probs
-
-            if (slot.task->params.sampling.n_probs > 0) {
-                populate_token_probs(slot, result, slot.task->params.post_sampling_probs, params_base.special, tok_idx);
-            }
-
-            if (!process_token(result, slot)) {
-                // release slot because of stop condition
-                slot.print_timings();
-                send_final_response(slot);
-                slot.release();
-
+            // sample from the main batch's row (no refill ran for this slot)
+            if (!sample_main_path(slot, slot.i_batch - off)) {
                 return;
             }
-
-            slot.print_timings_tg();
         });
 
         // speculative decoding - main model sample and accept
@@ -6542,6 +6531,96 @@ private:
             slot.print_timings_tg();
 
             SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int) n_accepted, (int) n_draft, slot.prompt.n_tokens());
+        });
+
+        // Refill pass (B1, 2026-10-09 12:43 crash root cause): run the deferred
+        // refills AFTER every slot (main + spec) has sampled from the main
+        // batch's rows. The refill's llama_decode overwrites the ctx output
+        // buffer, so running it inside the slot loop above stale the other
+        // slots' main-batch rows (the GGML_ASSERT abort). Now all main-batch
+        // rows are consumed before any refill runs, so the other slots are safe.
+        // Each refilling slot samples from its own refill's last row (or the
+        // main batch's row if the refill was rejected by the free-cell gate).
+        // ctx_out_clobbered tracks whether a decode loop already ran in this
+        // pass: once any slot's refill decoded, the ctx output buffer no longer
+        // holds the main batch's rows, so a LATER slot's gate rejection can no
+        // longer fail open (its main-batch row is stale) and must abort.
+        bool ctx_out_clobbered = false;
+        iterate(slots, [&](server_slot & slot) {
+            if (slot.da_pending_refill.empty()) {
+                return;
+            }
+            // A spec slot's refill is NOT applied here (mirrors the original
+            // behavior: the spec check in the first iterate returns before the
+            // refill, so a spec slot's refill was silently dropped). Skipping
+            // it here also avoids a double sample - the slot already sampled in
+            // the spec iterate above.
+            if (slot.can_speculate() && !slot.spec_draft.empty()) {
+                slot.da_pending_refill.clear();
+                return;
+            }
+            // The slot was deferred in the first iterate; it must still be
+            // generating. If it was released or moved to another state, drop
+            // the recall.
+            if (slot.state != SLOT_STATE_GENERATING) {
+                slot.da_pending_refill.clear();
+                return;
+            }
+            // Not in this sub-batch's view: post_decode runs per sub-batch and
+            // the first iterate skips out-of-view slots, so the recall must be
+            // kept for the sub-batch that contains it. Do NOT clear it here.
+            if (!is_inside_view(slot.i_batch)) {
+                return;
+            }
+            int32_t last_idx = -1;
+            bool safe_failopen = false;
+            const bool ok = kv_offload_refill(slot.ctx_tgt, slot, slot.da_pending_refill, &last_idx,
+                                              [this] { return try_clear_idle_slots(); }, &safe_failopen);
+            if (!safe_failopen) {
+                // the decode loop ran (success or mid-decode failure) - the ctx
+                // output buffer no longer holds the main batch's rows
+                ctx_out_clobbered = true;
+            }
+            if (ok) {
+                slot.da_refill_out_idx = last_idx;
+                refill_ran_this_iter = true;
+            } else if (safe_failopen && !ctx_out_clobbered) {
+                // Rejected BEFORE any decode ran (the free-cell hard gate) AND
+                // no earlier refill in this pass decoded - the ctx output buffer
+                // still holds the MAIN batch's rows, so the closing token's row
+                // (slot.i_batch - off) is valid. Fail-open: drop the recall and
+                // sample that row; the slot continues without the recalled chunk
+                // (keeps its cache).
+                SLT_INF(slot, "%s", "kv_offload: refill skipped (no free cells) - continuing without the recalled chunk\n");
+                // da_refill_out_idx stays -1 -> tok_idx = slot.i_batch - off.
+            } else {
+                // Either a failed refill (mid-decode) OR a gate rejection after
+                // an earlier slot's refill already decoded in this pass: the ctx
+                // logits buffer no longer holds the main batch's rows, so the
+                // closing token's row (slot.i_batch - off) is stale. Re-decoding
+                // the closing token is NOT safe in the cell-based KV cache
+                // (double-counted K/V). Abort the slot instead of sampling a
+                // stale row.
+                if (safe_failopen) {
+                    SLT_ERR(slot, "%s", "kv_offload: refill rejected (no free cells) after another slot's refill already decoded - aborting slot (the main-batch logits row is stale)\n");
+                    send_error(slot, "kv_offload: refill rejected after the ctx output was clobbered - the slot was aborted (the recalled block was dropped to avoid sampling a stale logits row)");
+                } else {
+                    SLT_ERR(slot, "%s", "kv_offload: deferred refill failed - aborting slot (dropping the recalled block to avoid sampling a stale logits row)\n");
+                    send_error(slot, "kv_offload: deferred refill failed - the slot was aborted (the recalled block was dropped to avoid sampling a stale logits row)");
+                }
+                slot.i_batch = -1;
+                slot.release();
+                slot.prompt_clear();
+                slot.da_pending_refill.clear();
+                return;
+            }
+            slot.da_pending_refill.clear();
+            // sample from the refill's last row (or the main batch's row if the
+            // refill was rejected by the free-cell gate)
+            const int tok_idx = slot.da_refill_out_idx >= 0 ? slot.da_refill_out_idx : slot.i_batch - off;
+            if (!sample_main_path(slot, tok_idx)) {
+                return;
+            }
         });
     }
 
@@ -7579,7 +7658,11 @@ static void kv_offload_refill_rollback(server_slot & slot, int32_t n_full, int32
 // pos_next() reflects the new length. HIGH RISK: mid-decode prefill - must be
 // validated by the offload probe before trusting.
 static bool kv_offload_refill(llama_context * ctx, server_slot & slot, const llama_tokens & toks, int32_t * out_last_idx,
-                              const std::function<bool()> & on_retry_idle) {
+                              const std::function<bool()> & on_retry_idle, bool * out_safe_failopen) {
+    // No decode has run yet - a failure at this point leaves the ctx output
+    // buffer holding the main batch's rows, so the caller can fail-open.
+    // Flipped to false once the decode loop starts (see below).
+    if (out_safe_failopen) *out_safe_failopen = true;
     const int32_t n_raw = (int32_t) toks.size();
     if (n_raw <= 0 || ctx == nullptr) return false;
 
@@ -7630,18 +7713,28 @@ static bool kv_offload_refill(llama_context * ctx, server_slot & slot, const lla
     int32_t off = 0;
     const int64_t t_refill_start = ggml_time_us();
     try {
-        // Log the physical free-cell count before the refill: if it is below
-        // the wrapped token count, find_slot will fail mid-refill (cell
-        // shortage) - correlate with the find_slot ERROR in llama-kv-cache.cpp
-        // and the ledger WARN in the hole-apply block.
+        // Hard gate (2026-10-09 12:43 crash): reject the refill BEFORE any
+        // decode runs when the wrapped block cannot fit the physical KV. The
+        // previous warning-only check let the refill start, run out of cells
+        // mid-way (used=76304), halve the sub-batch 10x, roll back (no-op ->
+        // slot poisoned) and clear the 66k prompt cache - and the failed
+        // decodes overwrote the ctx output buffer, killing the other slot's
+        // in-flight row (the GGML_ASSERT abort). Rejecting here leaves the
+        // buffer holding the MAIN batch's rows, so the caller fails open (drops
+        // the recall, samples the closing token's row, keeps the slot + cache).
         {
             const int32_t n_free = llama_memory_n_free_cells(llama_get_memory(ctx));
             da_trace("slot=%d task=%d L2 refill free cells: n_free=%d n_wrapped=%d\n",
                      (int) slot.id, (int) (slot.task ? slot.task->id : -1), n_free, n);
             if (n_free >= 0 && n_free < n) {
-                SLT_WRN(slot, "kv_offload: refill free-cell shortage - n_free=%d < n_wrapped=%d (find_slot failure likely)\n", n_free, n);
+                SLT_WRN(slot, "kv_offload: refill rejected - not enough free cells (n_free=%d < n_wrapped=%d); failing open (the recalled chunk is dropped, the slot continues without it)\n", n_free, n);
+                return false; // out_safe_failopen is already true
             }
         }
+        // From here on the decode loop runs and overwrites the ctx output
+        // buffer - a failure can no longer fail-open (the main batch's rows are
+        // gone), so the caller must abort the slot.
+        if (out_safe_failopen) *out_safe_failopen = false;
         // Dense forcing: the refill is a prefill and this function calls
         // llama_decode directly (bypassing update_da_n_kv_max, which the main
         // decode runs before each decode). A stale sparse bound from the last
