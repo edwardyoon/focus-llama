@@ -6143,6 +6143,11 @@ private:
                 slot.task->params.sampling.preserved_tokens.find(token) != slot.task->params.sampling.preserved_tokens.end();
         };
 
+        // A deferred refill runs llama_decode inside the slot loop below and
+        // overwrites the ctx output buffer. Set when one ran in this pass so
+        // the stale-logits probe can name the cause in its error.
+        bool refill_ran_this_iter = false;
+
         iterate(slots, [&](server_slot & slot) {
             // optionally send prompt processing progress
             if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT) {
@@ -6236,6 +6241,7 @@ private:
                 if (kv_offload_refill(slot.ctx_tgt, slot, slot.da_pending_refill, &last_idx,
                                       [this] { return try_clear_idle_slots(); })) {
                     slot.da_refill_out_idx = last_idx;
+                    refill_ran_this_iter = true;
                 } else {
                     // A failed refill leaves the ctx logits buffer holding the
                     // refill's sub-batch rows, so the closing token's row
@@ -6263,6 +6269,26 @@ private:
             // shifted according to the current sub-batch (or the refill's
             // final sub-batch when a deferred refill just ran)
             const int tok_idx = slot.da_refill_out_idx >= 0 ? slot.da_refill_out_idx : slot.i_batch - off;
+
+            // Defensive line (2026-10-09 12:43 crash): a decode that ran after
+            // this slot's main-batch row was computed (a deferred refill in
+            // another slot's iterate - successful or failed) overwrote the ctx
+            // output buffer, so the row no longer resolves and
+            // common_sampler's GGML_ASSERT would abort the whole server.
+            // Probe first and abort this slot with an error instead. The step
+            // is unrecoverable: re-decoding the token is unsafe in the
+            // cell-based KV cache (double-counted K/V).
+            if (llama_get_logits_ith(slot.ctx_tgt, tok_idx) == nullptr) {
+                SLT_ERR(slot, "kv_offload: stale logits row at sampling (a decode ran after this slot's batch row)%s - aborting slot\n",
+                        refill_ran_this_iter ? " (a deferred refill ran this iteration)" : "");
+                send_error(slot, "kv_offload: stale logits row - the slot was aborted (the in-flight step was dropped)");
+                slot.da_pending_refill.clear();
+                slot.i_batch = -1;
+                slot.da_refill_out_idx = -1;
+                slot.release();
+                slot.prompt_clear();
+                return;
+            }
 
             llama_token id;
             {
@@ -6338,6 +6364,36 @@ private:
                 common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
+
+                // Defensive line (2026-10-09 12:43 crash): the backtrace died
+                // in sample_and_accept_n on idx 1 - the first draft row of the
+                // slot that did NOT refill. A deferred refill in another slot's
+                // iterate overwrote the ctx output buffer, so every main-batch
+                // row (the whole spec_i_batch) is stale and common_sampler's
+                // GGML_ASSERT would abort the whole server. Probe before
+                // sampling and abort this slot with an error instead. The step
+                // is unrecoverable: re-decoding the token is unsafe in the
+                // cell-based KV cache (double-counted K/V).
+                int stale_idx = -1;
+                for (int32_t idx : slot.spec_i_batch) {
+                    if (llama_get_logits_ith(slot.ctx_tgt, idx) == nullptr) {
+                        stale_idx = idx;
+                        break;
+                    }
+                }
+                if (stale_idx >= 0) {
+                    SLT_ERR(slot, "kv_offload: stale logits row at spec sampling (idx=%d, a decode ran after this slot's batch row)%s - aborting slot\n",
+                            stale_idx, refill_ran_this_iter ? " (a deferred refill ran this iteration)" : "");
+                    send_error(slot, "kv_offload: stale logits row - the slot was aborted (the in-flight step was dropped)");
+                    slot.da_pending_refill.clear();
+                    slot.i_batch = -1;
+                    slot.da_refill_out_idx = -1;
+                    slot.spec_i_batch.clear();
+                    slot.release();
+                    slot.prompt_clear();
+                    return;
+                }
+
                 const auto & synth_probs = common_speculative_get_synth_probs(spec.get());
                 auto accepted = synth_probs.empty()
                     ? common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft)
