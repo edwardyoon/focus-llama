@@ -513,6 +513,12 @@ struct server_slot {
     // in the shared cache, not in the per-request slot state).
     std::vector<std::pair<llama_pos, llama_pos>> kv_hole_ranges;
     bool kv_holes_active = false;
+    // kv-offload-holes: the FocusMemory session this slot's KV belongs to
+    // (learned from task.params.kv_offload_session at launch, persists across
+    // release() while the prompt cache is kept). Key of the context's
+    // kv_session_cut entry - lets prompt_clear refresh it even when the slot
+    // is idle (task already gone).
+    std::string kv_session;
     // kv-offload-holes progressive apply (prefill-time hole cutting): per-hole
     // progress while the prompt is being (re-)prefilled. applied_until: [lo,
     // applied_until) is already cut from the KV. Request-scoped: cleared in
@@ -631,6 +637,13 @@ struct server_slot {
         kv_hole_ranges.clear();
         kv_holes_active = false;
         kv_hole_progress.clear();
+        // the session's actual-cut entry must drop with the ledger, or the
+        // watermark gate keeps subtracting holes that no longer exist
+        // (2026-10-10: idle-slot clear lost the ledger, the gate stayed idle
+        // and the KV refilled to the buffer cap)
+        if (callback_on_kv_holes_change) {
+            callback_on_kv_holes_change(*this);
+        }
     }
 
     std::vector<common_adapter_lora_info> lora;
@@ -655,6 +668,9 @@ struct server_slot {
 
     std::function<void(int /* id_slot */)>   callback_on_release;
     std::function<void(const server_slot &)> callback_on_reset; // called before reset()
+    // kv-offload-holes: refresh the context's kv_session_cut entry after the
+    // applied-hole ledger changes (set by the context; no-op if unset)
+    std::function<void(const server_slot &)> callback_on_kv_holes_change;
 
     // this is for printing timings with slot progress, not part of metrics
     int64_t t_print_last = 0;
@@ -1362,6 +1378,35 @@ public:
         metrics.reset_bucket();
     }
 
+    // kv-offload-holes: refresh the session's actual-cut entry from the
+    // slot's applied-hole ledger (kv_hole_ranges). Called at every ledger
+    // mutation (n_past apply/expire, progressive-cut completion, prompt_clear)
+    // so the watermark gate sees the holes that are physically cut in the KV
+    // right now, not the cumulative PUT history (see the kv_session_cut
+    // member for why). No-op for slots without a known session (plain
+    // traffic, or before the first da_auto turn). Public: the watermark gate
+    // in server_routes reads the entry via kv_session_cut_get().
+    void kv_session_cut_update(const server_slot & slot) {
+        if (slot.kv_session.empty()) {
+            return;
+        }
+        int64_t cut = 0;
+        for (const auto & r : slot.kv_hole_ranges) {
+            cut += (int64_t) (r.second - r.first);
+        }
+        std::lock_guard<std::mutex> lk(kv_session_cut_mutex);
+        kv_session_cut[slot.kv_session] = cut;
+    }
+
+    // kv-offload-holes: the actual-cut count for the watermark gate. 0 when
+    // the session has no (known) cut holes - e.g. a fresh session, or after
+    // its ledger was dropped by a prompt_clear.
+    int64_t kv_session_cut_get(const std::string & session) {
+        std::lock_guard<std::mutex> lk(kv_session_cut_mutex);
+        const auto it = kv_session_cut.find(session);
+        return it != kv_session_cut.end() ? it->second : 0;
+    }
+
 private:
     // note: accessing these fields outside of this class is not thread-safe
     // use server_context methods instead
@@ -1398,6 +1443,18 @@ private:
 
     // slots / clients
     std::vector<server_slot> slots;
+
+    // kv-offload-holes: session -> tokens currently cut from the KV (the sum
+    // of the owning slot's kv_hole_ranges ledger). The watermark gate reads
+    // this (kv_session_cut_get) instead of the cumulative PUT volume: holes
+    // expire when the KV is re-prefilled and the ledger is dropped by
+    // prompt_clear, so the PUT history overstates the offloaded amount and
+    // the gate stays "idle" while the physical KV refills to the buffer cap
+    // (2026-10-10 incident: resident 19919 reported, ~101k actually resident).
+    // Written on the queue thread (ledger mutations), read on the HTTP thread
+    // (the gate) - mutex-guarded.
+    std::mutex kv_session_cut_mutex;
+    std::map<std::string, int64_t> kv_session_cut;
 
     int trace = 0;        // env: LLAMA_TRACE
     int slots_debug = 0;  // env: LLAMA_SERVER_SLOTS_DEBUG
@@ -1928,6 +1985,10 @@ private:
                 }
             };
 
+            slot.callback_on_kv_holes_change = [this](const server_slot & slot) {
+                kv_session_cut_update(slot);
+            };
+
             slot.reset();
         }
 
@@ -2435,6 +2496,19 @@ private:
         // the per-request limit takes priority over the global one
         slot.n_predict_max = task.params.n_predict != -1 ? task.params.n_predict : params_base.n_predict;
 
+        // kv-offload-holes: learn the session owning this slot's KV so ledger
+        // mutations (including prompt_clear on an idle slot) can refresh the
+        // context's kv_session_cut entry. A takeover by another session drops
+        // the old session's entry now: its holes will be expired/cleared by
+        // the prefill, and a stale entry would understate its resident.
+        if (!task.params.kv_offload_session.empty() && task.params.kv_offload_session != slot.kv_session) {
+            if (!slot.kv_session.empty()) {
+                std::lock_guard<std::mutex> lk(kv_session_cut_mutex);
+                kv_session_cut[slot.kv_session] = 0;
+            }
+            slot.kv_session = task.params.kv_offload_session;
+        }
+
         slot.task = std::make_unique<const server_task>(std::move(task));
 
         slot.state = slot.task->is_child()
@@ -2534,40 +2608,48 @@ private:
 
         // if context shifting is disabled, make sure that we don't run out of context.
         // Decoupled-KV mode: the physical buffer (kv_cache_size) fills before the
-        // logical n_ctx, so also cap on the buffer minus the 16384 headroom the
-        // reject gate reserves for recall + pin + delta. This turns an over-long
-        // generation (which would otherwise hard-fail in llama_decode with "Context
-        // size has been exceeded" + slot abort + KV clear) into a clean
-        // finish_reason=length.
-        // The resident base must be the PHYSICAL KV size, not prompt.n_tokens():
-        // in holes mode (Option B) the evicted text stays in the prompt while its
-        // KV cells are cut (kv_hole_ranges ledger), so the prompt length overstates
-        // the resident by the cut span. Capping on the raw prompt length killed
-        // valid generations at n_gen=1 whenever the prompt alone exceeded the
-        // buffer cap (2026-10-07: prompt 59358 / resident 46865, 12055 cells free).
-        // n_gen must be in the projection too: the prompt length is constant during
-        // generation, so without it an over-long generation could never trip this.
+        // logical n_ctx. (2026-10-10, incident 2026-10-10-kv-ledger-loss) The
+        // buffer check now uses the PHYSICAL free-cell count
+        // (llama_memory_n_free_cells) instead of the ledger-based resident
+        // projection: the hole ledger can disagree with the physical KV (a slot
+        // cleared by the idle path and re-prefilled reports "holes cut 0" while
+        // ~101k cells are resident), and only the physical count sees that.
+        // Backends without n_free_cells support (return -1) fall back to the
+        // old ledger-based projection.
         {
             const int64_t buf_cap = params_base.kv_cache_size > 0 ?
                 (int64_t) params_base.kv_cache_size - 16384 : (int64_t) slot.n_ctx;
             const int64_t ctx_limit = std::min<int64_t>(slot.n_ctx, buf_cap);
             int64_t holes_cut = 0;
             for (const auto & r : slot.kv_hole_ranges) holes_cut += (int64_t) (r.second - r.first);
+            const int32_t n_free = llama_memory_n_free_cells(llama_get_memory(ctx_tgt));
+            const bool ctx_full = (int64_t) slot.prompt.n_tokens() + (int64_t) slot.stats.n_gen + 1 >= slot.n_ctx;
+            const bool buf_full = params_base.kv_cache_size > 0 && n_free >= 0 && n_free < 2048;
+            // Fallback estimate (n_free unavailable): the ledger-based resident
+            // projection. In holes mode (Option B) the evicted text stays in the
+            // prompt while its KV cells are cut (kv_hole_ranges ledger), so the
+            // prompt length overstates the resident by the cut span (2026-10-07:
+            // prompt 59358 / resident 46865, 12055 cells free).
             int64_t resident_base = (int64_t) slot.prompt.n_tokens() - holes_cut;
             if (holes_cut == 0 && slot.kv_holes_active && slot.kv_hole_peak_resident > 0) {
                 resident_base = slot.kv_hole_peak_resident;
             }
-            const int64_t projected = resident_base + (int64_t) slot.stats.n_gen + 1;
-            if (!params_base.ctx_shift && projected >= ctx_limit) {
+            const bool est_full = n_free < 0 &&
+                resident_base + (int64_t) slot.stats.n_gen + 1 >= ctx_limit;
+            if (!params_base.ctx_shift && (ctx_full || buf_full || est_full)) {
                 slot.truncated      = true;
                 slot.stop           = STOP_TYPE_LIMIT;
                 slot.has_next_token = false;
 
-                if (buf_cap < slot.n_ctx) {
-                    // INFO (not DBG): the client sees finish_reason=length and halts,
-                    // so the journal must record that the KV buffer (not the model
-                    // n_ctx) capped generation - distinct from a normal n_ctx stop.
-                    SRV_INF("slot %d: generation stopped at KV buffer cap - resident %d (prompt %d - holes cut %d) + n_gen %d >= buffer %d - 16384 (n_ctx %d) -> finish_reason=length\n",
+                if (buf_full) {
+                    // INFO (not DBG): the client sees finish_reason=length and
+                    // halts, so the journal must record that the physical KV
+                    // buffer (not the model n_ctx) capped generation.
+                    SRV_INF("slot %d: generation stopped at KV buffer cap - free cells %d < 2048 (prompt %d, holes cut %d, n_gen %d, buffer %d, n_ctx %d) -> finish_reason=length\n",
+                            (int) slot.id, n_free, (int) slot.prompt.n_tokens(), (int) holes_cut,
+                            (int) slot.stats.n_gen, params_base.kv_cache_size, slot.n_ctx);
+                } else if (est_full) {
+                    SRV_INF("slot %d: generation stopped at KV buffer cap (estimate, n_free unavailable) - resident %d (prompt %d - holes cut %d) + n_gen %d >= buffer %d - 16384 (n_ctx %d) -> finish_reason=length\n",
                             (int) slot.id, (int) resident_base, (int) slot.prompt.n_tokens(), (int) holes_cut,
                             (int) slot.stats.n_gen, params_base.kv_cache_size, slot.n_ctx);
                 } else {
@@ -4433,6 +4515,27 @@ private:
                             }
                         }
 
+                        // kv-offload-holes: the ledger just changed (expire /
+                        // apply / n_past=0 clear) - refresh the session's
+                        // actual-cut entry so the next gate sees the real
+                        // resident.
+                        kv_session_cut_update(slot);
+                        // kv-probe: physical occupancy vs the ledger, so the
+                        // journal shows whether the holes are really cut
+                        // (used ≈ prompt - ledger_cut) or the ledger lags the
+                        // physical state (2026-10-10: holes cut 0 with ~101k
+                        // resident after an idle-slot clear).
+                        if (params_base.kv_cache_size > 0) {
+                            const int32_t n_free = llama_memory_n_free_cells(llama_get_memory(ctx_tgt));
+                            int64_t probe_cut = 0;
+                            for (const auto & r : slot.kv_hole_ranges) {
+                                probe_cut += (int64_t) (r.second - r.first);
+                            }
+                            SLT_INF(slot, "kv-probe: used=%d free=%d ledger_cut=%d prompt=%d buffer=%d\n",
+                                    n_free >= 0 ? (int) (params_base.kv_cache_size - n_free) : -1, n_free,
+                                    (int) probe_cut, (int) slot.prompt.n_tokens(), params_base.kv_cache_size);
+                        }
+
                         // progressive apply: seed the peak tracker with the
                         // resident at prefill start (the matched prefix minus
                         // the holes already cut out of it). The per-batch
@@ -4500,6 +4603,7 @@ private:
                         slot.kv_hole_ranges.clear();
                         slot.kv_holes_active = false;
                         slot.kv_hole_peak_resident = 0;
+                        kv_session_cut_update(slot);
                     }
 
                     // If using an alora, there may be uncached tokens that come
@@ -5034,6 +5138,7 @@ private:
                     slot.kv_holes_active = true;
                     slot.kv_hole_progress.erase(slot.kv_hole_progress.begin() + i);
                     --i;
+                    kv_session_cut_update(slot);
                     SLT_INF(slot, "kv-offload-holes: progressive cut completed [%d, %d) at done=%d (seq %d)\n",
                             (int) h.lo, (int) h.hi, (int) done, (int) slot.kv_seq());
                 }
@@ -8708,21 +8813,30 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                         }
                     }
                     int32_t kv_retain_eff = kv_target - params.kv_offload_threshold;
-                    // High/low watermark: the session's KV-resident count (the full
-                    // logical prompt minus the cumulative evicted, from the per-
-                    // session PUT ledger - the same source GET /kv_state uses). In
-                    // holes mode the evicted text stays in the prompt, so the raw
-                    // token count overstates the resident by the cumulative evicted.
-                    int64_t kv_cumulative_evicted = 0;
+                    // (2026-10-10, incident 2026-10-10-kv-ledger-loss) Resident
+                    // estimate for the watermark gate: the tokens actually cut
+                    // from this session's KV (the owning slot's kv_hole_ranges
+                    // ledger sum), NOT the cumulative PUT total. The cumulative
+                    // ledger overcounts "offloaded" once holes expire or the
+                    // slot's prompt is cleared and re-prefilled, which pins the
+                    // resident low and keeps the gate idle forever even when the
+                    // physical KV sits near the buffer cap. The cut ledger is
+                    // the source of truth: cut holes are offloaded, expired
+                    // holes are resident again.
+                    const int64_t kv_cumulative_evicted = ctx_server.kv_session_cut_get(kv_session);
+                    const int64_t kv_resident = (int64_t) task.tokens.size() - kv_cumulative_evicted;
+                    // The Sigma anchor fetch below still keys off the PUT
+                    // ledger: it answers "has this session ever offloaded
+                    // text", which the cut ledger cannot express.
+                    int64_t kv_put_total = 0;
                     {
                         std::lock_guard<std::mutex> lk(kv_offload_put_mutex);
                         auto it = kv_offload_uploaded.find(kv_session);
                         if (it != kv_offload_uploaded.end()) {
-                            for (const auto & kv : it->second) kv_cumulative_evicted += kv.second;
+                            for (const auto & kv : it->second) kv_put_total += kv.second;
                         }
                     }
-                    const int64_t kv_resident = (int64_t) task.tokens.size() - kv_cumulative_evicted;
-                    kv_has_offloaded_history = kv_cumulative_evicted > 0;
+                    kv_has_offloaded_history = kv_put_total > 0;
                     // Watermark idle (holes mode only): while the resident is below
                     // the high watermark, skip the per-turn evict plan / PUT / hole
                     // re-apply. The already-cut holes persist in the KV (the
@@ -9100,11 +9214,19 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                                           task.params.da_chunk_base + n_active + (int32_t) i });
                             }
                         }
-                        if (!evicted_segs.empty()) {
+                        // (2026-10-10, incident 2026-10-10-kv-ledger-loss) Always
+                        // tag the task with its session id, not only on evicting
+                        // turns: the slot learns its kv_session from this (the
+                        // cut ledger is keyed by it), and a watermark-idle turn
+                        // is exactly when the slot keeps running. host/token/
+                        // vocab are only needed when there is something to PUT.
+                        if (!kv_session.empty()) {
                             task.params.kv_offload_session = kv_session;
-                            task.params.kv_offload_host    = params.focus_memory_host;
-                            task.params.kv_offload_token   = params.focus_memory_token;
-                            task.params.kv_offload_vocab   = ctx_server.vocab;
+                            if (!evicted_segs.empty()) {
+                                task.params.kv_offload_host    = params.focus_memory_host;
+                                task.params.kv_offload_token   = params.focus_memory_token;
+                                task.params.kv_offload_vocab   = ctx_server.vocab;
+                            }
                         }
                         // Option B (--kv-offload-holes): map each evicted segment's
                         // char range (original text space) to a token range (final
