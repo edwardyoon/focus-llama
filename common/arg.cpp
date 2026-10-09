@@ -1818,6 +1818,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_OFFLOAD_HOLES").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
+        {"--kv-offload-high"}, "N",
+        "kv_offload holes-mode high watermark: with --kv-offload-holes, evict only when the session KV-resident (full prompt minus cumulative evicted) reaches N, then drain to --kv-offload-threshold in one shot; while threshold < resident < N the gate is idle (no per-turn evict/PUT/hole work). 0 = legacy per-turn behavior (default: 0)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("error: --kv-offload-high must be >= 0 (got " + std::to_string(value) + ")");
+            }
+            params.kv_offload_high = value;
+        }
+    ).set_env("LLAMA_ARG_KV_OFFLOAD_HIGH").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
         {"--sparse-gate-threshold"}, "PCT",
         "DA sparse FA gate: use the sparse (gather) path only while the finite KV rows are at most PCT% of the cache, dense below that (1-100, default: 50)",
         [](common_params & params, int value) {

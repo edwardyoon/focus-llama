@@ -1823,6 +1823,33 @@ private:
                         (int) (params_base.kv_offload_threshold + gen_tail + 16384));
             }
         }
+        // (e) high/low watermark (holes mode): the high watermark must be >= the
+        //     low (drain) target, and a request just below the high watermark
+        //     (the idle band's worst case) must still fit the prefill peak
+        //     (resident + n_batch in holes mode) plus the gen tail under the
+        //     buffer cap - otherwise the request would be rejected (400) before
+        //     eviction can trigger. high == 0 = legacy per-turn gate (no check).
+        if (params_base.kv_offload && params_base.kv_offload_high > 0) {
+            if (params_base.kv_offload_high < params_base.kv_offload_threshold) {
+                SRV_ERR("kv_offload: --kv-offload-high %d < --kv-offload-threshold %d - the high watermark must be >= the low (drain) target\n",
+                        params_base.kv_offload_high, params_base.kv_offload_threshold);
+                return false;
+            }
+            if (!params_base.kv_offload_holes) {
+                SRV_WRN("kv_offload: --kv-offload-high %d is set but --kv-offload-holes is off - the watermark is holes-mode only (Option C needs the evict plan every request to reduce the prompt text) - ignoring --kv-offload-high (legacy per-turn gate)\n",
+                        params_base.kv_offload_high);
+            } else if (params_base.kv_cache_size > 0) {
+                const int64_t gen_tail = params_base.n_predict > 0 ?
+                    std::min<int64_t>(params_base.n_predict, KV_GEN_TAIL_CAP) : 0;
+                if ((int64_t) params_base.kv_offload_high + params_base.n_batch + gen_tail > (int64_t) params_base.kv_cache_size - 16384) {
+                    SRV_ERR("kv_offload: --kv-offload-high %d + batch %d + gen tail %d exceeds buffer %d - headroom 16384 - a request just below the high watermark would be rejected before eviction can trigger; lower --kv-offload-high to <= %d or raise --kv-cache-size\n",
+                            params_base.kv_offload_high, params_base.n_batch, (int) gen_tail,
+                            params_base.kv_cache_size,
+                            (int) (params_base.kv_cache_size - 16384 - params_base.n_batch - gen_tail));
+                    return false;
+                }
+            }
+        }
 
         // setup slots
         SRV_INF("initializing, n_slots = %d, n_ctx_slot = %d, kv_unified = '%s'\n",
@@ -8603,6 +8630,12 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                 std::vector<std::string> offloaded_hints;
                 std::vector<kv_offload_evict_segment> evicted_segs;
                 std::string kv_session;  // FocusMemory session id (set if kv_offload ran)
+                // True once the session has ANY cumulative evicted (the PUT ledger
+                // is non-empty), even on a watermark-idle turn where no new evict
+                // ran. Drives the Sigma anchor fetch (the DA scaffold must carry
+                // the state anchor while history is offloaded, not only on the
+                // turn that evicts).
+                bool kv_has_offloaded_history = false;
                 if (params.kv_offload && !params.focus_memory_host.empty()) {
                     kv_session = kv_offload_resolve_session(req, data);
                     // Record the session's logical (full prompt) token count for
@@ -8675,14 +8708,40 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                         }
                     }
                     int32_t kv_retain_eff = kv_target - params.kv_offload_threshold;
+                    // High/low watermark: the session's KV-resident count (the full
+                    // logical prompt minus the cumulative evicted, from the per-
+                    // session PUT ledger - the same source GET /kv_state uses). In
+                    // holes mode the evicted text stays in the prompt, so the raw
+                    // token count overstates the resident by the cumulative evicted.
+                    int64_t kv_cumulative_evicted = 0;
+                    {
+                        std::lock_guard<std::mutex> lk(kv_offload_put_mutex);
+                        auto it = kv_offload_uploaded.find(kv_session);
+                        if (it != kv_offload_uploaded.end()) {
+                            for (const auto & kv : it->second) kv_cumulative_evicted += kv.second;
+                        }
+                    }
+                    const int64_t kv_resident = (int64_t) task.tokens.size() - kv_cumulative_evicted;
+                    kv_has_offloaded_history = kv_cumulative_evicted > 0;
+                    // Watermark idle (holes mode only): while the resident is below
+                    // the high watermark, skip the per-turn evict plan / PUT / hole
+                    // re-apply. The already-cut holes persist in the KV (the
+                    // kv_hole_ranges ledger), so the resident stays low; recall is
+                    // still available via the Sigma anchor (offloaded-chunks note).
+                    const bool kv_watermark_idle =
+                            params.kv_offload_holes && params.kv_offload_high > 0 &&
+                            kv_resident < (int64_t) params.kv_offload_high;
                     // Diagnostic: config state + current token count vs threshold, so
                     // the journal shows exactly why eviction does or does not fire
                     // (was the flag parsed? threshold reached? host set? pin released?).
                     // task 17: gate log now carries the effective retain/target and the
                     // physical buffer so the journal shows the full evict budget.
-                    SRV_INF("kv_offload: gate - threshold=%d retain=%d target=%d buffer=%d tokens=%d host=%s session=%s pin_released=%d\n",
+                    // Watermark: resident (the KV-resident count) and high (the
+                    // trigger watermark; 0 = legacy per-turn gate).
+                    SRV_INF("kv_offload: gate - threshold=%d retain=%d target=%d buffer=%d tokens=%d resident=%d high=%d host=%s session=%s pin_released=%d\n",
                             params.kv_offload_threshold, kv_retain_eff, kv_target, params.kv_cache_size,
-                            (int) task.tokens.size(), params.focus_memory_host.c_str(),
+                            (int) task.tokens.size(), (int) kv_resident, params.kv_offload_high,
+                            params.focus_memory_host.c_str(),
                             kv_session.c_str(), (int) release_pin);
                     // Returns true if the request was rejected (res already holds the error).
                     // Two tiers (10-07):
@@ -8761,7 +8820,20 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     // the actually-evicted count instead, so a failed PUT (segment
                     // kept in the prompt, fail-open) is reflected in the judgment.
                     int32_t plan_tokens = 0;
-                    if (kv_offload_evict(ctx_server.vocab, da_prompt, (int32_t) task.tokens.size(),
+                    if (kv_watermark_idle) {
+                        // Watermark idle (holes mode): the resident is below the high
+                        // watermark, so no eviction this turn. The already-cut holes
+                        // persist in the KV (kv_hole_ranges ledger), keeping the
+                        // resident low; recall stays available via the Sigma anchor.
+                        // Run the capacity check with the actual resident (the
+                        // cumulative evicted) so a store-down / pin overflow is
+                        // still caught.
+                        SRV_INF("kv_offload: watermark idle - resident=%d < high=%d (low=%d) - no eviction this turn (holes persist, session=%s)\n",
+                                (int) kv_resident, params.kv_offload_high, params.kv_offload_threshold, kv_session.c_str());
+                        if (reject_if_over_buffer(kv_cumulative_evicted, 0, false)) {
+                            return res;
+                        }
+                    } else if (kv_offload_evict(ctx_server.vocab, da_prompt, (int32_t) task.tokens.size(),
                                          params.kv_offload_threshold, evict_segs, release_pin,
                                          kv_retain_eff)) {
                         // Diagnostic: the eviction plan (n segments, tokens each).
@@ -8951,7 +9023,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                 // ground. Nothing offloaded → the full history is in the KV →
                 // no anchor needed (no fetch, no cost).
                 std::string sigma_anchor;
-                if ((!offloaded_hints.empty() || !evict_bounds.empty()) &&
+                if ((kv_has_offloaded_history || !offloaded_hints.empty() || !evict_bounds.empty()) &&
                         params.kv_offload && !params.focus_memory_host.empty() && !kv_session.empty()) {
                     if (kv_offload_get_sigma(params.focus_memory_host, params.focus_memory_token, kv_session, sigma_anchor)) {
                         SRV_INF("kv_offload: sigma anchor for DA scaffold (%zu chars, session=%s)\n",

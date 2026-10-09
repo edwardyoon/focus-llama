@@ -667,6 +667,17 @@ struct common_params {
     // (1-token re-prefill instead of the ~64s full-tail re-prefill). Off =
     // Option C (prompt text reduction, the default).
     bool        kv_offload_holes     = false;
+    // High/low watermark (hysteresis) for the holes-mode eviction gate. When > 0,
+    // eviction is triggered only when the session's KV-resident count (the full
+    // logical prompt minus the cumulative evicted) reaches this high watermark,
+    // and it then drains to the low watermark (kv_offload_threshold) in one shot.
+    // While low < resident < high the gate is idle (no per-turn evict plan / PUT /
+    // hole re-apply; the already-cut holes persist in the KV). 0 = legacy
+    // per-turn behavior (evict every request over the threshold). Holes mode only
+    // (Option C needs the evict plan every request to reduce the prompt text, so
+    // the watermark is ignored there). Must satisfy high >= threshold and
+    // high + n_batch + gen_tail <= kv_cache_size - 16384 (validated at startup).
+    int32_t     kv_offload_high      = 0;
     // sparse FA gate (DA n_kv_max): the CUDA/Metal sparse (gather) path is used
     // only while the finite KV rows are at most this % of the cache; dense
     // below. Bridged to FOCUS_SPARSE_GATE_THRESHOLD in the server main (1-100).
