@@ -16,6 +16,14 @@ add_library(${TARGET} STATIC
     server-decision.cpp
     server-decision.h
     da-trace.h
+    da-tag.cpp
+    da-tag.h
+    kv-offload.cpp
+    kv-offload.h
+    da-layout.cpp
+    da-layout.h
+    recall-sanitize.cpp
+    recall-sanitize.h
     server-context.cpp
     server-context.h
     server-realtime.cpp
