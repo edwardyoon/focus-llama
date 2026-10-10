@@ -3,6 +3,7 @@
 #include "server-http.h"
 #include "server-task.h"
 #include "server-queue.h"
+#include "kv-offload.h"
 
 #include "json.h"
 
@@ -171,10 +172,6 @@ private:
     std::unique_ptr<server_res_generator> handle_slots_erase(const server_http_req &, int id_slot);
     std::unique_ptr<server_res_generator> handle_embeddings_impl(const server_http_req & req, task_response_type res_type);
     std::unique_ptr<server_res_generator> handle_count_tokens(const server_http_req & req, task_response_type res_type);
-    // Build the per-session /kv_state payload. Assumes kv_offload_put_mutex is
-    // held by the caller. Returns null if the session is unknown (no logical
-    // recording and no ledger entry).
-    json build_kv_state_json(const std::string & session) const;
 
     // using unique_ptr to allow late initialization of const
     std::unique_ptr<const server_context_meta> meta;
@@ -196,24 +193,14 @@ private:
     // call right before sleep to update the cached responses
     void update_cached_responses(bool is_sleeping);
 
-    // kv-offload: per-session set of content-hash keys already uploaded to the
-    // FocusMemory store. Option B (--kv-offload-holes) keeps evicted text in the
-    // prompt, so the same segment (same content-hash key) is re-planned and re-PUT
-    // every turn; the PUT is idempotent (key = content hash), so a cache hit lets
-    // us skip the network call. Lifetime = server process (a stateless server has
-    // no per-session end signal; a restart clears it -> full re-upload, the safe
-    // boundary). Bounded per-session by KV_OFFLOAD_PUT_CACHE_CAP to cap memory.
-    std::mutex                                       kv_offload_put_mutex;
-    // session -> (content-hash key -> offloaded token count). Storing the token
-    // count per key lets GET /kv_state report the total offloaded tokens.
-    std::map<std::string, std::map<std::string, int64_t>> kv_offload_uploaded; // session -> keys -> tokens
-    // session -> latest logical (full prompt) token count, recorded at the
-    // eviction gate. GET /kv_state derives resident = logical - offloaded.
-    std::map<std::string, int64_t> kv_session_logical; // session -> logical tokens
-    // kv-offload (B4): sessions whose first-user-message pin has been released
-    // by the FocusMemory state worker (the user revoked the original task).
-    // Sticky per process lifetime: the flag never un-sets, so a cached true
-    // never needs re-querying; a false result is simply re-queried on the
-    // next eviction plan (a local GET, sub-millisecond).
-    std::set<std::string> kv_offload_pin_released; // session ids
+    // kv-offload (auto-compact replacement): per-session upload ledger, logical
+    // token counts, B4 pin-released flags and the mutex guarding them, bundled in
+    // one state object (see kv-offload.h). Option B (--kv-offload-holes) keeps
+    // evicted text in the prompt, so the same segment (same content-hash key) is
+    // re-planned and re-PUT every turn; the PUT is idempotent (key = content
+    // hash), so a cache hit lets us skip the network call. Lifetime = server
+    // process (a stateless server has no per-session end signal; a restart
+    // clears it -> full re-upload, the safe boundary). Bounded per-session by
+    // KV_OFFLOAD_PUT_CACHE_CAP to cap memory.
+    kv_offload_state kv_offload;
 };
