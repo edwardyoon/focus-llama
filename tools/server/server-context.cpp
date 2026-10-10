@@ -986,6 +986,20 @@ struct server_slot {
                         prompt.tokens.size(), kv_hole_ranges.size(),
                         std::accumulate(kv_hole_ranges.begin(), kv_hole_ranges.end(), 0,
                                         [](int s, const auto & r) { return s + (int) (r.second - r.first); }));
+                // kv-probe (release): physical occupancy at cache-keep time, before
+                // any checkpoint restore of the next turn. used (buffer - free)
+                // already far above the ledger-based resident here means the cut
+                // never happened (H1); a jump only after restore means H2
+                // (2026-10-10 2nd incident).
+                {
+                    const int32_t n_free = llama_memory_n_free_cells(llama_get_memory(mem.ctx_tgt));
+                    int64_t probe_cut = 0;
+                    for (const auto & r : kv_hole_ranges) {
+                        probe_cut += (int64_t) (r.second - r.first);
+                    }
+                    SLT_INF(*this, "kv-probe (release): free=%d ledger_cut=%d prompt=%d\n",
+                            n_free, (int) probe_cut, (int) prompt.n_tokens());
+                }
             }
             // a B slot that returned to the original sequence mid-decode
             // (</focus> before the end) has a plain sequence again: the
@@ -4369,6 +4383,38 @@ private:
                                 slot.kv_holes_active = false;
                             }
                         }
+                        // kv-recut: re-apply every remaining ledger range. All have
+                        // hi <= n_past here (stale ones expired above), so the
+                        // recurrent tail (at n_past) is untouched and the op is an
+                        // idempotent metadata no-op on already-cut ranges. A
+                        // checkpoint restore may re-materialize cells the ledger
+                        // believes are cut (2026-10-10 2nd incident: all 48694
+                        // cut cells survived a PARTIAL_ONLY restore), and the
+                        // n_past path would otherwise never re-cut them (the
+                        // pending dedup skips ranges already in the ledger; an
+                        // idle gate plans nothing). Measure the freed cells so
+                        // the journal confirms the ledger matches the physical
+                        // pool; a rejected range is dropped so the gate's
+                        // resident projection stays honest.
+                        if (n_past > 0 && !slot.kv_hole_shift_blocked && !slot.kv_hole_ranges.empty()) {
+                            auto * m = llama_get_memory(ctx_tgt);
+                            const int32_t f0 = llama_memory_n_free_cells(m);
+                            int span = 0;
+                            for (auto it = slot.kv_hole_ranges.begin(); it != slot.kv_hole_ranges.end(); ) {
+                                if (!slot.mem.seq_rm_checked(slot.kv_seq(), it->first, it->second)) {
+                                    SLT_WRN(slot, "kv-recut: [%d, %d) rejected - dropping from ledger\n", (int) it->first, (int) it->second);
+                                    it = slot.kv_hole_ranges.erase(it);
+                                    continue;
+                                }
+                                span += it->second - it->first;
+                                ++it;
+                            }
+                            if (slot.kv_hole_ranges.empty()) {
+                                slot.kv_holes_active = false;
+                            }
+                            SLT_INF(slot, "kv-recut: %zu range(s), span=%d, freed=%d\n",
+                                    slot.kv_hole_ranges.size(), span, llama_memory_n_free_cells(m) - f0);
+                        }
                         if (n_past == 0) {
                             if (slot.kv_holes_active || !slot.kv_hole_ranges.empty()) {
                                 SLT_INF(slot, "kv-offload-holes: n_past=0 (sequence wiped) - clearing hole ledger (%zu applied)\n",
@@ -4533,6 +4579,21 @@ private:
                         slot.kv_holes_active = false;
                         slot.kv_hole_peak_resident = 0;
                         kv_session_cut_update(slot);
+                    }
+
+                    // kv-probe (post-trim): occupancy after the tail trim, so the
+                    // used value is comparable to the ledger (the STARTED-block
+                    // probe runs before this trim and overstates used by the
+                    // trimmed tail - 2026-10-10). Hole sessions only.
+                    if (params_base.kv_cache_size > 0 && !slot.kv_hole_ranges.empty()) {
+                        const int32_t n_free = llama_memory_n_free_cells(llama_get_memory(ctx_tgt));
+                        int64_t probe_cut = 0;
+                        for (const auto & r : slot.kv_hole_ranges) {
+                            probe_cut += (int64_t) (r.second - r.first);
+                        }
+                        SLT_INF(slot, "kv-probe (post-trim): used=%d free=%d ledger_cut=%d prompt=%d\n",
+                                n_free >= 0 ? (int) (params_base.kv_cache_size - n_free) : -1, n_free,
+                                (int) probe_cut, (int) slot.prompt.n_tokens());
                     }
 
                     // If using an alora, there may be uncached tokens that come
