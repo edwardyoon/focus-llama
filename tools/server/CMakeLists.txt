@@ -15,6 +15,7 @@ add_library(${TARGET} STATIC
     server-common.h
     server-decision.cpp
     server-decision.h
+    da-trace.h
     server-context.cpp
     server-context.h
     server-realtime.cpp
