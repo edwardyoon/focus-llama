@@ -7478,7 +7478,14 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     // copy (kv_last_prompt_set) - the next gate computes the LCP
                     // against it (the slot's residual prompt is queue-thread owned
                     // and must not be read from the HTTP thread).
-                    const llama_tokens kv_orig_tokens = task.tokens.get_tokens();
+                    // get_tokens() asserts on has_mtmd (true whenever an mmproj is
+                    // loaded, even for text-only prompts - the P1 DA scan above
+                    // uses the same split). A real media prompt never reaches this
+                    // block (the P4 branch requires !da_media), so
+                    // get_text_tokens() drops no placeholders here.
+                    const llama_tokens kv_orig_tokens = task.tokens.has_mtmd
+                            ? task.tokens.get_text_tokens()
+                            : task.tokens.get_tokens();
                     // B4 pin release: the FocusMemory state worker sets the
                     // session's pin_released flag when the user cancelled or
                     // superseded the original first task. Sticky: a cached
