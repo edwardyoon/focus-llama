@@ -7381,23 +7381,35 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             const bool da_media = task.tokens.has_mtmd &&
                     task.tokens.find_next_media_chunk(0).first != nullptr;
 
-            // (A, incident 2026-10-12): a media prompt skips EVERY budget gate
-            // (both DA paths below require !da_media, and the kv-offload reject
-            // gate is nested inside the P4 branch), so an over-buffer media
-            // prompt would hard-fail mid-prefill (~60s later: slot abort + KV
-            // clear) instead of failing fast. Reject immediately. The media path
-            // has no recall, so the headroom only covers the gen tail (capped)
-            // plus a fixed safety margin - smaller than the text path's 16384.
-            if (da_media && params.kv_cache_size > 0) {
+            // (2026-10-13) A media prompt used to skip EVERY budget gate (both
+            // DA paths below required !da_media, and the kv-offload reject gate
+            // is nested inside the P4 branch), so an over-buffer media prompt
+            // would hard-fail mid-prefill. It can now be saved by the P4
+            // evict+holes path (the P4 gate no longer excludes da_media): the
+            // evicted segments are pure text (old messages before the last
+            // user's image), so their KV is cut as holes while the image stays
+            // resident. da_media_enters_p4 is exactly the P4 gate (minus the
+            // now-removed !da_media) plus the kv-offload config that makes the
+            // evict+holes branch actually run. When it is false, no other gate
+            // will protect an over-buffer media prompt, so reject immediately
+            // (the media path has no recall; the headroom only covers the gen
+            // tail (capped) plus a fixed safety margin - smaller than the text
+            // path's 16384).
+            const bool da_media_enters_p4 = !da_disable && params.da_auto && da_guard_prompt.is_string() &&
+                    task.params.da_chunks.empty() && (int32_t) task.tokens.size() >= params.da_min_ctx &&
+                    params.kv_unified && params.kv_offload && !params.focus_memory_host.empty() &&
+                    params.kv_offload_holes;
+            if (da_media && params.kv_cache_size > 0 && !da_media_enters_p4) {
                 const int64_t n_predict_eff_m = task.params.n_predict != -1 ? task.params.n_predict : params.n_predict;
                 const int64_t gen_cost_m = n_predict_eff_m > 0 ? std::min<int64_t>(n_predict_eff_m, KV_GEN_TAIL_CAP) : 0;
                 const int64_t media_headroom = gen_cost_m + 4096;
                 const int64_t media_cap = (int64_t) params.kv_cache_size - media_headroom;
-                // No holes cut on the media path: every prompt cell (text +
-                // media) stays resident, so the prefill peak is the full prompt
-                // plus one in-flight sub-batch (same model as the holes-mode
-                // HARD tier in reject_if_over_buffer below).
-                const int64_t prefill_peak = (int64_t) task.tokens.size() + params.n_batch;
+                // No holes cut (the P4 evict+holes path is not reachable for
+                // this prompt), so every prompt cell (text + media) stays
+                // resident: the prefill peak is the full KV plus one in-flight
+                // sub-batch (same model as the holes-mode HARD tier in
+                // reject_if_over_buffer below).
+                const int64_t prefill_peak = (int64_t) task.tokens.pos_next(-1) + params.n_batch;
                 if (prefill_peak > media_cap) {
                     SRV_WRN("kv_offload: media request rejected - prefill peak %d tokens is above buffer %d - media headroom %d (gen %d + margin 4096), no recall\n",
                             (int) prefill_peak, params.kv_cache_size, (int) media_headroom, (int) gen_cost_m);
@@ -7444,7 +7456,12 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     SRV_WRN("%s", "da_auto: requires --kv-unified (reversible B-path) - staying VANILLA to avoid irreversible seq_rm deletion. Add --kv-unified to enable da-auto.\n");
                 }
             }
-            if (!da_disable && params.da_auto && da_guard_prompt.is_string() && !da_media &&
+            // (2026-10-13) da_media is no longer excluded: a media prompt is
+            // routed through this evict+holes path so the old text's KV is cut
+            // while the image (last user, protected) stays resident. The
+            // da_auto_chunk re-tokenization below is skipped for media (it would
+            // drop the image) - see the da_media guard on the da_auto_chunk call.
+            if (!da_disable && params.da_auto && da_guard_prompt.is_string() &&
                     task.params.da_chunks.empty() &&
                     (int32_t) task.tokens.size() >= params.da_min_ctx &&
                     params.kv_unified) {
@@ -7642,7 +7659,12 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     auto reject_if_over_buffer = [&](int64_t evicted_tokens, int32_t planned_tokens, bool put_failed) -> bool {
                         if (params.kv_cache_size <= 0) return false;
                         const int64_t cap = (int64_t) params.kv_cache_size - 16384;
-                        const int64_t prompt = (int64_t) task.tokens.size();
+                        // (2026-10-13) media: the prompt's KV footprint is the KV
+                        // position count (pos_next(-1)), not the array size - media
+                        // chunks occupy more KV cells than array tokens. The evicted
+                        // segments are pure text (their KV == their token count), so
+                        // resident = KV - evicted_tokens is the post-hole resident.
+                        const int64_t prompt = da_media ? (int64_t) task.tokens.pos_next(-1) : (int64_t) task.tokens.size();
                         const int64_t resident = prompt - evicted_tokens;
                         // Holes mode: progressive cut keeps the live-cell peak at the
                         // final resident + one in-flight sub-batch (NOT the raw prompt).
@@ -7661,10 +7683,22 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                             // 400 (ERROR_TYPE_EXCEED_CONTEXT_SIZE) stays reserved
                             // for the media path, where a retry cannot fix the
                             // prompt size.
-                            res->error(format_error_response(
-                                string_format("Context length exceeded: %d tokens > %d limit",
-                                              (int) prefill_peak, (int) cap),
-                                ERROR_TYPE_UNAVAILABLE));
+                            if (da_media) {
+                                // media: a retry (compaction) cannot fix a prompt
+                                // that still exceeds the cap after evict+holes -
+                                // fail fast with 400. The message avoids the
+                                // client's context-overflow trigger words (which
+                                // would loop a useless compaction).
+                                res->error(format_error_response(
+                                    string_format("conversation is larger than this server's KV buffer capacity: %d tokens > %d cell budget (--kv-cache-size %d). Start a new session with the image, describe it in text instead, or raise --kv-cache-size.",
+                                                  (int) prefill_peak, (int) cap, params.kv_cache_size),
+                                    ERROR_TYPE_EXCEED_CONTEXT_SIZE));
+                            } else {
+                                res->error(format_error_response(
+                                    string_format("Context length exceeded: %d tokens > %d limit",
+                                                  (int) prefill_peak, (int) cap),
+                                    ERROR_TYPE_UNAVAILABLE));
+                            }
                             return true;
                         }
                         int64_t recall_cost = 0;
@@ -7878,6 +7912,60 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                                 (int) params.kv_offload, (int) params.focus_memory_host.empty());
                     }
                 }
+                // (2026-10-13) media: the evicted segments are pure text (old
+                // messages before the last user's image). Cut their KV as holes
+                // (kv_hole_pending), keeping the prompt (and the image) intact.
+                // No DA scaffold (no magic headers) - the progressive hole cut
+                // (kv_holes_progressive_apply) does the cutting as the prefill
+                // head passes. The image (last user) is protected by
+                // kv_offload_evict, so its KV is never holed. The char ranges
+                // are in the original da_prompt text space; the evicted messages
+                // precede the last user's media marker, so their positions are
+                // unchanged by the marker. text_toks (get_text_tokens) drops the
+                // NULL media placeholders; text_to_arr recovers each text token's
+                // array index, and pos_next maps it to a KV position (media
+                // chunks occupy more KV cells than array tokens).
+                if (da_media && params.kv_offload_holes && !evicted_segs.empty()) {
+                    const llama_tokens text_toks = task.tokens.get_text_tokens();
+                    std::vector<int64_t> text_to_arr(text_toks.size());
+                    int64_t t = 0;
+                    for (size_t a = 0; a < task.tokens.size() && t < (int64_t) text_toks.size(); a++) {
+                        if (task.tokens[a] != LLAMA_TOKEN_NULL) text_to_arr[t++] = (int64_t) a;
+                    }
+                    const std::vector<size_t> offs = da_token_offsets_lenient(ctx_server.vocab, da_prompt, text_toks);
+                    if (offs.empty() || (size_t) t != text_toks.size()) {
+                        // Fail-closed: without holes the full prompt (text + media)
+                        // would exceed the buffer mid-prefill. A retry cannot fix a
+                        // media prompt, so reject with 400 (the message avoids the
+                        // client's context-overflow trigger words).
+                        SRV_WRN("kv_offload-holes(media): char->token mapping failed (drift) - rejecting, no holes to cut (session=%s)\n", kv_session.c_str());
+                        res->error(format_error_response(
+                            string_format("conversation is larger than this server's KV buffer capacity: %d tokens > %d cell budget (--kv-cache-size %d). Start a new session with the image, describe it in text instead, or raise --kv-cache-size.",
+                                          (int) task.tokens.pos_next(-1), (int) (params.kv_cache_size - 16384), params.kv_cache_size),
+                            ERROR_TYPE_EXCEED_CONTEXT_SIZE));
+                        return res;
+                    }
+                    for (auto & seg : evicted_segs) {
+                        const int32_t t_lo = da_char_to_token_nearest(offs, seg.range_lo);
+                        const int32_t t_hi = da_char_to_token_nearest(offs, seg.range_hi);
+                        if (t_lo < 0 || t_hi < 0 || t_hi <= t_lo ||
+                                t_lo >= (int32_t) text_to_arr.size() || t_hi >= (int32_t) text_to_arr.size()) {
+                            SRV_WRN("kv_offload-holes(media): failed to map evicted segment %s to a token range - skipping its hole\n", seg.key.c_str());
+                            continue;
+                        }
+                        const int32_t kv_lo = (int32_t) task.tokens.pos_next(text_to_arr[t_lo]);
+                        const int32_t kv_hi = (int32_t) task.tokens.pos_next(text_to_arr[t_hi]);
+                        task.params.kv_hole_pending.push_back({ kv_lo, kv_hi });
+                        SRV_INF("kv_offload-holes(media): pending hole %s -> kv [%d, %d) (%d)\n",
+                                seg.key.c_str(), kv_lo, kv_hi, kv_hi - kv_lo);
+                    }
+                    // The slot learns its kv_session from this (the cut ledger is
+                    // keyed by it); host/token/vocab are needed for PUT/recall.
+                    task.params.kv_offload_session = kv_session;
+                    task.params.kv_offload_host    = params.focus_memory_host;
+                    task.params.kv_offload_token   = params.focus_memory_token;
+                    task.params.kv_offload_vocab   = ctx_server.vocab;
+                }
                 // Option B (--kv-offload-holes): pass the evicted messages' char
                 // ranges + hints so da_auto_chunk gives each evicted message its
                 // own chunk (the hole boundary then coincides with the chunk
@@ -7897,15 +7985,23 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                 // ground. Nothing offloaded → the full history is in the KV →
                 // no anchor needed (no fetch, no cost).
                 std::string sigma_anchor;
-                if ((kv_has_offloaded_history || !offloaded_hints.empty() || !evict_bounds.empty()) &&
+                // (2026-10-13) media skips the DA scaffold (no magic chunks), so
+                // the sigma anchor (appended to the scaffold) is not needed.
+                if (!da_media && (kv_has_offloaded_history || !offloaded_hints.empty() || !evict_bounds.empty()) &&
                         params.kv_offload && !params.focus_memory_host.empty() && !kv_session.empty()) {
                     if (kv_offload_get_sigma(params.focus_memory_host, params.focus_memory_token, kv_session, sigma_anchor)) {
                         SRV_INF("kv_offload: sigma anchor for DA scaffold (%zu chars, session=%s)\n",
                                 sigma_anchor.size(), kv_session.c_str());
                     }
                 }
+                // (2026-10-13) media: skip da_auto_chunk - its common_tokenize
+                // re-tokenization is pure text and would drop the image. The
+                // default-constructed layout has ok=false, so the tokenize /
+                // set-tokens path below is skipped and the original mtmd
+                // task.tokens (with the image) is kept.
                 const da_auto_layout layout =
-                        da_auto_chunk(ctx_server.vocab, da_prompt, params.da_chunk_tokens, offloaded_hints, evict_bounds, sigma_anchor);
+                        da_media ? da_auto_layout()
+                                 : da_auto_chunk(ctx_server.vocab, da_prompt, params.da_chunk_tokens, offloaded_hints, evict_bounds, sigma_anchor);
                 if (layout.ok) {
                     const llama_tokens  toks = common_tokenize(ctx_server.vocab, layout.modified, true, true);
                     const std::vector<size_t> offs = da_token_offsets_lenient(ctx_server.vocab, layout.modified, toks);
