@@ -286,7 +286,6 @@ llama_model_glm4_moe::graph_mtp::graph_mtp(const llama_model & model, const llm_
     cb(cur, "result_output", -1);
 
     res->t_logits = cur;
-    ggml_build_forward_expand(gf, cur);
 }
 
 llama_model_glm4_moe::graph::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
@@ -440,6 +439,4 @@ llama_model_glm4_moe::graph::graph(const llama_model & model, const llm_graph_pa
 
     cb(cur, "result_output", -1);
     res->t_logits = cur;
-
-    ggml_build_forward_expand(gf, cur);
 }

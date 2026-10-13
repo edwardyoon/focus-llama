@@ -481,8 +481,6 @@ llama_model_deepseek32::graph::graph(const llama_model & model, const llm_graph_
 
     cb(cur, "result_output", -1);
     res->t_logits = cur;
-
-    ggml_build_forward_expand(gf, cur);
 }
 
 // LLM_GRAPH_TYPE_DECODER_MTP draft head for DeepSeek V3.2 (DEEPSEEK32).
@@ -722,6 +720,5 @@ llama_model_deepseek32::graph_mtp::graph_mtp(const llama_model & model, const ll
     cb(cur, "result_output", -1);
 
     res->t_logits = cur;
-    ggml_build_forward_expand(gf, cur);
 }
 
