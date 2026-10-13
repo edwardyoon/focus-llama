@@ -1362,6 +1362,10 @@ public:
         }
         std::lock_guard<std::mutex> lk(kv_session_cut_mutex);
         kv_session_cut[slot.kv_session] = cut;
+        // 2026-10-12: mirror the ranges too - the gate needs per-range
+        // coordinates to apply the expire rule (the total alone cannot say
+        // which holes survive the new n_past).
+        kv_session_holes[slot.kv_session] = slot.kv_hole_ranges;
     }
 
     // kv-offload-holes: the actual-cut count for the watermark gate. 0 when
@@ -1371,6 +1375,79 @@ public:
         std::lock_guard<std::mutex> lk(kv_session_cut_mutex);
         const auto it = kv_session_cut.find(session);
         return it != kv_session_cut.end() ? it->second : 0;
+    }
+
+    // kv-offload-holes (2026-10-12): the shared hole-expire rule (formerly
+    // inline at task start): a hole survives a re-prefill at n_past iff its
+    // KV range is entirely inside the matched prefix (hi <= n_past);
+    // otherwise its cells were freshly rewritten and the cut no longer
+    // applies. Returns the surviving ranges. Static so the task-start path
+    // (queue thread, the real n_past) and the gate's kv_session_valid_cut
+    // (HTTP thread, the simulated n_past) use the exact same rule.
+    static std::vector<std::pair<int32_t,int32_t>> kv_holes_survive(
+            const std::vector<std::pair<int32_t,int32_t>> & ranges, int64_t n_past) {
+        std::vector<std::pair<int32_t,int32_t>> out;
+        for (const auto & r : ranges) {
+            if (r.second <= n_past) {
+                out.push_back(r);
+            }
+        }
+        return out;
+    }
+
+    // kv-offload-holes (2026-10-12): the gate-side valid-cut estimate (HTTP
+    // thread). The cut-ledger total (kv_session_cut_get) overcounts the holes
+    // that survive this request: the client rewrites/compacts the history, so
+    // the new prompt's LCP with the previous one (the task-start n_past) is
+    // far below the previous prompt size, and every hole with hi > n_past
+    // expires (its KV is re-prefilled). Projecting resident = prompt -
+    // ledger_cut then pins the gate "idle" while the physical KV re-fills to
+    // the buffer cap (2026-10-12 13:35-13:54: 11x full re-prefill, ~55s
+    // each, then the find_slot cascade).
+    //
+    // The LCP is computed against the session's last accepted prompt (the
+    // kv_last_prompt copy - the slot's residual prompt is queue-thread owned
+    // and must not be read from the HTTP thread). The effective n_past is the
+    // LCP minus the given margin: a checkpoint restore can land below the
+    // LCP by up to the checkpoint spacing, and the da_auto re-tokenization
+    // can shift the chunk headers by up to one chunk. When uncertain, bias to
+    // the evict-plan side - over-planning is a few idempotent PUTs,
+    // under-planning is a 55s prefill + failure.
+    int64_t kv_session_valid_cut(const std::string & session, const llama_tokens & cur,
+                                 int64_t margin, size_t * lcp_out = nullptr) {
+        std::lock_guard<std::mutex> lk(kv_session_cut_mutex);
+        const auto pit = kv_last_prompt.find(session);
+        if (pit == kv_last_prompt.end()) {
+            return 0; // no history - nothing can be assumed cut
+        }
+        const size_t max_idx = std::min(cur.size(), pit->second.size());
+        size_t lcp = 0;
+        while (lcp < max_idx && cur[lcp] == pit->second[lcp]) {
+            lcp++;
+        }
+        if (lcp_out) {
+            *lcp_out = lcp;
+        }
+        const int64_t n_eff = (int64_t) lcp - margin;
+        if (n_eff < 0) {
+            return 0;
+        }
+        const auto hit = kv_session_holes.find(session);
+        if (hit == kv_session_holes.end()) {
+            return 0;
+        }
+        int64_t cut = 0;
+        for (const auto & r : kv_holes_survive(hit->second, n_eff)) {
+            cut += (int64_t) (r.second - r.first);
+        }
+        return cut;
+    }
+
+    // kv-offload-holes (2026-10-12): record the session's last accepted
+    // prompt (the gate's LCP reference for the next request).
+    void kv_last_prompt_set(const std::string & session, const llama_tokens & tokens) {
+        std::lock_guard<std::mutex> lk(kv_session_cut_mutex);
+        kv_last_prompt[session] = tokens;
     }
 
 private:
@@ -1421,6 +1498,19 @@ private:
     // (the gate) - mutex-guarded.
     std::mutex kv_session_cut_mutex;
     std::map<std::string, int64_t> kv_session_cut;
+    // kv-offload-holes (2026-10-12): session -> the owning slot's applied-hole
+    // ranges (kv_hole_ranges), mirrored for the HTTP-thread gate. The gate
+    // must not touch the slot's ledger (queue-thread owned - the 2026-10-12
+    // 13:35 gate ran 3ms before the prior task's release). Written by
+    // kv_session_cut_update on every ledger mutation, same mutex.
+    std::map<std::string, std::vector<std::pair<int32_t,int32_t>>> kv_session_holes;
+    // kv-offload-holes (2026-10-12): session -> the last accepted request's
+    // original prompt tokens (the gate's LCP reference). The gate (HTTP
+    // thread) compares the current prompt against this stored copy - NOT the
+    // slot's residual prompt (queue-thread owned). Updated when a request
+    // passes the gate; a rejected request leaves it untouched (the KV state
+    // did not change, so the reference must not move either).
+    std::map<std::string, llama_tokens> kv_last_prompt;
 
     int trace = 0;        // env: LLAMA_TRACE
     int slots_debug = 0;  // env: LLAMA_SERVER_SLOTS_DEBUG
@@ -4400,15 +4490,18 @@ private:
                         // Expire it; the gate re-plans and the apply path re-cuts
                         // once hi <= n_past.
                         if (n_past > 0 && !slot.kv_hole_ranges.empty()) {
-                            auto it = slot.kv_hole_ranges.begin();
-                            while (it != slot.kv_hole_ranges.end()) {
-                                if (it->second > n_past) {
-                                    SLT_INF(slot, "kv-offload-holes: expiring stale hole [%d, %d) (hi > n_past=%d) - KV re-prefilled, re-plan will re-apply\n",
-                                            (int) it->first, (int) it->second, n_past);
-                                    it = slot.kv_hole_ranges.erase(it);
-                                } else {
-                                    ++it;
+                            // 2026-10-12: the shared expire rule (kv_holes_survive) -
+                            // the same function the gate's kv_session_valid_cut uses
+                            // with its simulated n_past.
+                            const auto valid = kv_holes_survive(slot.kv_hole_ranges, n_past);
+                            if (valid.size() != slot.kv_hole_ranges.size()) {
+                                for (const auto & r : slot.kv_hole_ranges) {
+                                    if (r.second > n_past) {
+                                        SLT_INF(slot, "kv-offload-holes: expiring stale hole [%d, %d) (hi > n_past=%d) - KV re-prefilled, re-plan will re-apply\n",
+                                                (int) r.first, (int) r.second, n_past);
+                                    }
                                 }
+                                slot.kv_hole_ranges = std::move(valid);
                             }
                             if (slot.kv_hole_ranges.empty()) {
                                 slot.kv_holes_active = false;
@@ -4562,6 +4655,56 @@ private:
                                         ledger_span, n_past, n_stale);
                             }
                             slot.kv_hole_peak_resident = n_past - ledger_span;
+                        }
+
+                        // (2026-10-12, incident 2026-10-12) Secondary safety net:
+                        // the gate's estimate (HTTP thread) and the actual n_past
+                        // (here, after the checkpoint restore + hole
+                        // expire/recut/apply) can diverge - the gate ran
+                        // milliseconds before the prior task's release, a
+                        // checkpoint restore lands below the LCP, and the
+                        // wipe path clears the ledger. If the projected prefill
+                        // peak cannot fit the physical buffer, fail fast with a
+                        // 503 (retryable: the client compacts and retries
+                        // smaller) instead of the ~60s prefill + find_slot
+                        // cascade + slot abort + KV clear. The progressive cut
+                        // keeps the live-cell peak at the final resident plus
+                        // one in-flight sub-batch, so
+                        //   peak = prompt - (applied + pending cuts) + n_batch.
+                        // The prefill has not started, so the slot's KV is still
+                        // the consistent n_past prefix - release() keeps it for
+                        // the next request's LCP match (no prompt_clear).
+                        if (params_base.kv_cache_size > 0) {
+                            int64_t ledger_cut = 0;
+                            for (const auto & r : slot.kv_hole_ranges) {
+                                ledger_cut += (int64_t) (r.second - r.first);
+                            }
+                            int64_t pending_cut = 0;
+                            if (!slot.kv_hole_shift_blocked) {
+                                // the n_cache_reuse shift moved the KV: the pending
+                                // coordinates are stale and the progressive path
+                                // skips them this prefill - do not count the cut
+                                // (when uncertain, bias to the evict side).
+                                for (const auto & r : slot.task->params.kv_hole_pending) {
+                                    pending_cut += (int64_t) (r.second - r.first);
+                                }
+                            }
+                            const int64_t prefill_peak = (int64_t) slot.task->n_tokens() - ledger_cut - pending_cut + n_batch;
+                            if (prefill_peak > (int64_t) params_base.kv_cache_size) {
+                                SLT_ERR(slot, "kv_offload: prefill peak %d exceeds buffer %d (n_past=%d, ledger_cut=%d, pending_cut=%d) - rejecting with 503 (retryable: client compacts and retries)\n",
+                                        (int) prefill_peak, params_base.kv_cache_size, n_past,
+                                        (int) ledger_cut, (int) pending_cut);
+                                // The message intentionally matches the client's
+                                // context-overflow patterns (and carries the real
+                                // token counts for parseTokenCounts): reactive
+                                // compaction is the recovery path.
+                                send_error(slot,
+                                           string_format("Context length exceeded: %d tokens > %d limit",
+                                                         (int) prefill_peak, params_base.kv_cache_size),
+                                           ERROR_TYPE_UNAVAILABLE);
+                                slot.release();
+                                return;
+                            }
                         }
 
                         // this is to signal the client that the request has started processing
@@ -7238,6 +7381,38 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             const bool da_media = task.tokens.has_mtmd &&
                     task.tokens.find_next_media_chunk(0).first != nullptr;
 
+            // (A, incident 2026-10-12): a media prompt skips EVERY budget gate
+            // (both DA paths below require !da_media, and the kv-offload reject
+            // gate is nested inside the P4 branch), so an over-buffer media
+            // prompt would hard-fail mid-prefill (~60s later: slot abort + KV
+            // clear) instead of failing fast. Reject immediately. The media path
+            // has no recall, so the headroom only covers the gen tail (capped)
+            // plus a fixed safety margin - smaller than the text path's 16384.
+            if (da_media && params.kv_cache_size > 0) {
+                const int64_t n_predict_eff_m = task.params.n_predict != -1 ? task.params.n_predict : params.n_predict;
+                const int64_t gen_cost_m = n_predict_eff_m > 0 ? std::min<int64_t>(n_predict_eff_m, KV_GEN_TAIL_CAP) : 0;
+                const int64_t media_headroom = gen_cost_m + 4096;
+                const int64_t media_cap = (int64_t) params.kv_cache_size - media_headroom;
+                // No holes cut on the media path: every prompt cell (text +
+                // media) stays resident, so the prefill peak is the full prompt
+                // plus one in-flight sub-batch (same model as the holes-mode
+                // HARD tier in reject_if_over_buffer below).
+                const int64_t prefill_peak = (int64_t) task.tokens.size() + params.n_batch;
+                if (prefill_peak > media_cap) {
+                    SRV_WRN("kv_offload: media request rejected - prefill peak %d tokens is above buffer %d - media headroom %d (gen %d + margin 4096), no recall\n",
+                            (int) prefill_peak, params.kv_cache_size, (int) media_headroom, (int) gen_cost_m);
+                    // NOTE: message wording is constrained - the client (qwen-code) pattern-matches
+                    // the error text for context overflow ("input|prompt|message|context" + "tokens"
+                    // + "exceed" within 120 chars triggers reactive compaction with a wrong
+                    // originalTokenCount). Keep those word combinations out.
+                    res->error(format_error_response(
+                        string_format("conversation is larger than this server's KV buffer capacity: %d tokens > %d cell budget (--kv-cache-size %d minus %d media headroom). Start a new session with the image, describe it in text instead, or raise --kv-cache-size.",
+                                      (int) prefill_peak, (int) media_cap, params.kv_cache_size, (int) media_headroom),
+                        ERROR_TYPE_EXCEED_CONTEXT_SIZE));
+                    return res;
+                }
+            }
+
             // DA prompt scan (P1): the client hook (FocusMemory) may have
             // appended a marker block to the rendered prompt; recover the
             // chunk layout so the tag state machine can drive the attention
@@ -7297,6 +7472,13 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                         std::lock_guard<std::mutex> lk(kv_offload.put_mutex);
                         kv_offload.session_logical[kv_session] = (int64_t) task.tokens.size();
                     }
+                    // 2026-10-12: the original prompt tokens, captured before the
+                    // da_auto re-tokenization below replaces task.tokens. Once the
+                    // request passes the gate it becomes the session's last-prompt
+                    // copy (kv_last_prompt_set) - the next gate computes the LCP
+                    // against it (the slot's residual prompt is queue-thread owned
+                    // and must not be read from the HTTP thread).
+                    const llama_tokens kv_orig_tokens = task.tokens.get_tokens();
                     // B4 pin release: the FocusMemory state worker sets the
                     // session's pin_released flag when the user cancelled or
                     // superseded the original first task. Sticky: a cached
@@ -7361,16 +7543,30 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     int32_t kv_retain_eff = kv_target - params.kv_offload_threshold;
                     // (2026-10-10, incident 2026-10-10-kv-ledger-loss) Resident
                     // estimate for the watermark gate: the tokens actually cut
-                    // from this session's KV (the owning slot's kv_hole_ranges
-                    // ledger sum), NOT the cumulative PUT total. The cumulative
-                    // ledger overcounts "offloaded" once holes expire or the
-                    // slot's prompt is cleared and re-prefilled, which pins the
-                    // resident low and keeps the gate idle forever even when the
-                    // physical KV sits near the buffer cap. The cut ledger is
-                    // the source of truth: cut holes are offloaded, expired
-                    // holes are resident again.
-                    const int64_t kv_cumulative_evicted = ctx_server.kv_session_cut_get(kv_session);
-                    const int64_t kv_resident = (int64_t) task.tokens.size() - kv_cumulative_evicted;
+                    // from this session's KV, NOT the cumulative PUT total.
+                    // (2026-10-12, incident 2026-10-12) The raw cut-ledger total
+                    // is still wrong, in the other direction: the client
+                    // rewrites/compacts the history between turns, so this
+                    // request's n_past (LCP with the previous prompt) is far
+                    // below the previous prompt size, and every hole with
+                    // hi > n_past expires at task start (its KV is re-prefilled).
+                    // Projecting resident = prompt - ledger_cut then pins the
+                    // gate "idle" while the physical KV re-fills to the buffer
+                    // cap (13:35-13:54: 11x full re-prefill of 139-167k
+                    // prompts, ~55s each, then failure). Recompute the VALID
+                    // cut: LCP of the current prompt against the session's last
+                    // accepted prompt (stored copy - see kv_last_prompt), then
+                    // the shared expire rule (kv_holes_survive) with an
+                    // effective n_past below the LCP: a checkpoint restore can
+                    // land below the LCP by up to the checkpoint spacing, and
+                    // the da_auto re-tokenization can shift the chunk headers by
+                    // up to one chunk. When uncertain, bias to the evict-plan
+                    // side - over-planning is a few idempotent PUTs,
+                    // under-planning is a 55s prefill + failure.
+                    const int64_t kv_gate_margin = std::max<int64_t>(params.checkpoint_min_step, params.da_chunk_tokens);
+                    size_t kv_lcp = 0;
+                    const int64_t kv_valid_cut = ctx_server.kv_session_valid_cut(kv_session, kv_orig_tokens, kv_gate_margin, &kv_lcp);
+                    const int64_t kv_resident = (int64_t) task.tokens.size() - kv_valid_cut;
                     // The Sigma anchor fetch below still keys off the PUT
                     // ledger: it answers "has this session ever offloaded
                     // text", which the cut ledger cannot express.
@@ -7398,9 +7594,10 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     // physical buffer so the journal shows the full evict budget.
                     // Watermark: resident (the KV-resident count) and high (the
                     // trigger watermark; 0 = legacy per-turn gate).
-                    SRV_INF("kv_offload: gate - threshold=%d retain=%d target=%d buffer=%d tokens=%d resident=%d high=%d host=%s session=%s pin_released=%d\n",
+                    SRV_INF("kv_offload: gate - threshold=%d retain=%d target=%d buffer=%d tokens=%d resident=%d lcp=%zu margin=%d valid_cut=%d high=%d host=%s session=%s pin_released=%d\n",
                             params.kv_offload_threshold, kv_retain_eff, kv_target, params.kv_cache_size,
-                            (int) task.tokens.size(), (int) kv_resident, params.kv_offload_high,
+                            (int) task.tokens.size(), (int) kv_resident, kv_lcp, (int) kv_gate_margin, (int) kv_valid_cut,
+                            params.kv_offload_high,
                             params.focus_memory_host.c_str(),
                             kv_session.c_str(), (int) release_pin);
                     // Returns true if the request was rejected (res already holds the error).
@@ -7448,14 +7645,19 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                             SRV_WRN("kv_offload: rejecting request - prefill peak %d tokens is above buffer %d - headroom 16384 (holes=%d, evicted %d of planned %d, put_failed=%d, session=%s)\n",
                                     (int) prefill_peak, params.kv_cache_size, (int) params.kv_offload_holes,
                                     (int) evicted_tokens, (int) planned_tokens, (int) put_failed, kv_session.c_str());
-                            // NOTE: message wording is constrained - the client (qwen-code) pattern-matches
-                            // the error text for context overflow ("input|prompt|message|context" + "tokens"
-                            // + "exceed" within 120 chars triggers reactive compaction with a wrong
-                            // originalTokenCount). Keep those word combinations out.
+                            // 2026-10-12: text path = 503 (retryable), NOT 400
+                            // (fail-fast). The message intentionally matches the
+                            // client's context-overflow patterns and carries the
+                            // real token counts (parseTokenCounts): reactive
+                            // compaction is the recovery path - the client shrinks
+                            // the prompt and retries, and the retry fits. The
+                            // 400 (ERROR_TYPE_EXCEED_CONTEXT_SIZE) stays reserved
+                            // for the media path, where a retry cannot fix the
+                            // prompt size.
                             res->error(format_error_response(
-                                string_format("conversation is larger than this server's KV buffer capacity: %d tokens > %d cell budget (--kv-cache-size %d minus 16384 headroom). Compact the conversation and retry, or raise --kv-cache-size.",
-                                              (int) prefill_peak, (int) cap, params.kv_cache_size),
-                                ERROR_TYPE_EXCEED_CONTEXT_SIZE));
+                                string_format("Context length exceeded: %d tokens > %d limit",
+                                              (int) prefill_peak, (int) cap),
+                                ERROR_TYPE_UNAVAILABLE));
                             return true;
                         }
                         int64_t recall_cost = 0;
@@ -7490,7 +7692,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                         // still caught.
                         SRV_INF("kv_offload: watermark idle - resident=%d < high=%d (low=%d) - no eviction this turn (holes persist, session=%s)\n",
                                 (int) kv_resident, params.kv_offload_high, params.kv_offload_threshold, kv_session.c_str());
-                        if (reject_if_over_buffer(kv_cumulative_evicted, 0, false)) {
+                        if (reject_if_over_buffer(kv_valid_cut, 0, false)) {
                             return res;
                         }
                     } else if (kv_offload_evict(ctx_server.vocab, da_prompt, (int32_t) task.tokens.size(),
@@ -7654,6 +7856,11 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                             return res;
                         }
                     }
+                    // 2026-10-12: the request passed the gate - record its original
+                    // prompt as the session's last accepted prompt (the next gate's
+                    // LCP reference). A rejected request never reaches here (its KV
+                    // state did not change, so the reference must not move either).
+                    ctx_server.kv_last_prompt_set(kv_session, kv_orig_tokens);
                 } else {
                     // Diagnostic (one-time): kv-offload configured off - the flag was
                     // not parsed (was the old --kv-offload collision) or the host is

@@ -1157,6 +1157,54 @@ static void handle_media(
     }
 }
 
+// (C1, incident 2026-10-12): true if the OAI content array carries any media
+// part (image/audio/video). Used to locate the latest media-carrying user
+// message so that only its media is loaded.
+static bool content_has_media(const json & content) {
+    if (!content.is_array()) return false;
+    for (const auto & p : content) {
+        const std::string type = json_value(p, "type", std::string());
+        if (type == "image_url" || type == "input_audio" ||
+            type == "input_video" || type == "video_url") {
+            return true;
+        }
+    }
+    return false;
+}
+
+// (C1, incident 2026-10-12): replace every media part in the content array
+// with a plain-text omission marker; NO bytes are loaded. A chat client
+// re-sends the whole history on every turn, so a session that used media once
+// would keep it in the prompt forever - da_media stays true and the request
+// skips EVERY DA/kv-offload budget gate (the unguarded media path). After
+// this, the request re-enters the text path (DA + kv-offload) and only the
+// latest user message's media survives. Returns the number of parts omitted.
+static int content_omit_media(json & content) {
+    if (!content.is_array()) return 0;
+    int n = 0;
+    for (auto & p : content) {
+        const std::string type = json_value(p, "type", std::string());
+        if (type == "image_url") {
+            p["type"] = "text";
+            p["text"] = "[이미지 생략]";
+            p.erase("image_url");
+            n++;
+        } else if (type == "input_audio") {
+            p["type"] = "text";
+            p["text"] = "[오디오 생략]";
+            p.erase("input_audio");
+            n++;
+        } else if (type == "input_video" || type == "video_url") {
+            p["type"] = "text";
+            p["text"] = "[비디오 생략]";
+            p.erase("input_video");
+            p.erase("video_url");
+            n++;
+        }
+    }
+    return n;
+}
+
 // load media files from an OAI content array, then replace each media part with a media marker text part
 static void oaicompat_content_load_media(json & content, const server_chat_params & opt, std::vector<raw_buffer> & out_files) {
     for (auto & p : content) {
@@ -1294,7 +1342,25 @@ json oaicompat_chat_params_parse(
     if (!messages.is_array()) {
         throw std::invalid_argument("Expected 'messages' to be an array");
     }
-    for (auto & msg : messages) {
+    // (C1, incident 2026-10-12): only the LATEST user message that carries
+    // media loads its media files. A chat client re-sends the whole history on
+    // every turn, so a session that used media once would keep media in the
+    // prompt forever - da_media stays true and the request skips EVERY
+    // DA/kv-offload budget gate (the unguarded media path). Omit the media in
+    // every other message (text marker, no bytes loaded) so the request
+    // re-enters the text path (DA + kv-offload) and only the latest image
+    // survives.
+    int64_t last_media_user_idx = -1;
+    for (size_t mi = 0; mi < messages.size(); mi++) {
+        const std::string mrole = json_value(messages[mi], "role", std::string());
+        if (mrole == "user" && messages[mi].contains("content") &&
+                content_has_media(messages[mi].at("content"))) {
+            last_media_user_idx = (int64_t) mi;
+        }
+    }
+    int media_omitted = 0;
+    for (size_t i = 0; i < messages.size(); i++) {
+        json & msg = messages[i];
         std::string role = json_value(msg, "role", std::string());
         if (role != "assistant" && !msg.contains("content")) {
             throw std::invalid_argument("All non-assistant messages must contain 'content'");
@@ -1316,7 +1382,14 @@ json oaicompat_chat_params_parse(
             throw std::invalid_argument("Expected 'content' to be a string or an array");
         }
 
+        if ((int64_t) i != last_media_user_idx) {
+            media_omitted += content_omit_media(content);
+        }
         oaicompat_content_load_media(content, opt, out_files);
+    }
+    if (media_omitted > 0) {
+        SRV_INF("oaicompat: omitted %d media part(s) from earlier messages - only the latest user message's media is loaded (incident 2026-10-12)\n",
+                media_omitted);
     }
 
     auto caps = common_chat_templates_get_caps(opt.tmpls.get());
