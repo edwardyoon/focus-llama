@@ -866,6 +866,7 @@ ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
         }
     }
     const int64_t n_sel = sel_idx->ne[0];
+    GGML_ASSERT(n_sel == (int64_t) inp_kpool->n_sel);
 
     // Gather returns selected cell indices and masks padding separately.
     if (inp_kpool->gather) {
@@ -896,11 +897,13 @@ ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
     sel_idx = ggml_cast(ctx0, idx_f, GGML_TYPE_I32);
 
     ggml_tensor * sel = ggml_set_rows(ctx0, mask_all, zeros, ggml_reshape_3d(ctx0, sel_idx, n_sel, n_tokens, 1));
-    sel = ggml_view_2d(ctx0, sel, n_kv, n_tokens, sel->nb[2], 0);
 
     // Fold causal visibility before shared-indexer reuse.
     GGML_ASSERT(kq_mask->ne[0] == n_kv && kq_mask->ne[1]*kq_mask->ne[2]*kq_mask->ne[3] == n_tokens);
-    sel = ggml_add(ctx0, sel, ggml_reshape_2d(ctx0, kq_mask, n_kv, n_tokens));
+    const size_t row = sel->nb[2];
+    sel = ggml_view_4d(ctx0, sel, n_kv, kq_mask->ne[1], kq_mask->ne[2], kq_mask->ne[3],
+            row, row*kq_mask->ne[1], row*kq_mask->ne[1]*kq_mask->ne[2], 0);
+    sel = ggml_add(ctx0, sel, kq_mask);
     cb(sel, "indexer_sel", il);
 
     return sel;
@@ -983,14 +986,14 @@ ggml_tensor * llama_model_glm5_next::graph::build_dsa_layer(
         out = ggml_cont(ctx0, ggml_permute(ctx0, kqv, 0, 2, 1, 3));     // [n_embd_head_v, n_head, 1, n_tokens]
         out = ggml_reshape_2d(ctx0, out, kqv->ne[0]*n_head, n_tokens);
     } else {
-        // The scatter selection already includes the causal mask.
-        ggml_tensor * mask = ggml_reshape_4d(ctx0, sel, kq_mask->ne[0], kq_mask->ne[1], kq_mask->ne[2], kq_mask->ne[3]);
-        cb(mask, "kq_mask_dsa", il);
+        // The scatter selection already includes the causal mask, and it comes in the mask layout
+        GGML_ASSERT(ggml_are_same_shape(sel, kq_mask));
+        cb(sel, "kq_mask_dsa", il);
 
         ggml_tensor * k = mctx_mla->get_k(ctx0, il);
         ggml_tensor * v = ggml_view_4d(ctx0, k, kv_lora_rank, k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
 
-        out = build_attn_mha(q_absorbed, k, v, nullptr, mask, nullptr, layer.wv_b, inp_kpool->n_sel, kq_scale, il);
+        out = build_attn_mha(q_absorbed, k, v, nullptr, sel, nullptr, layer.wv_b, inp_kpool->n_sel, kq_scale, il);
     }
     cb(out, "kqv_out", il);
 
