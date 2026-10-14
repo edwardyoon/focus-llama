@@ -1014,6 +1014,8 @@ struct server_slot {
                 // already far above the ledger-based resident here means the cut
                 // never happened (H1); a jump only after restore means H2
                 // (2026-10-10 2nd incident).
+                // (2026-10-14) Disabled: logging-only occupancy probe, issue resolved.
+                /*
                 {
                     const int32_t n_free = llama_memory_n_free_cells(llama_get_memory(mem.ctx_tgt));
                     int64_t probe_cut = 0;
@@ -1023,6 +1025,7 @@ struct server_slot {
                     SLT_INF(*this, "kv-probe (release): free=%d ledger_cut=%d prompt=%d\n",
                             n_free, (int) probe_cut, (int) prompt.n_tokens());
                 }
+                */
             }
             // a B slot that returned to the original sequence mid-decode
             // (</focus> before the end) has a plain sequence again: the
