@@ -4627,6 +4627,7 @@ private:
                         // (used ≈ prompt - ledger_cut) or the ledger lags the
                         // physical state (2026-10-10: holes cut 0 with ~101k
                         // resident after an idle-slot clear).
+                        /*
                         if (params_base.kv_cache_size > 0) {
                             const int32_t n_free = llama_memory_n_free_cells(llama_get_memory(ctx_tgt));
                             int64_t probe_cut = 0;
@@ -4637,6 +4638,7 @@ private:
                                     n_free >= 0 ? (int) (params_base.kv_cache_size - n_free) : -1, n_free,
                                     (int) probe_cut, (int) slot.prompt.n_tokens(), params_base.kv_cache_size);
                         }
+                        */
 
                         // progressive apply: seed the peak tracker with the
                         // resident at prefill start (the matched prefix minus
