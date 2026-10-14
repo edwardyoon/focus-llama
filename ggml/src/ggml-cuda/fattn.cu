@@ -118,9 +118,10 @@ void ggml_cuda_flash_attn_ext_compact_mask(
 //   -> dense        : 'DENSE - ... - <failed condition>' - the fallback, with
 //                     the reason (multi-token speculative verify batch, the
 //                     50% decay K < 2*bound, ...) instead of a silent dense
-// Vanilla decode without a DA bound (n_kv_max == 0) logs nothing. The bound
-// is the 512-bucketed upper bound on the gather list; the finite rows read
-// are <= bound.
+// Vanilla decode without a DA bound (n_kv_max == 0) logs one transition line
+// ('DENSE - no DA bound') so the absence of a SPARSE line is distinguishable.
+// The bound is the 512-bucketed upper bound on the gather list; the finite rows
+// read are <= bound.
 void ggml_cuda_fattn_sparse_gate_log(const char * path, bool use_sparse, ggml_tensor * dst, const char * fail) {
     const ggml_tensor * K = dst->src[1];
     const int32_t n_kv_max = ggml_get_op_params_i32(dst, 4);
@@ -135,7 +136,17 @@ void ggml_cuda_fattn_sparse_gate_log(const char * path, bool use_sparse, ggml_te
     static char    last_fail[64] = {0};
 
     if (!use_sparse && n_kv_max <= 0) {
-        last_valid = false; // back to vanilla dense - the next DA transition logs again
+        // vanilla dense - no DA bound. Log the transition into steady no-DA-bound
+        // (first observation, or the bound vanishing) so a missing SPARSE line reads
+        // as "DA bound inactive" instead of silence; steady n_kv_max=0 stays quiet.
+        if (!last_valid || last_nkvmax != 0) {
+            last_valid  = true;
+            last_active = false;
+            last_nkvmax = 0;
+            last_fail[0] = '\0';
+            snprintf(last_path, sizeof(last_path), "%s", path);
+            GGML_LOG("da_sparse[%s]: DENSE - no DA bound (n_kv_max=0)\n", path);
+        }
         return;
     }
     if (last_valid && last_active == use_sparse && strcmp(last_path, path) == 0 &&
