@@ -119,6 +119,10 @@ void ggml_cuda_flash_attn_ext_compact_mask(
 //            the reason (vanilla n_kv_max=0, the KV gate K < min_kv, multi-
 //            token verify batch, ...) re-logged only when the reason itself
 //            changes, so a stable fallback is logged once, not per step
+//   WINDOW : 'window 5.0s - SPARSE N, DENSE M (bound B, KV K - <reason>)' -
+//            the per-path duty cycle over a rolling 5s window (one summary
+//            line per window), logged only when sparse was used or a DA bound
+//            was active, so a vanilla (n_kv_max=0) deployment stays quiet
 // FOCUS_SPARSE_DEBUG=1 bypasses the dedup - the live decision is logged on
 // every evaluation, throttled to one line per path per second (the gate runs
 // per layer, per step: thousands of evaluations per second on a 27B).
@@ -145,6 +149,61 @@ void ggml_cuda_fattn_sparse_gate_log(const char * path, bool use_sparse, ggml_te
     static GateLogState st[2]; // [0]=VEC, [1]=MMA
     const int slot = strncmp(path, "MMA", 3) == 0 ? 1 : 0;
     GateLogState & s = st[slot];
+
+    // Windowed counter: the gate runs per flash-attn op (per layer, per step),
+    // thousands of evaluations per second on a 27B, so per-evaluation logging
+    // floods the journal and adds hot-path overhead. Instead, count the
+    // SPARSE/DENSE decisions per path over a rolling 5s window and log one
+    // summary line per window - the sparse read reduction's actual duty cycle
+    // (how often the gate chose sparse) as a single number. The window only
+    // logs when sparse was used or a DA bound was active, so a vanilla
+    // deployment (n_kv_max=0) stays quiet. The current eval is counted AFTER
+    // the window closes, so it belongs to the new window.
+    struct GateCounter {
+        bool     active     = false;
+        std::chrono::steady_clock::time_point t0{};
+        uint64_t n_sparse   = 0;
+        uint64_t n_dense    = 0;
+        int32_t  max_bound  = 0;
+        int32_t  last_bound = 0;
+        int64_t  last_kv    = 0;
+        char     dense_fail[64] = {0};
+    };
+    static GateCounter cnt[2]; // [0]=VEC, [1]=MMA
+    GateCounter & c = cnt[slot];
+    {
+        const auto now = std::chrono::steady_clock::now();
+        if (c.active && now - c.t0 >= std::chrono::seconds(5) &&
+            (c.n_sparse > 0 || c.max_bound > 0)) {
+            const double secs = std::chrono::duration<double>(now - c.t0).count();
+            GGML_LOG("da_sparse[%s]: window %.1fs - SPARSE %llu, DENSE %llu (bound %d, KV %lld%s%s)\n",
+                     path, secs,
+                     (unsigned long long) c.n_sparse,
+                     (unsigned long long) c.n_dense,
+                     c.last_bound, (long long) c.last_kv,
+                     c.n_dense > 0 ? " - " : "",
+                     c.n_dense > 0 ? c.dense_fail : "");
+            c.n_sparse  = 0;
+            c.n_dense   = 0;
+            c.max_bound = 0;
+            c.t0 = now;
+        }
+        if (n_kv_max > c.max_bound) {
+            c.max_bound = n_kv_max;
+        }
+        c.last_bound = n_kv_max;
+        c.last_kv    = kv_rows;
+        if (use_sparse) {
+            c.n_sparse++;
+        } else {
+            c.n_dense++;
+            snprintf(c.dense_fail, sizeof(c.dense_fail), "%s", fail);
+        }
+        if (!c.active) {
+            c.active = true;
+            c.t0 = now;
+        }
+    }
 
     // FOCUS_SPARSE_DEBUG=1: bypass the dedup so the live decision is visible on
     // every evaluation. The gate runs per flash-attn op (per layer, per step) -
