@@ -5352,6 +5352,11 @@ private:
         // verification of the sparse kernel against the dense reference)
         static const bool dense_override = []() {
             const char * e = getenv("FOCUS_DA_DENSE");
+            if (e && atoi(e) != 0) {
+                // log once: without this, a leftover FOCUS_DA_DENSE=1 in the
+                // service env forces dense for the whole process with no trace
+                SRV_INF("%s", "da: FOCUS_DA_DENSE active - n_kv_max stays 0 (dense forced for A/B verification)\n");
+            }
             return e && atoi(e) != 0;
         }();
         if (dense_override) {
@@ -5365,8 +5370,17 @@ private:
         // runs in production). Reset the bound to 0 so a prior sparse bound (from
         // a co-existing DA slot) does not persist. Scans all slots: an idle slot's
         // holes must not be under-estimated by a sparse bound set for a co-tenant.
+        static bool r3_forced = false;
         for (auto & slot : slots) {
             if (slot.kv_holes_active) {
+                if (!r3_forced) {
+                    // the bound -> 0 log below only fires on a non-zero transition;
+                    // log the forcing itself on entry, so an always-0 bound is not
+                    // a silent dense (the kernel journal then shows only "n_kv_max=0")
+                    r3_forced = true;
+                    SRV_INF("da: R3 forcing dense - slot %d carries kv-offload holes (%zu range(s)) - n_kv_max stays 0, sparse gate cannot engage\n",
+                            (int) slot.kv_seq(), slot.kv_hole_ranges.size());
+                }
                 if (da_n_kv_max_last != 0) {
                     SRV_INF("da: n_kv_max %lld -> 0 (kv-offload-holes: forcing dense, R3)\n", (long long) da_n_kv_max_last);
                     da_n_kv_max_last = 0;
@@ -5374,6 +5388,10 @@ private:
                 }
                 return;
             }
+        }
+        if (r3_forced) {
+            r3_forced = false;
+            SRV_INF("%s", "da: R3 lifted - no slot with kv-offload holes, n_kv_max computation resumes\n");
         }
 
         int64_t n_kv_max = 0;

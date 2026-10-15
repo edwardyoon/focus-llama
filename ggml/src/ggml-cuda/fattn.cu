@@ -1,3 +1,6 @@
+#include <chrono>
+#include <cstdlib>
+
 #include "common.cuh"
 #include "fattn-common.cuh"
 #include "fattn-mma-f16.cuh"
@@ -116,6 +119,9 @@ void ggml_cuda_flash_attn_ext_compact_mask(
 //            the reason (vanilla n_kv_max=0, the KV gate K < min_kv, multi-
 //            token verify batch, ...) re-logged only when the reason itself
 //            changes, so a stable fallback is logged once, not per step
+// FOCUS_SPARSE_DEBUG=1 bypasses the dedup - the live decision is logged on
+// every evaluation, throttled to one line per path per second (the gate runs
+// per layer, per step: thousands of evaluations per second on a 27B).
 // The bound is the 512-bucketed upper bound on the gather list; the finite
 // rows read are <= bound.
 void ggml_cuda_fattn_sparse_gate_log(const char * path, bool use_sparse, ggml_tensor * dst, const char * fail) {
@@ -137,13 +143,27 @@ void ggml_cuda_fattn_sparse_gate_log(const char * path, bool use_sparse, ggml_te
         char    fail[64] = {0};
     };
     static GateLogState st[2]; // [0]=VEC, [1]=MMA
-    GateLogState & s = st[strncmp(path, "MMA", 3) == 0 ? 1 : 0];
+    const int slot = strncmp(path, "MMA", 3) == 0 ? 1 : 0;
+    GateLogState & s = st[slot];
 
-    // SPARSE re-logs as KV grows (the ratio drifts); DENSE re-logs only when the
-    // reason changes, so a stable fallback (e.g. vanilla n_kv_max=0) logs once.
-    if (s.valid && s.active == use_sparse && s.nkvmax == n_kv_max &&
-        (use_sparse ? s.kvrows == kv_rows
-                    : strncmp(s.fail, fail, sizeof(s.fail)) == 0)) {
+    // FOCUS_SPARSE_DEBUG=1: bypass the dedup so the live decision is visible on
+    // every evaluation. The gate runs per flash-attn op (per layer, per step) -
+    // thousands of evaluations per second on a 27B - so debug output is
+    // throttled to one line per path per second; a DENSE/SPARSE flip is still
+    // visible within the interval.
+    static const bool debug = getenv("FOCUS_SPARSE_DEBUG") != nullptr;
+    if (debug) {
+        static std::chrono::steady_clock::time_point last_log[2];
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last_log[slot] < std::chrono::seconds(1)) {
+            return;
+        }
+        last_log[slot] = now;
+    } else if (s.valid && s.active == use_sparse && s.nkvmax == n_kv_max &&
+               (use_sparse ? s.kvrows == kv_rows
+                           : strncmp(s.fail, fail, sizeof(s.fail)) == 0)) {
+        // SPARSE re-logs as KV grows (the ratio drifts); DENSE re-logs only when the
+        // reason changes, so a stable fallback (e.g. vanilla n_kv_max=0) logs once.
         return;
     }
     s.valid  = true;
