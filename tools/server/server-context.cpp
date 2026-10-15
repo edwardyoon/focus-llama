@@ -5363,37 +5363,6 @@ private:
             return;
         }
 
-        // Option B (--kv-offload-holes): mid-sequence holes are not supported by
-        // the sparse (n_kv_max) path in v1 (R3 - unverified at 100K context).
-        // Force the dense path whenever any slot carries kv holes: the generic
-        // KQ -inf mask handles the holes (the same physical state the DA A-path
-        // runs in production). Reset the bound to 0 so a prior sparse bound (from
-        // a co-existing DA slot) does not persist. Scans all slots: an idle slot's
-        // holes must not be under-estimated by a sparse bound set for a co-tenant.
-        static bool r3_forced = false;
-        for (auto & slot : slots) {
-            if (slot.kv_holes_active) {
-                if (!r3_forced) {
-                    // the bound -> 0 log below only fires on a non-zero transition;
-                    // log the forcing itself on entry, so an always-0 bound is not
-                    // a silent dense (the kernel journal then shows only "n_kv_max=0")
-                    r3_forced = true;
-                    SRV_INF("da: R3 forcing dense - slot %d carries kv-offload holes (%zu range(s)) - n_kv_max stays 0, sparse gate cannot engage\n",
-                            (int) slot.kv_seq(), slot.kv_hole_ranges.size());
-                }
-                if (da_n_kv_max_last != 0) {
-                    SRV_INF("da: n_kv_max %lld -> 0 (kv-offload-holes: forcing dense, R3)\n", (long long) da_n_kv_max_last);
-                    da_n_kv_max_last = 0;
-                    llama_set_n_kv_max(ctx_tgt, 0);
-                }
-                return;
-            }
-        }
-        if (r3_forced) {
-            r3_forced = false;
-            SRV_INF("%s", "da: R3 lifted - no slot with kv-offload holes, n_kv_max computation resumes\n");
-        }
-
         int64_t n_kv_max = 0;
 
         bool prefill = false;
@@ -5407,7 +5376,7 @@ private:
         if (!prefill) {
             bool any_holes = false;
             for (auto & slot : slots) {
-                if (slot.is_processing() && (slot.da_seq >= 0 || slot.da_removed_a)) {
+                if (slot.is_processing() && (slot.da_seq >= 0 || slot.da_removed_a || slot.kv_holes_active)) {
                     any_holes = true;
                     break;
                 }
@@ -5422,14 +5391,29 @@ private:
                     if (slot.da_seq >= 0) {
                         // B: the slot decodes on da_seq - the compact
                         // sequence (kept prefix + generated tail), every
-                        // cell finite
+                        // cell finite. kv-offload holes are cut from the main
+                        // sequence, not from da_seq, so they do not appear
+                        // in the da_seq mask.
                         n_read = (int32_t) slot.da_keep_count + (n_full - slot.da_bound);
-                    } else if (slot.da_removed_a) {
-                        // A: holes in the original sequence, finite = the rest
-                        n_read = std::max(0, n_full - (int32_t) slot.n_da_removed);
                     } else {
-                        // plain co-tenant: the whole causal row is finite
-                        n_read = n_full;
+                        // A / plain: the mask is over the main sequence. The
+                        // non-finite cells are the UNION of the DA-removed
+                        // ranges (masked -inf, cells kept) and the kv-offload
+                        // holes (cells physically cut -> is_empty -> -inf by
+                        // the generic mask). Subtract max of the two, not the
+                        // sum: eviction tends to hit exactly the old filler DA
+                        // already masks, and a double count would under-
+                        // estimate the bound - the excess cells would be
+                        // silently dropped. max is a safe overestimate of the
+                        // union (never under).
+                        int32_t n_kv_holes = 0;
+                        if (slot.kv_holes_active) {
+                            for (const auto & r : slot.kv_hole_ranges) {
+                                n_kv_holes += (int32_t) (r.second - r.first);
+                            }
+                        }
+                        const int32_t n_nonfinite = std::max((int32_t) slot.n_da_removed, n_kv_holes);
+                        n_read = std::max(0, n_full - n_nonfinite);
                     }
                     n_kv_max = std::max(n_kv_max, ((int64_t) n_read + 511) / 512 * 512);
                 }
