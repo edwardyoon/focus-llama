@@ -65,6 +65,15 @@
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
+// FOCUS_SPARSE_DEBUG: the sparse-attention debug journal flag (fattn.cu's
+// DENSE decision journal uses the same one). The per-sub-batch kv-probe /
+// kv-offload-holes progress lines are gated on it: on a large prefill they
+// fire once per prompt sub-batch and flood the log.
+static bool focus_sparse_debug() {
+    static const bool enabled = getenv("FOCUS_SPARSE_DEBUG") != nullptr;
+    return enabled;
+}
+
 // Upper bound on the generation tail (in KV cells) that the decoupled-KV
 // reject gate and eviction clamp reserve. Reserving the full request n_predict
 // (often 32768) makes resident + recall + gen exceed the buffer for most real
@@ -5585,7 +5594,8 @@ private:
                     // used value is comparable to the ledger (the STARTED-block
                     // probe runs before this trim and overstates used by the
                     // trimmed tail - 2026-10-10). Hole sessions only.
-                    if (params_base.kv_cache_size > 0 && !slot.kv_hole_ranges.empty()) {
+                    // FOCUS_SPARSE_DEBUG-gated: fires once per prompt sub-batch.
+                    if (focus_sparse_debug() && params_base.kv_cache_size > 0 && !slot.kv_hole_ranges.empty()) {
                         const int32_t n_free = llama_memory_n_free_cells(llama_get_memory(ctx_tgt));
                         int64_t probe_cut = 0;
                         for (const auto & r : slot.kv_hole_ranges) {
