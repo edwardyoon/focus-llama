@@ -108,52 +108,57 @@ void ggml_cuda_flash_attn_ext_compact_mask(
 
 // DA (declarative attention) journal for the n_kv_max sparse gate: proves in
 // the log whether the physical KV read reduction is actually active. The gate
-// is evaluated per flash-attn op (per layer, per step), so a line is emitted
-// only when the decision, the kernel path, or the gather bound changes:
-//   dense -> sparse : 'SPARSE - gather bound X of Y (Z%)' - the reduction is
-//                     active, with the read ratio (bound / KV rows)
-//   while sparse    : one line per 512-token bound step (the ratio drifts)
-//   -> dense        : 'DENSE - ... - <failed condition>' - the fallback, with
-//                     the reason (multi-token speculative verify batch, the
-//                     50% decay K < 2*bound, ...) instead of a silent dense
-// Vanilla decode without a DA bound (n_kv_max == 0) logs nothing. The bound
-// is the 512-bucketed upper bound on the gather list; the finite rows read
-// are <= bound.
+// is evaluated per flash-attn op (per layer, per step); all layers of a step
+// share the decision inputs, so the journal dedups on them and logs:
+//   SPARSE : 'SPARSE - gather bound X of Y (Z%)' - the reduction is active,
+//            re-logged as KV grows (the read ratio drifts under a fixed bound)
+//   DENSE  : 'DENSE - bound X, KV Y - <failed condition>' - the fallback, with
+//            the reason (vanilla n_kv_max=0, the KV gate K < min_kv, multi-
+//            token verify batch, ...) re-logged only when the reason itself
+//            changes, so a stable fallback is logged once, not per step
+// The bound is the 512-bucketed upper bound on the gather list; the finite
+// rows read are <= bound.
 void ggml_cuda_fattn_sparse_gate_log(const char * path, bool use_sparse, ggml_tensor * dst, const char * fail) {
     const ggml_tensor * K = dst->src[1];
     const int32_t n_kv_max = ggml_get_op_params_i32(dst, 4);
+    const int64_t kv_rows  = K->ne[1];
     if (!fail) {
         fail = "gate"; // e.g. dense on a non-NVIDIA device: all conditions pass, the gate still fails
     }
 
-    static bool    last_valid  = false;
-    static bool    last_active = false;
-    static int32_t last_nkvmax = -1;
-    static char    last_path[8]  = {0};
-    static char    last_fail[64] = {0};
+    // Per-path dedup state: VEC and MMA both call this function, so a single
+    // global state would let each path clobber the other's last-log and re-log
+    // every step. Two slots, one per path.
+    struct GateLogState {
+        bool    valid  = false;
+        bool    active = false;
+        int32_t nkvmax = -1;
+        int64_t kvrows = -1;
+        char    fail[64] = {0};
+    };
+    static GateLogState st[2]; // [0]=VEC, [1]=MMA
+    GateLogState & s = st[strncmp(path, "MMA", 3) == 0 ? 1 : 0];
 
-    if (!use_sparse && n_kv_max <= 0) {
-        last_valid = false; // back to vanilla dense - the next DA transition logs again
+    // SPARSE re-logs as KV grows (the ratio drifts); DENSE re-logs only when the
+    // reason changes, so a stable fallback (e.g. vanilla n_kv_max=0) logs once.
+    if (s.valid && s.active == use_sparse && s.nkvmax == n_kv_max &&
+        (use_sparse ? s.kvrows == kv_rows
+                    : strncmp(s.fail, fail, sizeof(s.fail)) == 0)) {
         return;
     }
-    if (last_valid && last_active == use_sparse && strcmp(last_path, path) == 0 &&
-        (use_sparse ? last_nkvmax == n_kv_max
-                    : strncmp(last_fail, fail, sizeof(last_fail)) == 0)) {
-        return;
-    }
-    last_valid  = true;
-    last_active = use_sparse;
-    last_nkvmax = n_kv_max;
-    snprintf(last_path, sizeof(last_path), "%s", path);
-    snprintf(last_fail, sizeof(last_fail), "%s", fail ? fail : "");
+    s.valid  = true;
+    s.active = use_sparse;
+    s.nkvmax = n_kv_max;
+    s.kvrows = kv_rows;
+    snprintf(s.fail, sizeof(s.fail), "%s", fail ? fail : "");
 
     if (use_sparse) {
         GGML_LOG("da_sparse[%s]: SPARSE - gather bound %d of %lld KV rows (%.1f%% of KV)\n",
-                 path, n_kv_max, (long long) K->ne[1],
-                 100.0 * (double) n_kv_max / (double) K->ne[1]);
+                 path, n_kv_max, (long long) kv_rows,
+                 100.0 * (double) n_kv_max / (double) kv_rows);
     } else {
         GGML_LOG("da_sparse[%s]: DENSE - bound %d, KV %lld - %s\n",
-                 path, n_kv_max, (long long) K->ne[1], fail ? fail : "gate");
+                 path, n_kv_max, (long long) kv_rows, fail ? fail : "gate");
     }
 }
 
@@ -221,8 +226,10 @@ const char * ggml_cuda_flash_attn_ext_mma_f16_sparse_fail(ggml_backend_cuda_cont
     const int64_t kv_min = kv_min_rows(n_kv_max, kv_pct);
     if (K->ne[1] < std::max<int64_t>(4096, kv_min)) {
         static thread_local char buf[128];
-        snprintf(buf, sizeof(buf), "K->ne[1]=%lld < max(4096, min_kv(%d,%d%%)=%lld)",
-                 (long long) K->ne[1], n_kv_max, kv_pct, (long long) kv_min);
+        // Omit the live K->ne[1] (it grows per step, which would defeat the
+        // journal's reason-based dedup); it is already in the DENSE log prefix.
+        snprintf(buf, sizeof(buf), "KV < max(4096, min_kv(%d,%d%%)=%lld)",
+                 n_kv_max, kv_pct, (long long) kv_min);
         return buf;
     }
     return nullptr;
@@ -284,8 +291,10 @@ const char * ggml_cuda_flash_attn_ext_vec_sparse_fail(const ggml_tensor * dst) {
     const int64_t kv_min = kv_min_rows(n_kv_max, kv_pct);
     if (K->ne[1] < kv_min) {
         static thread_local char buf[128];
-        snprintf(buf, sizeof(buf), "K->ne[1]=%lld < min_kv(%d,%d%%)=%lld",
-                 (long long) K->ne[1], n_kv_max, kv_pct, (long long) kv_min);
+        // Omit the live K->ne[1] (it grows per step, which would defeat the
+        // journal's reason-based dedup); it is already in the DENSE log prefix.
+        snprintf(buf, sizeof(buf), "KV < min_kv(%d,%d%%)=%lld",
+                 n_kv_max, kv_pct, (long long) kv_min);
         return buf;
     }
     return nullptr;

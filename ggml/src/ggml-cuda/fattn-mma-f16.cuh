@@ -2086,7 +2086,17 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
         } else
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
         {
-            ggml_cuda_fattn_sparse_gate_log("MMA", false, dst, "no sparse kernel variant");
+            // No sparse kernel is compiled for this (ncols1, ncols2) shape (e.g. a
+            // multi-token verify batch). On NVIDIA also report the runtime gate's real
+            // failure reason if it failed, so the journal shows why sparse is off
+            // (the old "no sparse kernel variant" hid the KV < min_kv cause).
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+            const char * mma_fail = ggml_cuda_flash_attn_ext_mma_f16_sparse_fail(ctx, dst);
+            const char * variant_fail = mma_fail ? mma_fail : "no sparse kernel variant for this batch";
+#else
+            const char * variant_fail = "no sparse kernel variant (non-NVIDIA)";
+#endif
+            ggml_cuda_fattn_sparse_gate_log("MMA", false, dst, variant_fail);
             constexpr bool use_sparse_kernel = false;
             fattn_kernel = flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, use_sparse_kernel>;
 
