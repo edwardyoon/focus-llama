@@ -117,17 +117,17 @@ void ggml_cuda_flash_attn_ext_compact_mask(
 // share the decision inputs, so the journal dedups on them and logs:
 //   SPARSE : 'SPARSE - gather bound X of Y (Z%)' - the reduction is active,
 //            re-logged as KV grows (the read ratio drifts under a fixed bound)
-//   DENSE  : 'DENSE - bound X, KV Y - <failed condition>' - the fallback, with
-//            the reason (vanilla n_kv_max=0, the KV gate K < min_kv, multi-
-//            token verify batch, ...) re-logged only when the reason itself
-//            changes, so a stable fallback is logged once, not per step
+//   DENSE  : 'DENSE - bound X, KV Y - <failed condition>' - the fallback with
+//            its reason (vanilla n_kv_max=0, the KV gate K < min_kv, multi-
+//            token verify batch, ...); journaled only with FOCUS_SPARSE_DEBUG=1
 //   WINDOW : 'window 5.0s - SPARSE N, DENSE M (bound B, KV K - <reason>)' -
 //            the per-path duty cycle over a rolling 5s window (one summary
 //            line per window), logged only when sparse was used or a DA bound
 //            was active, so a vanilla (n_kv_max=0) deployment stays quiet
-// FOCUS_SPARSE_DEBUG=1 bypasses the dedup - the live decision is logged on
-// every evaluation, throttled to one line per path per second (the gate runs
-// per layer, per step: thousands of evaluations per second on a 27B).
+// FOCUS_SPARSE_DEBUG=1 is the only mode that journals DENSE decisions; it
+// also bypasses the dedup so the live decision is logged on every evaluation,
+// throttled to one line per path per second (the gate runs per layer, per
+// step: thousands of evaluations per second on a 27B).
 // The bound is the 512-bucketed upper bound on the gather list; the finite
 // rows read are <= bound.
 void ggml_cuda_fattn_sparse_gate_log(const char * path, bool use_sparse, ggml_tensor * dst, const char * fail) {
@@ -223,8 +223,9 @@ void ggml_cuda_fattn_sparse_gate_log(const char * path, bool use_sparse, ggml_te
     } else if (s.valid && s.active == use_sparse && s.nkvmax == n_kv_max &&
                (use_sparse ? s.kvrows == kv_rows
                            : strncmp(s.fail, fail, sizeof(s.fail)) == 0)) {
-        // SPARSE re-logs as KV grows (the ratio drifts); DENSE re-logs only when the
-        // reason changes, so a stable fallback (e.g. vanilla n_kv_max=0) logs once.
+        // SPARSE re-logs as KV grows (the ratio drifts). The DENSE half of the
+        // condition is bookkeeping only: the DENSE line is journaled in debug
+        // mode alone.
         return;
     }
     s.valid  = true;
@@ -237,7 +238,9 @@ void ggml_cuda_fattn_sparse_gate_log(const char * path, bool use_sparse, ggml_te
         GGML_LOG("da_sparse[%s]: SPARSE - gather bound %d of %lld KV rows (%.1f%% of KV)\n",
                  path, n_kv_max, (long long) kv_rows,
                  100.0 * (double) n_kv_max / (double) kv_rows);
-    } else {
+    } else if (debug) {
+        // The 5s window summary above already counts DENSE decisions (n_dense +
+        // last reason), so a non-debug deployment never journals the fallback.
         GGML_LOG("da_sparse[%s]: DENSE - bound %d, KV %lld - %s\n",
                  path, n_kv_max, (long long) kv_rows, fail ? fail : "gate");
     }

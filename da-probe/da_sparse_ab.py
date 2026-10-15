@@ -34,9 +34,9 @@ Modes: capture (default for production) | compare | both (two live servers).
 
 Notes
   - Journal lines are deduplicated by the server: SPARSE re-logs when the KV
-    rows change, DENSE only when the reason changes. 'no line' can therefore
-    mean "same dense state as before". Set FOCUS_SPARSE_DEBUG=1 in the unit's
-    Environment for a live decision every second per path.
+    rows change. DENSE lines are journaled ONLY with FOCUS_SPARSE_DEBUG=1
+    (one per path per second) - set it in the unit's Environment, because the
+    WHO-blocked verdict below reads the DENSE reason lines.
   - The MMA path only runs for multi-token batches (MTP verify). If MMA shows
     no line at all the path probably never ran in this window.
   - The server keeps the last --da-tail-keep (K) tokens before the removal boundary
@@ -296,8 +296,9 @@ def diagnose(info):
     if (not info["nkv"] and not info["r3"] and
             not any(info["sparse"][p] or info["dense"][p] for p in ("VEC", "MMA"))):
         msgs.append("no 'da: n_kv_max' and no da_sparse line: the bound stayed 0 for the whole "
-                    "window (DENSE repeats are deduplicated). Check that update_da_n_kv_max on "
-                    "the GPU box pushes a bound for a da_rm request (slot.da_seq / da_removed_a).")
+                    "window (DENSE lines are journaled only with FOCUS_SPARSE_DEBUG=1). Check "
+                    "that update_da_n_kv_max on the GPU box pushes a bound for a da_rm request "
+                    "(slot.da_seq / da_removed_a).")
     for p in ("VEC", "MMA"):
         if info["sparse"][p]:
             continue
@@ -311,8 +312,9 @@ def diagnose(info):
             else:
                 msgs.append("[%s] KERNEL gate rejected sparse (regression candidate): %s" % (p, r[:90]))
         else:
-            msgs.append("[%s] no da_sparse line: path did not run, or same dense state "
-                        "as before (dedup; use FOCUS_SPARSE_DEBUG=1)" % p)
+            msgs.append("[%s] no da_sparse line: path did not run, or DENSE decisions are "
+                        "not journaled (FOCUS_SPARSE_DEBUG unset - set it in the unit's "
+                        "Environment to see them)" % p)
     return msgs
 
 
