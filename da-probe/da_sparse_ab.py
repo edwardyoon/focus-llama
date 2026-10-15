@@ -81,6 +81,8 @@ TOK_PER_PAIR = 85.3  # measured on Qwen3.8: FILLER_A 41.2 + FILLER_B 44.1 tokens
 
 RE_DASPARSE = re.compile(r"da_sparse\[(VEC|MMA)\]: (SPARSE|DENSE) - (.*)")
 RE_PUSH = re.compile(r"-> (\d+)")
+RE_TAIL = re.compile(r"tail_keep=\[(\d+), (\d+)\) - (\d+) token\(s\) newly kept \(K=(\d+)")
+REQUIRE_VEC = False  # set from --require-vec
 
 
 # ----------------------------------------------------------------------------
@@ -204,7 +206,7 @@ def print_layout(layout, est):
         print("removed filler range     : [%d, %d)  (%d tokens)" % (r[0], r[1], r[1] - r[0]))
     print("removed total            : %d tokens (%.0f%% of prompt)"
           % (layout["removed"], 100.0 * layout["removed"] / n))
-    print("tail floor (K=%d)        : server keeps [%d, %d) -> effective removal %d tokens (%.0f%% of prompt)"
+    print("tail floor (assumed K=%d)  : server keeps [%d, %d) -> effective removal %d tokens (%.0f%% of prompt)"
           % (est["tail_keep"], est["tail_floor_lo"], layout["rm_at"], est["removed_eff"],
              100.0 * est["removed_eff"] / n))
     if est["removed_eff"] < 512:
@@ -254,17 +256,19 @@ def filter_journal(text):
     if text is None:
         return None
     return [l.strip() for l in text.splitlines()
-            if "da_sparse[" in l or "da: n_kv_max" in l or "R3 lifted" in l]
+            if "da_sparse[" in l or "da: n_kv_max" in l or "R3 lifted" in l or "tail_keep=" in l]
 
 
 def analyze_journal(text):
     info = {"sparse": {"VEC": [], "MMA": []}, "dense": {"VEC": [], "MMA": []},
-            "r3": [], "r3_lifted": [], "nkv": []}
+            "r3": [], "r3_lifted": [], "nkv": [], "tail": []}
     for l in (text or "").splitlines():
         m = RE_DASPARSE.search(l)
         if m:
             path, kind, rest = m.groups()
             info["sparse" if kind == "SPARSE" else "dense"][path].append(rest.strip())
+        elif RE_TAIL.search(l):
+            info["tail"].append(tuple(int(x) for x in RE_TAIL.search(l).groups()))
         elif "R3 lifted" in l:
             info["r3_lifted"].append(l.strip())
         elif "forcing dense, R3" in l:
@@ -297,6 +301,8 @@ def diagnose(info):
     for p in ("VEC", "MMA"):
         if info["sparse"][p]:
             continue
+        if p == "VEC" and not REQUIRE_VEC:
+            continue
         if info["dense"][p]:
             r = info["dense"][p][-1]
             if is_guard_reason(r):
@@ -315,6 +321,10 @@ def sparse_journal_checks(jtext, check):
     push = [int(m.group(1)) for l in info["nkv"] if (m := RE_PUSH.search(l))]
     check("server pushed n_kv_max>0", any(v > 0 for v in push),
           "%d 'da: n_kv_max' line(s), values %s" % (len(info["nkv"]), push[-4:]))
+    if info["tail"]:
+        lo, hi, kept, K = info["tail"][-1]
+        print("server tail_keep           : K=%d keeps [%d, %d) (%d token(s) newly kept) - the script "
+              "estimate assumes --tail-keep" % (K, lo, hi, kept))
     for p in ("VEC", "MMA"):
         n = len(info["sparse"][p])
         if n:
@@ -323,9 +333,37 @@ def sparse_journal_checks(jtext, check):
             last = "DENSE " + info["dense"][p][-1]
         else:
             last = "no da_sparse line"
-        check("kernel SPARSE[%s]" % p, n > 0, "%d SPARSE line(s); last: %s" % (n, last[:100]))
+        detail = "%d SPARSE line(s); last: %s" % (n, last[:100])
+        if p == "VEC" and not REQUIRE_VEC and n == 0:
+            print("%-32s: n/a  (%s)" % ("kernel SPARSE[VEC]", detail))
+            print("  NOTE: with MTP the draft context's single-token steps stay dense by design "
+                  "(ctx_dft gets no bound) and the target mostly runs multi-token verify batches "
+                  "(MMA). VEC SPARSE needs target single-token decodes: use --require-vec against "
+                  "a server started without spec decoding.")
+            continue
+        check("kernel SPARSE[%s]" % p, n > 0, detail)
     for m in diagnose(info):
         print("  DIAG: %s" % m)
+
+
+def bound_consistency(layout, jtext, check):
+    """The pushed bound must never be BELOW the finite-cell count: the gather
+    kernel drops the overflow (highest cell index = newest tokens) silently.
+    Uses the K the server actually applied ('tail_keep=... (K=N'), not the CLI
+    guess. Lower bound = finite cells at the FIRST decode step (+1 token)."""
+    info = analyze_journal(jtext)
+    if not info["tail"] or layout is None:
+        return
+    K = info["tail"][-1][3]
+    est = estimate(layout, 1, K, 10 ** 9)  # max_tokens=1 -> finite at the first decode step
+    pushed = [int(m.group(1)) for l in info["nkv"] if (m := RE_PUSH.search(l))]
+    pushed = [v for v in pushed if v > 0]
+    if not pushed:
+        return
+    lo = est["n_kv_max_bucket"]
+    check("bound >= finite (K=%d)" % K, max(pushed) >= lo,
+          "pushed max %d vs expected >= %d (prompt %d - removed %d + 1; under-estimate = silent drop)"
+          % (max(pushed), lo, layout["n_prompt"], est["removed_eff"]))
 
 
 def dense_journal_checks(jtext, check):
@@ -337,7 +375,7 @@ def dense_journal_checks(jtext, check):
 # ----------------------------------------------------------------------------
 # Checks
 # ----------------------------------------------------------------------------
-def run_checks(label, results, max_lp_diff, sparse_j, dense_j):
+def run_checks(label, results, max_lp_diff, sparse_j, dense_j, layout=None):
     """results = (sparse_runs, dense_runs|None). Returns overall ok."""
     checks = []
 
@@ -411,6 +449,7 @@ def run_checks(label, results, max_lp_diff, sparse_j, dense_j):
     print("-" * 72)
     if sparse_j is not None:
         sparse_journal_checks(sparse_j, check)
+        bound_consistency(layout, sparse_j, check)
     else:
         print("sparse journal             : none given (--unit / --sparse-log) - "
               "kernel SPARSE NOT verified")
@@ -462,9 +501,12 @@ def main():
     ap.add_argument("--no-probs", action="store_true",
                     help="do not request logprobs (kernel-engagement bisect only; "
                          "may leave spec decoding enabled)")
+    ap.add_argument("--require-vec", action="store_true",
+                    help="treat missing VEC SPARSE as FAIL (only meaningful without spec decoding)")
     ap.add_argument("--wait-idle", type=int, default=60,
                     help="seconds to wait for idle slots before starting (0 = skip)")
     args = ap.parse_args()
+    globals()["REQUIRE_VEC"] = args.require_vec
     n_probs = 0 if args.no_probs else 5
 
     if args.mode == "compare":
@@ -478,14 +520,18 @@ def main():
             print("FATAL: captures disagree on prompt layout")
             sys.exit(2)
         mt = cap_a.get("max_tokens", args.max_tokens)
-        print_layout(cap_a, estimate(cap_a, mt, args.tail_keep, args.offload_threshold))
+        _tk = analyze_journal("\n".join(cap_a.get("journal") or []))["tail"]
+        k_eff = _tk[-1][3] if _tk else args.tail_keep
+        if _tk:
+            print("(tail-keep K=%d taken from the sparse capture's server journal)" % k_eff)
+        print_layout(cap_a, estimate(cap_a, mt, k_eff, args.offload_threshold))
         sj = read_file(args.sparse_log)
         if sj is None and cap_a.get("journal") is not None:
             sj = "\n".join(cap_a["journal"])
         dj = read_file(args.dense_log)
         if dj is None and cap_b.get("journal") is not None:
             dj = "\n".join(cap_b["journal"])
-        ok = run_checks("compare", (cap_a["runs"], cap_b["runs"]), args.max_lp_diff, sj, dj)
+        ok = run_checks("compare", (cap_a["runs"], cap_b["runs"]), args.max_lp_diff, sj, dj, cap_a)
         sys.exit(0 if ok else 1)
 
     n_filler = args.n_filler or max(1, round(args.target_tokens / TOK_PER_PAIR))
@@ -513,7 +559,7 @@ def main():
             json.dump(cap, f)
         print("captured %d run(s) -> %s" % (len(runs), out))
         sj, dj = (jtext, None) if role == "sparse" else (None, jtext)
-        ok = run_checks("capture", (runs, None), args.max_lp_diff, sj, dj)
+        ok = run_checks("capture", (runs, None), args.max_lp_diff, sj, dj, layout)
         sys.exit(0 if ok else 1)
 
     # mode: both (two live servers, local small models)
@@ -527,8 +573,9 @@ def main():
                   for _ in range(args.repeat)]
     time.sleep(1.5)
     ok = run_checks("both", (sparse_runs, dense_runs), args.max_lp_diff,
-                    fetch_log(args, t0), read_file(args.dense_log))
+                    fetch_log(args, t0), read_file(args.dense_log), layout)
     sys.exit(0 if ok else 1)
+
 
 if __name__ == "__main__":
     main()
