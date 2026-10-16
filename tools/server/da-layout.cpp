@@ -217,7 +217,7 @@ bool da_scan_prompt(
                 sig_diagnosed = true;
                 std::string excerpt = filler_text.substr(0, 120);
                 for (auto & ch : excerpt) if (ch == '\n' || ch == '\r') ch = ' ';
-                SRV_WRN("da_scan: filler missing sig marker %s (hook/server version drift?) - filler head: %.120s\n",
+                SRV_WRN_DBG("da_scan: filler missing sig marker %s (hook/server version drift?) - filler head: %.120s\n",
                         sig.c_str(), excerpt.c_str());
             }
             return false;
@@ -345,7 +345,7 @@ bool da_scan_prompt(
                     sig_diagnosed = true;
                     std::string excerpt = filler_text.substr(0, 120);
                     for (auto & ch : excerpt) if (ch == '\n' || ch == '\r') ch = ' ';
-                    SRV_WRN("da_scan: filler missing sig marker %s (hook/server version drift?) - filler head: %.120s\n",
+                    SRV_WRN_DBG("da_scan: filler missing sig marker %s (hook/server version drift?) - filler head: %.120s\n",
                             sig.c_str(), excerpt.c_str());
                 }
                 continue;
@@ -370,7 +370,7 @@ bool da_scan_prompt(
     // of a shift of at most a token or two at each chunk boundary.
     const std::vector<size_t> offsets = da_token_offsets_lenient(vocab, text, tokens);
     if (offsets.empty()) {
-        SRV_WRN("da_scan: token round-trip drift exceeds 1%% (%zu tokens) - failing open to vanilla\n",
+        SRV_WRN_DBG("da_scan: token round-trip drift exceeds 1%% (%zu tokens) - failing open to vanilla\n",
                 tokens.size());
         return false;
     }
@@ -382,13 +382,13 @@ bool da_scan_prompt(
             continue;  // footer: kept, no removal range
         }
         if (i + 1 >= block.size()) {
-            SRV_WRN("da_scan: marker %zu has no following boundary - failing open to vanilla\n", i);
+            SRV_WRN_DBG("da_scan: marker %zu has no following boundary - failing open to vanilla\n", i);
             return false;
         }
         const int32_t lo = da_char_to_token_nearest(offsets, block[i].start);
         const int32_t hi = da_char_to_token_nearest(offsets, block[i + 1].start);
         if (lo < 0 || hi < 0 || hi <= lo) {
-            SRV_WRN("da_scan: marker %zu boundaries collapse to the same token (lo=%d, hi=%d) - failing open to vanilla\n",
+            SRV_WRN_DBG("da_scan: marker %zu boundaries collapse to the same token (lo=%d, hi=%d) - failing open to vanilla\n",
                     i, lo, hi);
             return false;
         }
@@ -404,7 +404,7 @@ bool da_scan_prompt(
     params.da_chunk_base = base;
     params.da_b          = kv_unified;
 
-    SRV_INF("da_scan: %zu chunk(s) numbered %d..%d%s, %zu prompt token(s) - %s path\n",
+    SRV_INF_DBG("da_scan: %zu chunk(s) numbered %d..%d%s, %zu prompt token(s) - %s path\n",
             params.da_chunks.size(),
             base, base + (int32_t) params.da_chunks.size() - 1,
             da_filler.first >= 0 ? " + filler" : "",
