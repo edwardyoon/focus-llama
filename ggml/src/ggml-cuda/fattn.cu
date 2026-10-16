@@ -138,6 +138,17 @@ void ggml_cuda_fattn_sparse_gate_log(const char * path, bool use_sparse, ggml_te
         fail = "gate"; // e.g. dense on a non-NVIDIA device: all conditions pass, the gate still fails
     }
 
+    // FOCUS_SPARSE_DEBUG=1 is the only mode that journals any da_sparse line
+    // (SPARSE/DENSE decisions + the window summary); unset or "0" keeps the
+    // gate completely silent.
+    static const bool debug = [] {
+        const char * v = getenv("FOCUS_SPARSE_DEBUG");
+        return v != nullptr && v[0] == '1' && v[1] == '\0';
+    }();
+    if (!debug) {
+        return;
+    }
+
     // Per-path dedup state: VEC and MMA both call this function, so a single
     // global state would let each path clobber the other's last-log and re-log
     // every step. Two slots, one per path.
@@ -207,26 +218,18 @@ void ggml_cuda_fattn_sparse_gate_log(const char * path, bool use_sparse, ggml_te
         }
     }
 
-    // FOCUS_SPARSE_DEBUG=1: bypass the dedup so the live decision is visible on
-    // every evaluation. The gate runs per flash-attn op (per layer, per step) -
-    // thousands of evaluations per second on a 27B - so debug output is
-    // throttled to one line per path per second; a DENSE/SPARSE flip is still
-    // visible within the interval.
-    static const bool debug = getenv("FOCUS_SPARSE_DEBUG") != nullptr;
-    if (debug) {
+    // Debug mode (FOCUS_SPARSE_DEBUG=1, checked at the top of the function):
+    // the live decision is visible on every evaluation. The gate runs per
+    // flash-attn op (per layer, per step) - thousands of evaluations per second
+    // on a 27B - so the journal is throttled to one line per path per second;
+    // a DENSE/SPARSE flip is still visible within the interval.
+    {
         static std::chrono::steady_clock::time_point last_log[2];
         const auto now = std::chrono::steady_clock::now();
         if (now - last_log[slot] < std::chrono::seconds(1)) {
             return;
         }
         last_log[slot] = now;
-    } else if (s.valid && s.active == use_sparse && s.nkvmax == n_kv_max &&
-               (use_sparse ? s.kvrows == kv_rows
-                           : strncmp(s.fail, fail, sizeof(s.fail)) == 0)) {
-        // SPARSE re-logs as KV grows (the ratio drifts). The DENSE half of the
-        // condition is bookkeeping only: the DENSE line is journaled in debug
-        // mode alone.
-        return;
     }
     s.valid  = true;
     s.active = use_sparse;
@@ -238,9 +241,10 @@ void ggml_cuda_fattn_sparse_gate_log(const char * path, bool use_sparse, ggml_te
         GGML_LOG("da_sparse[%s]: SPARSE - gather bound %d of %lld KV rows (%.1f%% of KV)\n",
                  path, n_kv_max, (long long) kv_rows,
                  100.0 * (double) n_kv_max / (double) kv_rows);
-    } else if (debug) {
+    } else {
         // The 5s window summary above already counts DENSE decisions (n_dense +
-        // last reason), so a non-debug deployment never journals the fallback.
+        // last reason); this per-evaluation line runs in debug mode only
+        // (FOCUS_SPARSE_DEBUG=1 gates the whole journal above).
         GGML_LOG("da_sparse[%s]: DENSE - bound %d, KV %lld - %s\n",
                  path, n_kv_max, (long long) kv_rows, fail ? fail : "gate");
     }
