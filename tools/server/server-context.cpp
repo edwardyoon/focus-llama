@@ -57,15 +57,6 @@
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
-// FOCUS_SPARSE_DEBUG: the sparse-attention debug journal flag (fattn.cu's
-// DENSE decision journal uses the same one). The per-sub-batch kv-probe /
-// kv-offload-holes progress lines are gated on it: on a large prefill they
-// fire once per prompt sub-batch and flood the log.
-static bool focus_sparse_debug() {
-    static const bool enabled = getenv("FOCUS_SPARSE_DEBUG") != nullptr;
-    return enabled;
-}
-
 // Upper bound on the generation tail (in KV cells) that the decoupled-KV
 // reject gate and eviction clamp reserve. Reserving the full request n_predict
 // (often 32768) makes resident + recall + gen exceed the buffer for most real
@@ -914,7 +905,7 @@ struct server_slot {
             if (da_seq >= 0) {
                 const int32_t n_full = (int32_t) prompt.n_tokens();
                 const int32_t n_read = (int32_t) da_keep_count + (n_full - da_bound);
-                SLT_INF(*this, "da_b: finished on seq %d - final logical read set %d of %d token(s) (%zu kept prefix + %d after boundary %d); seq %d kept intact\n",
+                SLT_INF_DBG(*this, "da_b: finished on seq %d - final logical read set %d of %d token(s) (%zu kept prefix + %d after boundary %d); seq %d kept intact\n",
                         da_seq, n_read, n_full, da_keep_count, n_full - da_bound, da_bound, id);
             }
 
@@ -925,7 +916,7 @@ struct server_slot {
                 const uint64_t n_full_steps = n_full * stats.n_da_restricted_steps;
                 const double reduction = n_full_steps > 0
                         ? 100.0 * (1.0 - (double) stats.n_da_attended_tokens / (double) n_full_steps) : 0.0;
-                SLT_INF(*this, "da: %s path - %lu restricted step(s), logical attended %lu of %lu token-step(s) (-%.1f%%)\n",
+                SLT_INF_DBG(*this, "da: %s path - %lu restricted step(s), logical attended %lu of %lu token-step(s) (-%.1f%%)\n",
                         stats.da_removed_a ? "A" : "B",
                         (unsigned long) stats.n_da_restricted_steps,
                         (unsigned long) stats.n_da_attended_tokens,
@@ -937,7 +928,7 @@ struct server_slot {
             // re-reason phase). The transition sequence itself is in the
             // da_tag: lines above.
             if (stats.da_n_transitions > 0) {
-                SLT_INF(*this, "da_overhead: %lu transition(s), generated tokens by mode: global %lu / focus %lu / local %lu (of %lu total)\n",
+                SLT_INF_DBG(*this, "da_overhead: %lu transition(s), generated tokens by mode: global %lu / focus %lu / local %lu (of %lu total)\n",
                         (unsigned long) stats.da_n_transitions,
                         (unsigned long) stats.da_tokens_global,
                         (unsigned long) stats.da_tokens_focus,
@@ -953,7 +944,7 @@ struct server_slot {
             if (da_measure_only && da_first_tag_gen >= 0) {
                 const double total = (double) stats.n_gen;
                 const double g     = total > 0 ? (double) da_first_tag_gen / total : 0.0;
-                SLT_INF(*this, "da_measure: first <focus>/<local> tag at generated token %d of %lu - g=%.4f (global-step share before restriction)\n",
+                SLT_INF_DBG(*this, "da_measure: first <focus>/<local> tag at generated token %d of %lu - g=%.4f (global-step share before restriction)\n",
                         da_first_tag_gen, (unsigned long) stats.n_gen, g);
             }
 
@@ -996,7 +987,7 @@ struct server_slot {
                     mem.seq_cp(da_seq, id, da_bound, n_full);
                 }
                 mem.seq_rm(da_seq, -1, -1);
-                SLT_INF(*this, "da_b: returned %d generated token(s) to seq %d - prompt cache kept\n",
+                SLT_INF_DBG(*this, "da_b: returned %d generated token(s) to seq %d - prompt cache kept\n",
                         n_full - da_bound, id);
                 da_seq = -1;
             } else if (da_removed_a) {
@@ -1014,7 +1005,7 @@ struct server_slot {
                 // evicted tail -> KEEP the prompt cache. (Placed after the DA
                 // branches on purpose: da_applied must still get its tail
                 // copy-back and da_removed_a must still clear - those win.)
-                SLT_INF(*this, "kv-offload-holes: prompt cache kept (%zu prompt tokens, %zu hole range(s), %d token span)\n",
+                SLT_INF_DBG(*this, "kv-offload-holes: prompt cache kept (%zu prompt tokens, %zu hole range(s), %d token span)\n",
                         prompt.tokens.size(), kv_hole_ranges.size(),
                         std::accumulate(kv_hole_ranges.begin(), kv_hole_ranges.end(), 0,
                                         [](int s, const auto & r) { return s + (int) (r.second - r.first); }));
@@ -1031,7 +1022,7 @@ struct server_slot {
                     for (const auto & r : kv_hole_ranges) {
                         probe_cut += (int64_t) (r.second - r.first);
                     }
-                    SLT_INF(*this, "kv-probe (release): free=%d ledger_cut=%d prompt=%d\n",
+                    SLT_INF_DBG(*this, "kv-probe (release): free=%d ledger_cut=%d prompt=%d\n",
                             n_free, (int) probe_cut, (int) prompt.n_tokens());
                 }
                 */
@@ -2941,7 +2932,7 @@ private:
         // output and the DA end-state (mode / da_seq / keep / removed) are
         // captured together for a request.
         if (!slot.task->params.da_chunks.empty() || slot.da_applied) {
-            SLT_INF(slot, "da: request complete - n_gen=%d, mode=%s, da_seq=%d, da_bound=%d, keep=%zu, removed=%u, n_full=%d\n",
+            SLT_INF_DBG(slot, "da: request complete - n_gen=%d, mode=%s, da_seq=%d, da_bound=%d, keep=%zu, removed=%u, n_full=%d\n",
                     (int) slot.stats.n_gen,
                     slot.da_mode == DA_MODE_GLOBAL ? "GLOBAL"
                         : (slot.da_mode == DA_MODE_FOCUS ? "FOCUS" : "LOCAL"),
@@ -2963,7 +2954,7 @@ private:
                     dbg_count(g, "<parameter=", E) != dbg_count(g, "</parameter>", E);
                 //SLT_INF(slot, "da_trace: final n_gen=%d stop=%d unbalanced=%d tail='%s'\n",
                 //        (int) slot.stats.n_gen, (int) slot.stop, (int) unbalanced, dbg_esc(g.substr(E > 300 ? E - 300 : 0), 320).c_str());
-                if (unbalanced) SLT_WRN(slot, "%s", "da_trace: DERAIL-SUSPECT (tool-call tags unbalanced)\n");
+                if (unbalanced) SLT_WRN_DBG(slot, "%s", "da_trace: DERAIL-SUSPECT (tool-call tags unbalanced)\n");
             }
 
 #if 0  // disabled: re-logged the entire (17K+ char) generation on every DA request,
@@ -2979,7 +2970,7 @@ private:
                 else if (c == '\r') escaped += "\\r";
                 else                escaped += c;
             }
-            SLT_INF(slot, "da: generated_text (%zu chars): %s\n",
+            SLT_INF_DBG(slot, "da: generated_text (%zu chars): %s\n",
                     gtext.size(), escaped.c_str());
 #endif
         }
@@ -3941,7 +3932,7 @@ private:
                     slot.da_skip_draft = false;
                     if (da_draft_gate) {
                         if (da_just_closed) {
-                            SLT_INF(slot, "%s", "da_tag: draft skipped (first step after tag close)\n");
+                            SLT_INF_DBG(slot, "%s", "da_tag: draft skipped (first step after tag close)\n");
                         } else {
                             SLT_DBG(slot, "%s", "da_tag: draft skipped (tag in flight)\n");
                         }
@@ -4114,12 +4105,12 @@ private:
                             const size_t n_total = slot.task->tokens.size();
                             const size_t n_text  = slot.task->tokens.get_text_tokens().size();
                             slot.da_rm_text_only = (n_text == n_total);
-                            SLT_INF(slot, "da_rm: request start - %zu range(s), da_rm_at=%d, da_b=%d, n_tokens=%zu, has_mtmd=%d, n_text=%zu, n_media=%zu\n",
+                            SLT_INF_DBG(slot, "da_rm: request start - %zu range(s), da_rm_at=%d, da_b=%d, n_tokens=%zu, has_mtmd=%d, n_text=%zu, n_media=%zu\n",
                                     slot.task->params.da_rm.size(), slot.task->params.da_rm_at,
                                     (int) slot.task->params.da_b,
                                     n_total, (int) slot.task->tokens.has_mtmd, n_text, n_total - n_text);
                             for (const auto & range : slot.task->params.da_rm) {
-                                SLT_INF(slot, "da_rm:   range [%d, %d)\n", range.first, range.second);
+                                SLT_INF_DBG(slot, "da_rm:   range [%d, %d)\n", range.first, range.second);
                             }
                         }
 
@@ -4127,13 +4118,13 @@ private:
                         // magic_chunks="N"> tag drives the removals; the client
                         // only supplies the chunk layout.
                         if (!slot.task->params.da_chunks.empty()) {
-                            SLT_INF(slot, "da_tag: request start - %zu chunk(s), da_b=%d, filler=%s\n",
+                            SLT_INF_DBG(slot, "da_tag: request start - %zu chunk(s), da_b=%d, filler=%s\n",
                                     slot.task->params.da_chunks.size(), (int) slot.task->params.da_b,
                                     slot.task->params.da_filler.first >= 0
                                         ? string_format("[%d, %d)", slot.task->params.da_filler.first, slot.task->params.da_filler.second).c_str()
                                         : "none");
                             for (size_t n = 0; n < slot.task->params.da_chunks.size(); n++) {
-                                SLT_INF(slot, "da_tag:   chunk %zu [%d, %d)\n", n + 1,
+                                SLT_INF_DBG(slot, "da_tag:   chunk %zu [%d, %d)\n", n + 1,
                                         slot.task->params.da_chunks[n].first, slot.task->params.da_chunks[n].second);
                             }
                         }
@@ -4509,7 +4500,7 @@ private:
                             if (valid.size() != slot.kv_hole_ranges.size()) {
                                 for (const auto & r : slot.kv_hole_ranges) {
                                     if (r.second > n_past) {
-                                        SLT_INF(slot, "kv-offload-holes: expiring stale hole [%d, %d) (hi > n_past=%d) - KV re-prefilled, re-plan will re-apply\n",
+                                        SLT_INF_DBG(slot, "kv-offload-holes: expiring stale hole [%d, %d) (hi > n_past=%d) - KV re-prefilled, re-plan will re-apply\n",
                                                 (int) r.first, (int) r.second, n_past);
                                     }
                                 }
@@ -4538,7 +4529,7 @@ private:
                             int span = 0;
                             for (auto it = slot.kv_hole_ranges.begin(); it != slot.kv_hole_ranges.end(); ) {
                                 if (!slot.mem.seq_rm_checked(slot.kv_seq(), it->first, it->second)) {
-                                    SLT_WRN(slot, "kv-recut: [%d, %d) rejected - dropping from ledger\n", (int) it->first, (int) it->second);
+                                    SLT_WRN_DBG(slot, "kv-recut: [%d, %d) rejected - dropping from ledger\n", (int) it->first, (int) it->second);
                                     it = slot.kv_hole_ranges.erase(it);
                                     continue;
                                 }
@@ -4548,12 +4539,12 @@ private:
                             if (slot.kv_hole_ranges.empty()) {
                                 slot.kv_holes_active = false;
                             }
-                            SLT_INF(slot, "kv-recut: %zu range(s), span=%d, freed=%d\n",
+                            SLT_INF_DBG(slot, "kv-recut: %zu range(s), span=%d, freed=%d\n",
                                     slot.kv_hole_ranges.size(), span, llama_memory_n_free_cells(m) - f0);
                         }
                         if (n_past == 0) {
                             if (slot.kv_holes_active || !slot.kv_hole_ranges.empty()) {
-                                SLT_INF(slot, "kv-offload-holes: n_past=0 (sequence wiped) - clearing hole ledger (%zu applied)\n",
+                                SLT_INF_DBG(slot, "kv-offload-holes: n_past=0 (sequence wiped) - clearing hole ledger (%zu applied)\n",
                                         slot.kv_hole_ranges.size());
                                 slot.kv_hole_ranges.clear();
                                 slot.kv_holes_active = false;
@@ -4581,7 +4572,7 @@ private:
                                 }
                             }
                             if (fresh.size() != slot.task->params.kv_hole_pending.size()) {
-                                SLT_INF(slot, "kv-offload-holes: %zu pending hole(s) already applied - skipping re-apply\n",
+                                SLT_INF_DBG(slot, "kv-offload-holes: %zu pending hole(s) already applied - skipping re-apply\n",
                                         slot.task->params.kv_hole_pending.size() - fresh.size());
                             }
                             if (!fresh.empty()) {
@@ -4599,7 +4590,7 @@ private:
                                     // the hole while the ledger entry was lost or differs) - re-cutting is a no-op,
                                     // so record it to keep the per-request re-plan idempotent.
                                     if (!slot.mem.seq_rm_checked(slot.kv_seq(), r.first, r.second)) {
-                                        SLT_WRN(slot, "kv-offload-holes: seq_rm no-op for [%d, %d) in main seq %d (n_past=%d) - recording as applied\n",
+                                        SLT_WRN_DBG(slot, "kv-offload-holes: seq_rm no-op for [%d, %d) in main seq %d (n_past=%d) - recording as applied\n",
                                                 r.first, r.second, (int) slot.kv_seq(), n_past);
                                         slot.kv_hole_ranges.push_back(r);
                                         n_noop++;
@@ -4613,14 +4604,14 @@ private:
                                     slot.kv_holes_active = true;
                                 }
                                 if (n_applied > 0) {
-                                    SLT_INF(slot, "kv-offload-holes: applied %zu hole(s), %d token span, in main seq %d (n_past=%d)\n",
+                                    SLT_INF_DBG(slot, "kv-offload-holes: applied %zu hole(s), %d token span, in main seq %d (n_past=%d)\n",
                                             n_applied, span, (int) slot.kv_seq(), n_past);
                                 }
                                 if (n_noop > 0) {
-                                    SLT_INF(slot, "kv-offload-holes: %zu hole(s) already cut (no-op), recorded in ledger\n", n_noop);
+                                    SLT_INF_DBG(slot, "kv-offload-holes: %zu hole(s) already cut (no-op), recorded in ledger\n", n_noop);
                                 }
                                 if (n_deferred > 0) {
-                                    SLT_INF(slot, "kv-offload-holes: deferring %zu pending hole(s) (n_past=%d, need hi<=n_past)\n",
+                                    SLT_INF_DBG(slot, "kv-offload-holes: deferring %zu pending hole(s) (n_past=%d, need hi<=n_past)\n",
                                             n_deferred, n_past);
                                 }
                             }
@@ -4643,7 +4634,7 @@ private:
                             for (const auto & r : slot.kv_hole_ranges) {
                                 probe_cut += (int64_t) (r.second - r.first);
                             }
-                            SLT_INF(slot, "kv-probe: used=%d free=%d ledger_cut=%d prompt=%d buffer=%d\n",
+                            SLT_INF_DBG(slot, "kv-probe: used=%d free=%d ledger_cut=%d prompt=%d buffer=%d\n",
                                     n_free >= 0 ? (int) (params_base.kv_cache_size - n_free) : -1, n_free,
                                     (int) probe_cut, (int) slot.prompt.n_tokens(), params_base.kv_cache_size);
                         }
@@ -4665,7 +4656,7 @@ private:
                                 }
                             }
                             if (ledger_span > n_past || n_stale > 0) {
-                                SLT_WRN(slot, "kv-offload-holes: ledger polluted - span=%d, n_past=%d, %zu stale hole(s) with hi>n_past (overlapping/stale entries inflate the resident projection)\n",
+                                SLT_WRN_DBG(slot, "kv-offload-holes: ledger polluted - span=%d, n_past=%d, %zu stale hole(s) with hi>n_past (overlapping/stale entries inflate the resident projection)\n",
                                         ledger_span, n_past, n_stale);
                             }
                             slot.kv_hole_peak_resident = n_past - ledger_span;
@@ -4780,7 +4771,7 @@ private:
                         for (const auto & r : slot.kv_hole_ranges) {
                             probe_cut += (int64_t) (r.second - r.first);
                         }
-                        SLT_INF(slot, "kv-probe (post-trim): used=%d free=%d ledger_cut=%d prompt=%d\n",
+                        SLT_INF_DBG(slot, "kv-probe (post-trim): used=%d free=%d ledger_cut=%d prompt=%d\n",
                                 n_free >= 0 ? (int) (params_base.kv_cache_size - n_free) : -1, n_free,
                                 (int) probe_cut, (int) slot.prompt.n_tokens());
                     }
@@ -4838,7 +4829,7 @@ private:
                             slot.da_rm_gate_diag_done = true;
                             const size_t n_total = slot.task->tokens.size();
                             const size_t n_text  = slot.task->tokens.get_text_tokens().size();
-                            SLT_INF(slot, "da_rm: mid-prefill boundary reached but skipped (media present) - da_rm_at=%d has_mtmd=%d n_tokens=%d n_text=%zu n_media=%zu; applying after prefill instead (the boundary may fall inside an mtmd chunk)\n",
+                            SLT_INF_DBG(slot, "da_rm: mid-prefill boundary reached but skipped (media present) - da_rm_at=%d has_mtmd=%d n_tokens=%d n_text=%zu n_media=%zu; applying after prefill instead (the boundary may fall inside an mtmd chunk)\n",
                                     slot.task->params.da_rm_at, (int) slot.task->tokens.has_mtmd, (int) slot.prompt.n_tokens(),
                                     n_text, n_total - n_text);
                         }
@@ -4933,7 +4924,7 @@ private:
                                 slot.prompt.n_tokens() >= slot.task->params.da_rm_at) {
                             // fires at most once: da_rm_pending is cleared when the
                             // gate applies the removals in the next prefill round
-                            SLT_INF(slot, "da_rm: batch fill stopped at boundary - n_tokens=%d, da_rm_at=%d, %d token(s) left to prefill after removal\n",
+                            SLT_INF_DBG(slot, "da_rm: batch fill stopped at boundary - n_tokens=%d, da_rm_at=%d, %d token(s) left to prefill after removal\n",
                                     (int) slot.prompt.n_tokens(), slot.task->params.da_rm_at,
                                     (int) (slot.task->n_tokens() - slot.prompt.n_tokens()));
                             break;
@@ -5119,7 +5110,7 @@ private:
                         if (!s.is_processing()) continue;
                         int span = 0;
                         for (auto & r : s.kv_hole_ranges) span += (int) (r.second - r.first);
-                        SRV_ERR("da_trace: decode fail slot=%d prompt=%d cached=%d holes_applied=%zu span=%d progress=%zu pending=%zu peak=%d buffer=%d da_seq=%d\n",
+                        SRV_ERR_DBG("da_trace: decode fail slot=%d prompt=%d cached=%d holes_applied=%zu span=%d progress=%zu pending=%zu peak=%d buffer=%d da_seq=%d\n",
                                 s.id, (int) s.prompt.n_tokens(), (int) s.stats.n_prompt_cached, s.kv_hole_ranges.size(), span,
                                 s.kv_hole_progress.size(), s.task ? s.task->params.kv_hole_pending.size() : 0,
                                 s.kv_hole_peak_resident, params_base.kv_cache_size, (int) s.da_seq);
@@ -5304,7 +5295,7 @@ private:
                     // fail-open: keep the progress, retry as the head passes
                     if (!h.fail_logged) {
                         h.fail_logged = true;
-                        SLT_WRN(slot, "kv-offload-holes: progressive cut of [%d, %d) rejected at done=%d (seq %d) - retrying as the head passes; if it never cuts, the n_past path applies it on the next request\n",
+                        SLT_WRN_DBG(slot, "kv-offload-holes: progressive cut of [%d, %d) rejected at done=%d (seq %d) - retrying as the head passes; if it never cuts, the n_past path applies it on the next request\n",
                                 (int) a, (int) b, (int) done, (int) slot.kv_seq());
                     }
                     continue;
@@ -5318,7 +5309,7 @@ private:
                     slot.kv_hole_progress.erase(slot.kv_hole_progress.begin() + i);
                     --i;
                     kv_session_cut_update(slot);
-                    SLT_INF(slot, "kv-offload-holes: progressive cut completed [%d, %d) at done=%d (seq %d)\n",
+                    SLT_INF_DBG(slot, "kv-offload-holes: progressive cut completed [%d, %d) at done=%d (seq %d)\n",
                             (int) h.lo, (int) h.hi, (int) done, (int) slot.kv_seq());
                 }
             }
@@ -5329,7 +5320,7 @@ private:
             }
             // FOCUS_SPARSE_DEBUG-gated: fires once per prompt sub-batch.
             if (focus_sparse_debug()) {
-                SLT_INF(slot, "kv-offload-holes: prefill progress - done=%d resident=%d (cut %d, peak %d, buffer %d)\n",
+                SLT_INF_DBG(slot, "kv-offload-holes: prefill progress - done=%d resident=%d (cut %d, peak %d, buffer %d)\n",
                         (int) done, resident, cut_total, slot.kv_hole_peak_resident, params_base.kv_cache_size);
             }
         });
@@ -5370,7 +5361,7 @@ private:
             if (e && atoi(e) != 0) {
                 // log once: without this, a leftover FOCUS_DA_DENSE=1 in the
                 // service env forces dense for the whole process with no trace
-                SRV_INF("%s", "da: FOCUS_DA_DENSE active - n_kv_max stays 0 (dense forced for A/B verification)\n");
+                SRV_INF_DBG("%s", "da: FOCUS_DA_DENSE active - n_kv_max stays 0 (dense forced for A/B verification)\n");
             }
             return e && atoi(e) != 0;
         }();
@@ -5436,7 +5427,7 @@ private:
         }
 
         if (n_kv_max != da_n_kv_max_last) {
-            SRV_INF("da: n_kv_max %lld -> %lld%s\n", (long long) da_n_kv_max_last, (long long) n_kv_max, prefill ? " (prefill, dense)" : "");
+            SRV_INF_DBG("da: n_kv_max %lld -> %lld%s\n", (long long) da_n_kv_max_last, (long long) n_kv_max, prefill ? " (prefill, dense)" : "");
             da_n_kv_max_last = n_kv_max;
         }
         llama_set_n_kv_max(ctx_tgt, n_kv_max);
@@ -5524,7 +5515,7 @@ private:
         const size_t before = da_ranges_total(rm_ranges);
         da_subtract_range(rm_ranges, lo, hi);
         const size_t newly_kept = before - da_ranges_total(rm_ranges);
-        SLT_INF(slot, "da: tail_keep=[%d, %d) - %zu token(s) newly kept (K=%d, %s)\n",
+        SLT_INF_DBG(slot, "da: tail_keep=[%d, %d) - %zu token(s) newly kept (K=%d, %s)\n",
                 lo, hi, newly_kept, K, when);
         // bucket the remaining removals by the distance of the range end
         // from the tail: how much of what was removed sat close to the work
@@ -5543,7 +5534,7 @@ private:
                 }
                 bkt[b] += (size_t) (r.second - r.first);
             }
-            SLT_INF(slot, "da: removed by distance from tail (%s): <1k=%zu 1-4k=%zu 4-8k=%zu 8-16k=%zu 16-32k=%zu 32k+=%zu\n",
+            SLT_INF_DBG(slot, "da: removed by distance from tail (%s): <1k=%zu 1-4k=%zu 4-8k=%zu 8-16k=%zu 16-32k=%zu 32k+=%zu\n",
                     when, bkt[0], bkt[1], bkt[2], bkt[3], bkt[4], bkt[5]);
         }
     }
@@ -5562,14 +5553,14 @@ private:
         }
 
         if (slot.da_measure_only) {
-            SLT_INF(slot, "da_rm: SKIPPED (measure-only) - %zu range(s) not applied to KV (%s); output stays vanilla\n",
+            SLT_INF_DBG(slot, "da_rm: SKIPPED (measure-only) - %zu range(s) not applied to KV (%s); output stays vanilla\n",
                     ranges.size(), when);
             return;
         }
 
         const int32_t n_prompt = slot.task->n_tokens();
 
-        SLT_INF(slot, "da_rm: applying %zu range(s) (%s) - bound=%d, n_prompt=%d\n",
+        SLT_INF_DBG(slot, "da_rm: applying %zu range(s) (%s) - bound=%d, n_prompt=%d\n",
                 ranges.size(), when, bound, n_prompt);
 
         // Subtract the Σ anchor range from the removal ranges so it is
@@ -5585,7 +5576,7 @@ private:
                 const int32_t s_hi = std::min(sig.second, bound);
                 if (s_hi > s_lo) {
                     da_subtract_range(rm_ranges, s_lo, s_hi);
-                    SLT_INF(slot, "da_rm: sigma tokens [%d, %d) kept (subtracted from removal ranges)\n", s_lo, s_hi);
+                    SLT_INF_DBG(slot, "da_rm: sigma tokens [%d, %d) kept (subtracted from removal ranges)\n", s_lo, s_hi);
                 }
             }
         }
@@ -5599,7 +5590,7 @@ private:
             int32_t hi = range.second;
 
             if (lo >= bound) {
-                SLT_WRN(slot, "da_rm: range [%d, %d) starts at/after the removal boundary %d - skipping\n", lo, hi, bound);
+                SLT_WRN_DBG(slot, "da_rm: range [%d, %d) starts at/after the removal boundary %d - skipping\n", lo, hi, bound);
                 continue;
             }
 
@@ -5611,13 +5602,13 @@ private:
             // would otherwise drop seq_pos_max and make the continuation
             // non-contiguous (llama_decode returns "Invalid input batch").
             if (hi > bound - 1) {
-                SLT_WRN(slot, "da_rm: range [%d, %d) reaches the removal boundary %d - clamping end to %d (position %d must stay for contiguity)\n",
+                SLT_WRN_DBG(slot, "da_rm: range [%d, %d) reaches the removal boundary %d - clamping end to %d (position %d must stay for contiguity)\n",
                         lo, hi, bound, bound - 1, bound - 1);
                 hi = bound - 1;
             }
 
             if (hi <= lo) {
-                SLT_WRN(slot, "da_rm: range [%d, %d) is empty after clamping - skipping\n", lo, hi);
+                SLT_WRN_DBG(slot, "da_rm: range [%d, %d) is empty after clamping - skipping\n", lo, hi);
                 continue;
             }
 
@@ -5637,7 +5628,7 @@ private:
                 slot.da_applied    = true;
                 slot.da_removed_a  = true;
             }
-            SLT_INF(slot, "da_rm: [%d, %d) %s (%s)\n", lo, hi, ok ? "removed" : "rejected", when);
+            SLT_INF_DBG(slot, "da_rm: [%d, %d) %s (%s)\n", lo, hi, ok ? "removed" : "rejected", when);
         }
     }
 
@@ -5691,13 +5682,13 @@ private:
         }
 
         if (slot.da_measure_only) {
-            SLT_INF(slot, "da_b: SKIPPED (measure-only) - %zu range(s) not applied to KV (%s); da_seq stays -1, output stays vanilla\n",
+            SLT_INF_DBG(slot, "da_b: SKIPPED (measure-only) - %zu range(s) not applied to KV (%s); da_seq stays -1, output stays vanilla\n",
                     ranges.size(), when);
             return;
         }
 
         if (bound <= 0) {
-            SLT_WRN(slot, "da_b: removal boundary is empty (bound=%d) - falling back to logical removal (%s)\n", bound, when);
+            SLT_WRN_DBG(slot, "da_b: removal boundary is empty (bound=%d) - falling back to logical removal (%s)\n", bound, when);
             apply_da_rm(slot, ranges, bound, when);
             return;
         }
@@ -5707,7 +5698,7 @@ private:
         // media, and the removals are applied after prefill), the tokens in
         // [bound, n_prompt) would be missing from the new sequence
         if (slot.prompt.n_tokens() > bound) {
-            SLT_WRN(slot, "da_b: prefilled prompt (%d tokens) exceeds the removal boundary %d - falling back to logical removal (%s)\n",
+            SLT_WRN_DBG(slot, "da_b: prefilled prompt (%d tokens) exceeds the removal boundary %d - falling back to logical removal (%s)\n",
                     slot.prompt.n_tokens(), bound, when);
             apply_da_rm(slot, ranges, bound, when);
             return;
@@ -5716,7 +5707,7 @@ private:
         // partial-range seq_cp across KV streams aborts; only the unified pool
         // (one stream for all sequences) supports it via metadata retagging
         if (!llama_kv_unified(ctx_tgt) || (ctx_dft && !llama_kv_unified(ctx_dft))) {
-            SLT_WRN(slot, "da_b: requires --kv-unified (partial-range seq_cp across KV streams is unsupported) - falling back to logical removal (%s)\n", when);
+            SLT_WRN_DBG(slot, "da_b: requires --kv-unified (partial-range seq_cp across KV streams is unsupported) - falling back to logical removal (%s)\n", when);
             apply_da_rm(slot, ranges, bound, when);
             return;
         }
@@ -5747,7 +5738,7 @@ private:
             }
         }
         if (da_seq < 0) {
-            SLT_WRN(slot, "da_b: no sequence id beyond the slot ids (n_seq_max=%d, n_slots=%d) - falling back to logical removal (%s)\n", n_seq_max, n_slots, when);
+            SLT_WRN_DBG(slot, "da_b: no sequence id beyond the slot ids (n_seq_max=%d, n_slots=%d) - falling back to logical removal (%s)\n", n_seq_max, n_slots, when);
             apply_da_rm(slot, ranges, bound, when);
             return;
         }
@@ -5768,11 +5759,11 @@ private:
             int32_t hi = range.second;
 
             if (lo >= bound) {
-                SLT_WRN(slot, "da_b: range [%d, %d) starts at/after the removal boundary %d - ignoring for the copy\n", lo, hi, bound);
+                SLT_WRN_DBG(slot, "da_b: range [%d, %d) starts at/after the removal boundary %d - ignoring for the copy\n", lo, hi, bound);
                 continue;
             }
             if (hi > bound - 1) {
-                SLT_WRN(slot, "da_b: range [%d, %d) reaches the removal boundary %d - clamping end to %d (position %d must stay for contiguity)\n",
+                SLT_WRN_DBG(slot, "da_b: range [%d, %d) reaches the removal boundary %d - clamping end to %d (position %d must stay for contiguity)\n",
                         lo, hi, bound, bound - 1, bound - 1);
                 hi = bound - 1;
             }
@@ -5804,7 +5795,7 @@ private:
                 const int32_t s_hi = std::min(sig.second, bound);
                 if (s_hi > s_lo) {
                     da_subtract_range(rm_merged, s_lo, s_hi);
-                    SLT_INF(slot, "da_b: sigma tokens [%d, %d) kept (subtracted from removal ranges)\n", s_lo, s_hi);
+                    SLT_INF_DBG(slot, "da_b: sigma tokens [%d, %d) kept (subtracted from removal ranges)\n", s_lo, s_hi);
                 }
             }
         }
@@ -5834,7 +5825,7 @@ private:
         const size_t n_remove = (size_t) bound - n_keep;
 
         if (n_remove == 0) {
-            SLT_WRN(slot, "da_b: removal ranges cover nothing in [0, %d) after clamping - nothing to remove, staying on seq %d (%s)\n", bound, slot.id, when);
+            SLT_WRN_DBG(slot, "da_b: removal ranges cover nothing in [0, %d) after clamping - nothing to remove, staying on seq %d (%s)\n", bound, slot.id, when);
             return;
         }
 
@@ -5846,7 +5837,7 @@ private:
         // GLOBAL. Opt-in via --da-b-min-remove (0 = always switch, so the
         // small-prompt da_b_smoke mechanism checks keep passing).
         if (slot.da_b_min_remove > 0 && n_remove < (size_t) slot.da_b_min_remove) {
-            SLT_WRN(slot, "da_b: only %zu token(s) would be removed (< %d) - skipping the switch, staying on seq %d (%s)\n",
+            SLT_WRN_DBG(slot, "da_b: only %zu token(s) would be removed (< %d) - skipping the switch, staying on seq %d (%s)\n",
                     n_remove, slot.da_b_min_remove, slot.id, when);
             return;
         }
@@ -5868,12 +5859,12 @@ private:
         // the non-contiguous append ("Invalid input batch").
         slot.da_applied    = true;
 
-        SLT_INF(slot, "da_b: switched decode to seq %d (%s) - logical read set now %zu of %d prefix token(s) (%zu removed, -%.1f%%)\n",
+        SLT_INF_DBG(slot, "da_b: switched decode to seq %d (%s) - logical read set now %zu of %d prefix token(s) (%zu removed, -%.1f%%)\n",
                 da_seq, when, n_keep, bound, n_remove, 100.0 * (double) n_remove / (double) bound);
         for (const auto & r : keep) {
-            SLT_INF(slot, "da_b:   keep [%d, %d) %zu token(s)\n", r.first, r.second, (size_t) (r.second - r.first));
+            SLT_INF_DBG(slot, "da_b:   keep [%d, %d) %zu token(s)\n", r.first, r.second, (size_t) (r.second - r.first));
         }
-        SLT_INF(slot, "da_b: original seq %d untouched (%d token(s)) - rollback/reference\n", slot.id, bound);
+        SLT_INF_DBG(slot, "da_b: original seq %d untouched (%d token(s)) - rollback/reference\n", slot.id, bound);
     }
 
     // ---------------------------------------------------------------------
@@ -6058,12 +6049,12 @@ private:
                                 break;
                             }
                             if (!found) {
-                                SLT_WRN(slot, "da_tag: magic_chunks number %d is not an active or offloaded chunk - ignored\n", n);
+                                SLT_WRN_DBG(slot, "da_tag: magic_chunks number %d is not an active or offloaded chunk - ignored\n", n);
                             }
                             continue;
                         }
                         if (n < base || n - base >= n_chunks) {
-                            SLT_WRN(slot, "da_tag: magic_chunks number %d out of range (%d..%d) - ignored\n",
+                            SLT_WRN_DBG(slot, "da_tag: magic_chunks number %d out of range (%d..%d) - ignored\n",
                                     n, base, base + n_chunks - 1);
                             continue;
                         }
@@ -6147,7 +6138,7 @@ private:
                         if (did_refill) {
                             SLT_INF(slot, "%s", "kv_offload: focus on offloaded chunk(s) - re-prefilled at tail, model reads in current mode");
                         } else {
-                            SLT_WRN(slot, "%s", "da_tag: no valid magic_chunks number - tag consumed, mode unchanged\n");
+                            SLT_WRN_DBG(slot, "%s", "da_tag: no valid magic_chunks number - tag consumed, mode unchanged\n");
                         }
                         break;
                     }
@@ -6179,7 +6170,7 @@ private:
                             if (filler.first >= 0) {
                                 ranges.push_back(filler);
                             }
-                            SLT_INF(slot, "da_tag: <focus magic_chunks=\"%s\"> closed at generated token %d - B switch, removing %zu range(s), bound=%d\n",
+                            SLT_INF_DBG(slot, "da_tag: <focus magic_chunks=\"%s\"> closed at generated token %d - B switch, removing %zu range(s), bound=%d\n",
                                     keep_str.c_str(), (int) slot.stats.n_gen, ranges.size(), n_full);
                             apply_da_b(slot, ranges, n_full, "at tag close");
                             if (slot.da_seq >= 0) {
@@ -6202,7 +6193,7 @@ private:
                                 }
                             }
                             slot.da_keep_chunks.assign(keep_idx.begin(), keep_idx.end());
-                            SLT_INF(slot, "da_tag: FOCUS switch - now keeping chunk(s) %s\n", keep_str.c_str());
+                            SLT_INF_DBG(slot, "da_tag: FOCUS switch - now keeping chunk(s) %s\n", keep_str.c_str());
                         } else {
                             // LOCAL -> FOCUS: copy the keep(s) into da_seq
                             for (size_t n : keep_idx) {
@@ -6211,7 +6202,7 @@ private:
                             }
                             slot.da_keep_chunks.assign(keep_idx.begin(), keep_idx.end());
                             slot.da_set_mode(DA_MODE_FOCUS);
-                            SLT_INF(slot, "da_tag: LOCAL -> FOCUS - keeping chunk(s) %s\n", keep_str.c_str());
+                            SLT_INF_DBG(slot, "da_tag: LOCAL -> FOCUS - keeping chunk(s) %s\n", keep_str.c_str());
                         }
                     } else {
                         // A path: monotonic. The chunks still present in the
@@ -6229,7 +6220,7 @@ private:
                         bool all_present = true;
                         for (size_t n : keep_idx) {
                             if (std::find(present.begin(), present.end(), n) == present.end()) {
-                                SLT_WRN(slot, "da_tag: A path is monotonic - chunk %d was already removed, cannot switch keep (staying %s)\n",
+                                SLT_WRN_DBG(slot, "da_tag: A path is monotonic - chunk %d was already removed, cannot switch keep (staying %s)\n",
                                         (int) (n + base), in_focus ? "FOCUS" : (in_local ? "LOCAL" : "GLOBAL"));
                                 all_present = false;
                                 break;
@@ -6245,7 +6236,7 @@ private:
                             if (!slot.da_applied && filler.first >= 0) {
                                 ranges.push_back(filler);
                             }
-                            SLT_INF(slot, "da_tag: <focus magic_chunks=\"%s\"> closed at generated token %d - A removal, %zu range(s), bound=%d\n",
+                            SLT_INF_DBG(slot, "da_tag: <focus magic_chunks=\"%s\"> closed at generated token %d - A removal, %zu range(s), bound=%d\n",
                                     keep_str.c_str(), (int) slot.stats.n_gen, ranges.size(), n_full);
                             apply_da_rm(slot, ranges, n_full, "at tag close");
                             slot.da_keep_chunks.assign(keep_idx.begin(), keep_idx.end());
@@ -6264,7 +6255,7 @@ private:
                                 holed += std::max(0, std::min(chunks[n].second, (int32_t) h.second) - std::max(chunks[n].first, (int32_t) h.first));
                             }
                             if (holed > chunks[n].second - chunks[n].first) {
-                                SLT_WRN(slot, "da: L3 holed=%d > len=%d for keep chunk %d [%d,%d) - ledger spans exceed the chunk (stale/overlapping holes)\n",
+                                SLT_WRN_DBG(slot, "da: L3 holed=%d > len=%d for keep chunk %d [%d,%d) - ledger spans exceed the chunk (stale/overlapping holes)\n",
                                         holed, chunks[n].second - chunks[n].first, (int) (n + base), chunks[n].first, chunks[n].second);
                             }
                             da_trace("slot=%d task=%d L3 B keep chunk=%d [%d,%d) len=%d holed=%d did_refill=%d da_seq=[%d,%d] bound=%d n_full=%d\n",
@@ -6284,7 +6275,7 @@ private:
                             if (filler.first >= 0) {
                                 ranges.push_back(filler);
                             }
-                            SLT_INF(slot, "da_tag: <local> closed at generated token %d - B switch, removing %zu range(s), bound=%d\n",
+                            SLT_INF_DBG(slot, "da_tag: <local> closed at generated token %d - B switch, removing %zu range(s), bound=%d\n",
                                     (int) slot.stats.n_gen, ranges.size(), n_full);
                             apply_da_b(slot, ranges, n_full, "at tag close");
                             if (slot.da_seq >= 0) {
@@ -6299,7 +6290,7 @@ private:
                             }
                             slot.da_keep_chunks.clear();
                             slot.da_set_mode(DA_MODE_LOCAL);
-                            SLT_INF(slot, "%s", "da_tag: FOCUS -> LOCAL - keep chunk(s) dropped\n");
+                            SLT_INF_DBG(slot, "%s", "da_tag: FOCUS -> LOCAL - keep chunk(s) dropped\n");
                         }
                         // LOCAL -> LOCAL: no-op
                     } else {
@@ -6321,7 +6312,7 @@ private:
                         if (!slot.da_applied && filler.first >= 0) {
                             ranges.push_back(filler);
                         }
-                        SLT_INF(slot, "da_tag: <local> closed at generated token %d - A removal, %zu range(s), bound=%d\n",
+                        SLT_INF_DBG(slot, "da_tag: <local> closed at generated token %d - A removal, %zu range(s), bound=%d\n",
                                 (int) slot.stats.n_gen, ranges.size(), n_full);
                         apply_da_rm(slot, ranges, n_full, "at tag close");
                         slot.da_keep_chunks.clear();
@@ -6334,7 +6325,7 @@ private:
                 case 4:
                 case 5: { // </focus> / </local> / <global> / </global> : return to GLOBAL
                     if (in_local && tag.type == 2) {
-                        SLT_WRN(slot, "%s", "da_tag: </focus> while in LOCAL - treating as </local>\n");
+                        SLT_WRN_DBG(slot, "%s", "da_tag: </focus> while in LOCAL - treating as </local>\n");
                     }
                     if (slot.da_seq >= 0) {
                         // B: copy the generated tail back to the original
@@ -6344,14 +6335,14 @@ private:
                             slot.mem.seq_cp(slot.da_seq, slot.id, slot.da_bound, n_full);
                         }
                         slot.mem.seq_rm(slot.da_seq, -1, -1);
-                        SLT_INF(slot, "da_tag: returned to GLOBAL - %d generated token(s) copied back to seq %d, da_seq %d freed\n",
+                        SLT_INF_DBG(slot, "da_tag: returned to GLOBAL - %d generated token(s) copied back to seq %d, da_seq %d freed\n",
                                 std::max(0, n_full - slot.da_bound), (int) slot.id, (int) slot.da_seq);
                         slot.da_seq        = -1;
                         slot.da_bound      = -1;
                         slot.da_keep_count = 0;
                         slot.da_keep_chunks.clear();
                     } else if (slot.da_applied) {
-                        SLT_WRN(slot, "da_tag: A path removals are irreversible - attention stays restricted (%zu chunk(s) kept), mode nominal GLOBAL\n",
+                        SLT_WRN_DBG(slot, "da_tag: A path removals are irreversible - attention stays restricted (%zu chunk(s) kept), mode nominal GLOBAL\n",
                                 slot.da_keep_chunks.size());
                     }
                     // !da_applied: nothing was removed - a clean return
@@ -6508,7 +6499,7 @@ private:
                 // (the progressive cut's success criterion:
                 // peak <= buffer - 16384 headroom).
                 if (!slot.task->params.kv_hole_pending.empty()) {
-                    SLT_INF(slot, "kv-offload-holes: prefill done - peak resident %d (buffer %d, prompt %d, applied holes %zu)\n",
+                    SLT_INF_DBG(slot, "kv-offload-holes: prefill done - peak resident %d (buffer %d, prompt %d, applied holes %zu)\n",
                             slot.kv_hole_peak_resident, params_base.kv_cache_size,
                             (int) slot.prompt.n_tokens(), slot.kv_hole_ranges.size());
                 }
@@ -6522,7 +6513,7 @@ private:
                     if (slot.task->params.da_rm_at >= 0) {
                         const size_t n_total = slot.task->tokens.size();
                         const size_t n_text  = slot.task->tokens.get_text_tokens().size();
-                        SLT_INF(slot, "da_rm: mid-prefill boundary never applied (da_rm_at=%d has_mtmd=%d n_tokens=%d n_text=%zu n_media=%zu) - applying after prefill\n",
+                        SLT_INF_DBG(slot, "da_rm: mid-prefill boundary never applied (da_rm_at=%d has_mtmd=%d n_tokens=%d n_text=%zu n_media=%zu) - applying after prefill\n",
                                 slot.task->params.da_rm_at, (int) slot.task->tokens.has_mtmd, (int) slot.prompt.n_tokens(),
                                 n_text, n_total - n_text);
                     }
@@ -6664,7 +6655,7 @@ private:
                             const std::string piece = common_token_to_piece(slot.ctx_tgt, accepted[i], accept_special_token(slot, accepted[i]));
                             if (off + piece.size() >= cut) {
                                 accepted.resize(i + 1);
-                                SLT_INF(slot, "da_tag: batch cut - %zu of %zu accepted token(s) discarded (tag closed mid-batch)\n",
+                                SLT_INF_DBG(slot, "da_tag: batch cut - %zu of %zu accepted token(s) discarded (tag closed mid-batch)\n",
                                         n_acc_full - (i + 1), n_acc_full);
                                 break;
                             }
@@ -7358,7 +7349,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             }
         }
         if (da_disable) {
-            SRV_INF("%s", "da: injection disabled for this request (da_disable) - staying vanilla");
+            SRV_INF_DBG("%s", "da: injection disabled for this request (da_disable) - staying vanilla");
         }
 
         // process prompt
@@ -7473,7 +7464,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     !params.kv_unified) {
                 static std::atomic<bool> da_auto_needs_kvunified_warned{false};
                 if (!da_auto_needs_kvunified_warned.exchange(true)) {
-                    SRV_WRN("%s", "da_auto: requires --kv-unified (reversible B-path) - staying VANILLA to avoid irreversible seq_rm deletion. Add --kv-unified to enable da-auto.\n");
+                    SRV_WRN_DBG("%s", "da_auto: requires --kv-unified (reversible B-path) - staying VANILLA to avoid irreversible seq_rm deletion. Add --kv-unified to enable da-auto.\n");
                 }
             }
             // (2026-10-13) da_media is no longer excluded: a media prompt is
@@ -8064,13 +8055,13 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                             // the whole request (keeping vanilla): drop the
                             // sigma protection ({-1,-1}) and continue with the
                             // rest of the layout.
-                            SRV_WRN("%s", "da_auto: sigma range does not map to token boundaries - continuing without sigma protection\n");
+                            SRV_WRN_DBG("%s", "da_auto: sigma range does not map to token boundaries - continuing without sigma protection\n");
                         } else {
                             sigma = { lo, hi };
                         }
                     }
                     if (!ok) {
-                        SRV_WRN("%s", "da_auto: layout does not map to token boundaries - keeping vanilla\n");
+                        SRV_WRN_DBG("%s", "da_auto: layout does not map to token boundaries - keeping vanilla\n");
                     } else {
                         task.tokens  = server_tokens(toks, false);
                         task.params.da_chunks = std::move(chunks);
@@ -8132,15 +8123,15 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                                 const int32_t lo = da_char_to_token_nearest(offs, mod_pos(seg.range_lo));
                                 const int32_t hi = da_char_to_token_nearest(offs, mod_pos(seg.range_hi));
                                 if (lo < 0 || hi < 0 || hi <= lo) {
-                                    SRV_WRN("kv-offload-holes: failed to map evicted segment %s to a token range - skipping its hole\n", seg.key.c_str());
+                                    SRV_WRN_DBG("kv-offload-holes: failed to map evicted segment %s to a token range - skipping its hole\n", seg.key.c_str());
                                     continue;
                                 }
                                 task.params.kv_hole_pending.push_back({ lo, hi });
-                                SRV_INF("kv-offload-holes: pending hole %s -> tokens [%d, %d) (%d tokens)\n",
+                                SRV_INF_DBG("kv-offload-holes: pending hole %s -> tokens [%d, %d) (%d tokens)\n",
                                         seg.key.c_str(), lo, hi, hi - lo);
                             }
                         }
-                        SRV_INF("da_auto: %zu chunk(s) from %zu source message(s), %zu token(s) - %s path%s%s\n",
+                        SRV_INF_DBG("da_auto: %zu chunk(s) from %zu source message(s), %zu token(s) - %s path%s%s\n",
                                 task.params.da_chunks.size(), layout.n_source_msgs,
                                 task.tokens.get_tokens().size(),
                                 task.params.da_b ? "B" : "A",
