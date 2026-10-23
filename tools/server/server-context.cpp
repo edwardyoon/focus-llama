@@ -7823,8 +7823,9 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                                     // later (idempotent).
                                     if (keys.size() >= 4096) keys.erase(keys.begin());
                                     keys[seg.key] = seg.tokens;
-                                    SRV_INF("kv_offload: PUT ok key=%s tokens=%d (%s)\n",
-                                            seg.key.c_str(), seg.tokens, seg.hint.c_str());
+                                    // FOCUS_SPARSE_DEBUG-gated: fires on every segment PUT.
+                                    SRV_INF_DBG("kv_offload: PUT ok key=%s tokens=%d (%s)\n",
+                                                seg.key.c_str(), seg.tokens, seg.hint.c_str());
                                 }
                             }
                             if (put_ok) {
