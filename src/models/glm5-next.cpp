@@ -330,15 +330,19 @@ llama_model_glm5_next::llm_graph_input_kpool * llama_model_glm5_next::graph::bui
         // both terms are context constants: n_ubatch bounds every ubatch and top_k + kpool - 1 bounds
         // n_sel, so the graph shape follows neither n_tokens nor n_kv, which the reserve cannot predict
         // TODO: remove "gather" logic and everything related. the backends now support sparse attension so this is obsolete
-        inp->gather = (int64_t) cparams.n_ubatch <= max_ub && (int64_t) cparams.n_ctx > hparams.indexer_top_k + kpool - 1;
+        // the fused mask op replaces the gather path, which would read the then-unallocated gather_mask
+        inp->gather = !cparams.fused_top_k_mask && (int64_t) cparams.n_ubatch <= max_ub && (int64_t) cparams.n_ctx > hparams.indexer_top_k + kpool - 1;
 
         // Both paths read the slot mask: gather adds it to the scores, scatter maps its dead slots to dump rows.
-        inp->gather_mask = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_sel, 1, 1, n_tokens);
-        ggml_set_input(inp->gather_mask);
-        // Keep the mask allocated even when no op reads it, because set_input_kpool always fills it.
-        ggml_build_forward_expand(gf, inp->gather_mask);
-        // one view for all layers: each view of a host input is a separate upload
-        inp->gather_mask_2d = ggml_reshape_2d(ctx0, inp->gather_mask, n_sel, n_tokens);
+        // the fused mask op reads liveness from the scores instead
+        if (!cparams.fused_top_k_mask) {
+            inp->gather_mask = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_sel, 1, 1, n_tokens);
+            ggml_set_input(inp->gather_mask);
+            // Keep the mask allocated even when no op reads it, because set_input_kpool always fills it.
+            ggml_build_forward_expand(gf, inp->gather_mask);
+            // one view for all layers: each view of a host input is a separate upload
+            inp->gather_mask_2d = ggml_reshape_2d(ctx0, inp->gather_mask, n_sel, n_tokens);
+        }
     }
 
     inp->n_new = n_new;
@@ -850,6 +854,17 @@ ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
 
         const int64_t n_top_pool = std::min<int64_t>(n_pool, hparams.indexer_top_k / kpool);
         ggml_tensor * top_k = ggml_top_k(ctx0, score, n_top_pool); // [n_top_pool, n_tokens], UNORDERED
+
+        // keep the kq_mask cells of the live picked pools and the tail, -inf elsewhere
+        if (cparams.fused_top_k_mask) {
+            ggml_tensor * tail = hparams.indexer_kpool_select_tail ? inp_kpool->tail_idxs : nullptr;
+            GGML_ASSERT(kpool*n_top_pool + (tail ? tail->ne[0] : 0) == (int64_t) inp_kpool->n_sel);
+
+            ggml_tensor * sel = build_fused_top_k_mask(kq_mask, top_k, score, inp_kpool->pool_idxs, tail, il);
+            cb(sel, "indexer_sel", il);
+
+            return sel;
+        }
 
         // The gather mask marks the first min(nv, n_top_pool) slots as the visible pools, so order the set by descending score.
         ggml_tensor * sel_score = ggml_get_rows(ctx0,
