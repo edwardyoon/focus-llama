@@ -10,7 +10,10 @@
 //   <ISO8601>.<us> tid=<hex> | <message>
 // Path: env FOCUS_DA_TRACE_LOG, default /tmp/da-trace.log. Append + flush
 // per line; the volume is a few lines per request. Tracing failures are
-// silent - they must never break the request path.
+// silent - they must never break the request path. Written only with
+// FOCUS_SPARSE_DEBUG=1 (checked once per process, same flag and semantics as
+// focus_sparse_debug() in server-common.h and fattn.cu's da_sparse journal)
+// so production runs do not accumulate the file.
 //
 // Split out of server-context.cpp (2026-10-18): the functions were static
 // there; they are inline now. The ofstream is a persistent static (one open
@@ -41,6 +44,14 @@ inline const std::string & da_trace_path() {
 
 // fmt must carry a trailing newline.
 inline void da_trace(const char * fmt, ...) {
+    // Same gate as focus_sparse_debug() (server-common.h) and fattn.cu:
+    // only the literal value "1" enables tracing, checked once per process.
+    static const bool enabled = [] {
+        const char * v = getenv("FOCUS_SPARSE_DEBUG");
+        return v != nullptr && v[0] == '1' && v[1] == '\0';
+    }();
+    if (!enabled) return;
+
     char msg[16384];
     va_list ap;
     va_start(ap, fmt);
