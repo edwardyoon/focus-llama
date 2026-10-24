@@ -3,6 +3,7 @@
 #include "common.cuh"
 #include "unary.cuh"
 
+#include <algorithm>
 #include <climits>
 #include <cstdint>
 
@@ -1517,9 +1518,11 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     // For the stream-k kernel it is possible to run it with tiling by setting the number of CUDA blocks equal to the number of tiles.
     // This is worthwhile if the efficiency of tiling is high and skipping the fixup kernel is more important.
     const int ntiles_dst = ntx * nty * ntzw;
-    const dim3 block_nums_stream_k(GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_mmq_tiling_is_efficient(ntiles_dst, nsm) ? ntiles_dst : nsm, 1, 1);
 
     GGML_ASSERT(ntiles_dst * blocks_per_ne00_fd.z < (1 << 30)); // Assert that variable kbc will not overflow.
+
+    const int nwork = ntiles_dst * ((args.ncols_x + config.K_vram - 1) / config.K_vram); // Maximum number of CUDA blocks that can do useful work.
+    const dim3 block_nums_stream_k(GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_mmq_tiling_is_efficient(ntiles_dst, nsm) ? ntiles_dst : std::min(nsm, nwork), 1, 1);
 
     const bool fixup_needed = ntiles_dst % block_nums_stream_k.x != 0;
 
