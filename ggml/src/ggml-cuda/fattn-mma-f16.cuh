@@ -2140,7 +2140,7 @@ void ggml_cuda_flash_attn_ext_mma_f16_case(ggml_backend_cuda_context & ctx, ggml
             // failure reason if it failed, so the journal shows why sparse is off
             // (the old "no sparse kernel variant" hid the KV < min_kv cause).
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-            const char * mma_fail = ggml_cuda_flash_attn_ext_mma_f16_sparse_fail(ctx, dst);
+            const char * mma_fail = ggml_cuda_flash_attn_ext_mma_f16_sparse_fail(cc, dst, ncols1);
             const char * variant_fail = mma_fail ? mma_fail : "no sparse kernel variant for this batch";
 #else
             const char * variant_fail = "no sparse kernel variant (non-NVIDIA)";
