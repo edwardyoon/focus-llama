@@ -236,7 +236,6 @@ static void launch_gated_delta_net(
         }
         default:
             GGML_ABORT("fatal error");
-            break;
     }
 }
 
