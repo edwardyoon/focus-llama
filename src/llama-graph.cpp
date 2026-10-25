@@ -229,6 +229,15 @@ void llm_graph_input_embd_h::set_input(const llama_ubatch * ubatch) {
         return;
     }
 
+    // TODO: extend llama_ubatch to differentiate between token embeddings and hidden states
+    //       for now, we assume that the hidden state is always provided as an embedding
+    //       ref: https://github.com/ggml-org/llama.cpp/pull/23643
+    if (ubatch->embd) {
+        GGML_ASSERT(n_embd_state == h->ne[0]);
+
+        ggml_backend_tensor_set(h, ubatch->embd, 0, n_tokens*n_embd_state*ggml_element_size(h));
+    }
+
     GGML_ASSERT(ubatch->embd_state && "this graph requires a state embedding, see llama_batch_ext_set_embd_state()");
     GGML_ASSERT(n_embd_state == h->ne[0]);
 

@@ -156,6 +156,7 @@ public:
 // similar to llm_graph_input_embd but with an additional hidden state input, fed from ubatch.embd_state
 class llm_graph_input_embd_h : public llm_graph_input_i {
 public:
+    llm_graph_input_embd_h(int64_t n_embd) : n_embd(n_embd), n_embd_state(n_embd) {}
     llm_graph_input_embd_h(int64_t n_embd, int64_t n_embd_state) : n_embd(n_embd), n_embd_state(n_embd_state) {}
     virtual ~llm_graph_input_embd_h() = default;
 
