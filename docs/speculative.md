@@ -296,6 +296,9 @@ Use exactly one of these options:
 --spec-draft-n-min                      N
                                         minimum number of draft tokens to use for speculative decoding (default: 0)
                                         (env: LLAMA_ARG_SPEC_DRAFT_N_MIN)
+--spec-draft-n-min-adaptive                     N
+                                        minimum adaptive MTP draft depth; the depth starts here and never drops below it (default: 3)
+                                        (env: LLAMA_ARG_SPEC_DRAFT_N_MIN_ADAPTIVE)
 --spec-draft-n-ubatch                   N
                                         physical maximum batch size of the draft context, use a smaller value to spare VRAM (default: 0 - same as --n-ubatch)
                                         (env: LLAMA_ARG_SPEC_DRAFT_N_UBATCH)
