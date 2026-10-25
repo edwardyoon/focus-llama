@@ -151,7 +151,8 @@ public:
 // similar to llm_graph_input_embd but with an additional hidden state input
 class llm_graph_input_embd_h : public llm_graph_input_i {
 public:
-    llm_graph_input_embd_h(int64_t n_embd) : n_embd(n_embd) {}
+    llm_graph_input_embd_h(int64_t n_embd) : n_embd(n_embd), n_embd_state(n_embd) {}
+    llm_graph_input_embd_h(int64_t n_embd, int64_t n_embd_state) : n_embd(n_embd), n_embd_state(n_embd_state) {}
     virtual ~llm_graph_input_embd_h() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
@@ -160,9 +161,10 @@ public:
 
     ggml_tensor * tokens = nullptr; // I32 [n_batch]
     ggml_tensor * embd   = nullptr; // F32 [n_embd, n_batch]
-    ggml_tensor * h      = nullptr; // F32 [n_embd, n_batch]
+    ggml_tensor * h      = nullptr; // F32 [n_embd_state, n_batch]
 
-    const int64_t n_embd = 0;
+    const int64_t n_embd       = 0;
+    const int64_t n_embd_state = 0;
 };
 
 class llm_graph_input_pos : public llm_graph_input_i {
@@ -1064,6 +1066,16 @@ struct llm_graph_context {
     virtual ~llm_graph_context() = default;
 
     void cb(ggml_tensor * cur, const char * name, int il) const;
+
+    // true when the last layer must be narrowed to the output rows before the nextn hidden state is captured
+    bool crop_before_nextn(const ggml_tensor * inp_out_ids) const {
+        return inp_out_ids != nullptr && (!cparams.embeddings_nextn || cparams.embeddings_nextn_masked);
+    }
+
+    // true when the nextn hidden state must be narrowed to the output rows after it is captured
+    bool crop_after_nextn(const ggml_tensor * inp_out_ids) const {
+        return inp_out_ids != nullptr && cparams.embeddings_nextn && !cparams.embeddings_nextn_masked;
+    }
 
     //
     // common
