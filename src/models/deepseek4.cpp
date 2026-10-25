@@ -8,14 +8,6 @@
 #include <stdexcept>
 #include <string>
 
-static float dsv4_rope_attn_factor(float freq_scale, float ext_factor) {
-    if (ext_factor == 0.0f) {
-        return 1.0f;
-    }
-
-    return 1.0f / (1.0f + 0.1f*logf(1.0f/freq_scale));
-}
-
 void llama_model_deepseek4::load_arch_hparams(llama_model_loader & ml) {
     if (hparams.n_layer_nextn > 0) {
         const uint32_t n_layer_main = hparams.n_layer_all - hparams.n_layer_nextn;
@@ -368,6 +360,21 @@ llama_model_deepseek4::graph::build_hc_mixes(
         ggml_tensor * hc_scale,
         ggml_tensor * hc_base,
         int il) const {
+    ggml_tensor * post = nullptr;
+    ggml_tensor * comb = nullptr;
+    ggml_tensor * pre  = build_hc_mixes(x, hc_fn, hc_scale, hc_base, &post, &comb, false, il);
+    return { pre, post, comb };
+}
+
+ggml_tensor * llama_model_deepseek4::graph::build_hc_mixes(
+        ggml_tensor * x,
+        ggml_tensor * hc_fn,
+        ggml_tensor * hc_scale,
+        ggml_tensor * hc_base,
+        ggml_tensor ** post,
+        ggml_tensor ** comb,
+        bool f32_src,
+        int il) const {
     const int64_t hc         = hparams.dsv4_hc_mult;
     const int64_t hc_dim     = hc*n_embd;
     const int64_t hc_mix_dim = (2 + hc)*hc;
@@ -379,6 +386,10 @@ llama_model_deepseek4::graph::build_hc_mixes(
     ggml_tensor * flat = ggml_reshape_2d(ctx0, x, hc_dim, nt);
     ggml_tensor * flat_norm = ggml_rms_norm(ctx0, flat, norm_rms_eps);
     ggml_tensor * mixes = ggml_mul_mat(ctx0, hc_fn, flat_norm);
+    if (f32_src && !ggml_is_quantized(hc_fn->type)) {
+        // F32 weights (model.py hc_pre runs in fp32): request F32 inputs, the mixes are near-tie sensitive
+        ggml_prec_set_src(mixes, GGML_PREC_F32, 1);
+    }
     cb(mixes, "hc_mixes", il);
 
     ggml_tensor * scale_pre  = dsv4_view_1d(ctx0, hc_scale, 1, 0);
@@ -393,29 +404,28 @@ llama_model_deepseek4::graph::build_hc_mixes(
     pre = ggml_scale_bias(ctx0, pre, 1.0f, hparams.dsv4_hc_eps);
     cb(pre, "hc_pre", il);
 
-    ggml_tensor * post = dsv4_view_2d(ctx0, mixes, hc, nt, hc);
-    post = dsv4_hc_affine(ctx0, post, scale_post, base_post);
-    post = ggml_sigmoid(ctx0, post);
-    post = ggml_scale(ctx0, post, 2.0f);
-    cb(post, "hc_post", il);
+    *post = dsv4_view_2d(ctx0, mixes, hc, nt, hc);
+    *post = dsv4_hc_affine(ctx0, *post, scale_post, base_post);
+    *post = ggml_sigmoid(ctx0, *post);
+    *post = ggml_scale(ctx0, *post, 2.0f);
+    cb(*post, "hc_post", il);
 
-    ggml_tensor * comb = nullptr;
     if (cparams.fused_dsv4_hc_comb) {
-        comb = ggml_dsv4_hc_comb(ctx0, mixes, hc_scale, hc_base, hparams.dsv4_hc_eps,
+        *comb = ggml_dsv4_hc_comb(ctx0, mixes, hc_scale, hc_base, hparams.dsv4_hc_eps,
                 (int32_t) hparams.dsv4_hc_sinkhorn_iters);
-        res->add_fused_node({LLM_FUSED_OP_DSV4_HC_COMB, comb, il});
+        res->add_fused_node({LLM_FUSED_OP_DSV4_HC_COMB, *comb, il});
     } else {
         ggml_tensor * scale_comb = dsv4_view_1d(ctx0, hc_scale, 1, 2);
         ggml_tensor * base_comb  = dsv4_view_1d(ctx0, hc_base, hc*hc, 2*hc);
 
-        comb = dsv4_view_2d(ctx0, mixes, hc*hc, nt, 2*hc);
-        comb = dsv4_hc_affine(ctx0, comb, scale_comb, base_comb);
-        comb = ggml_reshape_3d(ctx0, comb, hc, hc, nt);
-        comb = build_hc_sinkhorn(comb, il);
+        *comb = dsv4_view_2d(ctx0, mixes, hc*hc, nt, 2*hc);
+        *comb = dsv4_hc_affine(ctx0, *comb, scale_comb, base_comb);
+        *comb = ggml_reshape_3d(ctx0, *comb, hc, hc, nt);
+        *comb = build_hc_sinkhorn(*comb, il);
     }
-    cb(comb, "hc_comb", il);
+    cb(*comb, "hc_comb", il);
 
-    return { pre, post, comb };
+    return pre;
 }
 
 ggml_tensor * llama_model_deepseek4::graph::build_hc_post(
