@@ -1828,6 +1828,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_OFFLOAD_HIGH").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
+        {"--sigma-fetch"},
+        {"--no-sigma-fetch"},
+        "kv_offload: fetch the FocusMemory session state anchor (Σ) at offload time and append it to the DA scaffold (default: disabled - the offload-time snapshot is the last async extraction, which is stale right after an offload and can re-latch the model onto a finished task; enable to restore the anchor injection)",
+        [](common_params & params, bool value) {
+            params.kv_sigma_fetch = value;
+        }
+    ).set_env("LLAMA_ARG_SIGMA_FETCH").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
         {"--sparse-gate-threshold"}, "PCT",
         "DA sparse FA gate: use the sparse (gather) path only while the finite KV rows are at most PCT% of the cache, dense below that (1-100, default: 50)",
         [](common_params & params, int value) {

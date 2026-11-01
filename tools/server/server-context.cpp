@@ -8029,7 +8029,13 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                 std::string sigma_anchor;
                 // (2026-10-13) media skips the DA scaffold (no magic chunks), so
                 // the sigma anchor (appended to the scaffold) is not needed.
-                if (!da_media && (kv_has_offloaded_history || !offloaded_hints.empty() || !evict_bounds.empty()) &&
+                // (2026-11-01) --sigma-fetch gate (default off): the fetch
+                // returns the last async extraction, which is stale right after
+                // an offload - injecting it as "current-task (… defines the
+                // work)" re-latched the model onto a finished task. See
+                // incidents/2026-11-01-stale-sigma-anchor-contamination.md.
+                if (params.kv_sigma_fetch &&
+                        !da_media && (kv_has_offloaded_history || !offloaded_hints.empty() || !evict_bounds.empty()) &&
                         params.kv_offload && !params.focus_memory_host.empty() && !kv_session.empty()) {
                     if (kv_offload_get_sigma(params.focus_memory_host, params.focus_memory_token, kv_session, sigma_anchor)) {
                         SRV_INF("kv_offload: sigma anchor for DA scaffold (%zu chars, session=%s)\n",

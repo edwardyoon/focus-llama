@@ -683,6 +683,15 @@ struct common_params {
     // the watermark is ignored there). Must satisfy high >= threshold and
     // high + n_batch + gen_tail <= kv_cache_size - 16384 (validated at startup).
     int32_t     kv_offload_high      = 0;
+    // Mid-turn Σ anchor fetch gate (2026-11-01, see incidents/2026-11-01-stale-
+    // sigma-anchor-contamination.md): when disabled (the default) the engine
+    // skips the offload-time fetch of the session state anchor
+    // (kv_offload_get_sigma) entirely. The fetch returns the last async
+    // extraction, which is stale right after an offload - injected as
+    // "current-task (… defines the work)" it re-latched the model onto an
+    // already-finished task. Enable with --sigma-fetch to restore the anchor
+    // injection.
+    bool        kv_sigma_fetch       = false;
     // sparse FA gate (DA n_kv_max): the CUDA/Metal sparse (gather) path is used
     // only while the finite KV rows are at most this % of the cache; dense
     // below. Bridged to FOCUS_SPARSE_GATE_THRESHOLD in the server main (1-100).
