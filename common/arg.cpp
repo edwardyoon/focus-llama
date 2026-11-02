@@ -1757,6 +1757,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_OFFLOAD_HOLES").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
+        {"--kv-pin"},
+        {"--no-kv-pin"},
+        "kv_offload B4: pin the session's first user message (the original task spec) in the KV - eviction starts after it until the FocusMemory store releases the pin or the 4h+30min TTL backstop fires; off = the first user message is a normal evictable candidate (default: disabled)",
+        [](common_params & params, bool value) {
+            params.kv_pin = value;
+        }
+    ).set_env("LLAMA_ARG_KV_PIN").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
         {"--kv-offload-high"}, "N",
         "kv_offload holes-mode high watermark: with --kv-offload-holes, evict only when the session KV-resident (full prompt minus cumulative evicted) reaches N, then drain to --kv-offload-threshold in one shot; while threshold < resident < N the gate is idle (no per-turn evict/PUT/hole work). 0 = legacy per-turn behavior (default: 0)",
         [](common_params & params, int value) {

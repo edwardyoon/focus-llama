@@ -7544,26 +7544,63 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     const llama_tokens kv_orig_tokens = task.tokens.has_mtmd
                             ? task.tokens.get_text_tokens()
                             : task.tokens.get_tokens();
-                    // B4 pin release: the FocusMemory state worker sets the
-                    // session's pin_released flag when the user cancelled or
-                    // superseded the original first task. Sticky: a cached
-                    // true is never re-queried; a false is re-queried on the
-                    // next eviction plan (a local GET, sub-millisecond). Any
-                    // query failure keeps the pin (fail-open = current
-                    // behavior).
-                    bool release_pin = false;
-                    {
-                        std::lock_guard<std::mutex> lk(kv_offload.put_mutex);
-                        release_pin = kv_offload.pin_released.count(kv_session) > 0;
-                    }
-                    if (!release_pin &&
-                            kv_offload_session_get(params.focus_memory_host, params.focus_memory_token,
-                                                   kv_session, release_pin)) {
-                        if (release_pin) {
+                    // B4 task-anchor pin (2026-11-03: opt-in via --kv-pin,
+                    // default off). While disabled the first user message is a
+                    // normal evictable candidate from the start - no pin
+                    // polling, no TTL clocks. While enabled: the FocusMemory
+                    // state worker sets the session's pin_released flag when
+                    // the user cancelled or superseded the original first
+                    // task. Sticky: a cached true is never re-queried; a false
+                    // is re-queried on the next eviction plan (a local GET,
+                    // sub-millisecond). Any query failure keeps the pin
+                    // (fail-open).
+                    bool release_pin = !params.kv_pin;
+                    if (params.kv_pin) {
+                        {
                             std::lock_guard<std::mutex> lk(kv_offload.put_mutex);
-                            kv_offload.pin_released.insert(kv_session);
-                            SRV_INF("kv_offload: pin released (session=%s) - first user message becomes evictable\n",
-                                    kv_session.c_str());
+                            release_pin = kv_offload.pin_released.count(kv_session) > 0;
+                        }
+                        if (!release_pin &&
+                                kv_offload_session_get(params.focus_memory_host, params.focus_memory_token,
+                                                       kv_session, release_pin)) {
+                            if (release_pin) {
+                                std::lock_guard<std::mutex> lk(kv_offload.put_mutex);
+                                kv_offload.pin_released.insert(kv_session);
+                                SRV_INF("kv_offload: pin released (session=%s) - first user message becomes evictable\n",
+                                        kv_session.c_str());
+                            }
+                        }
+                        // TTL backstop (2026-11-03): the release decision above
+                        // is made by the FocusMemory state worker, which is
+                        // hook-driven — on hook-less hosts it never fires and
+                        // the pin is held forever. The engine sees every
+                        // request, so it owns the only reliable idle clock: if
+                        // the pin has been held >= PIN_TTL_HOLD and this
+                        // session has not passed the gate for >= PIN_TTL_IDLE,
+                        // release it locally. (The store doc's updated_at would
+                        // fire spuriously on hook-death.)
+                        if (!release_pin) {
+                            const auto now = std::chrono::steady_clock::now();
+                            bool ttl_release = false;
+                            {
+                                std::lock_guard<std::mutex> lk(kv_offload.put_mutex);
+                                auto it = kv_offload.pin_first_seen.find(kv_session);
+                                if (it == kv_offload.pin_first_seen.end()) {
+                                    kv_offload.pin_first_seen[kv_session] = now;
+                                } else if (now - it->second >= PIN_TTL_HOLD) {
+                                    auto ait = kv_offload.last_activity.find(kv_session);
+                                    if (ait == kv_offload.last_activity.end() || now - ait->second >= PIN_TTL_IDLE) {
+                                        kv_offload.pin_released.insert(kv_session);
+                                        ttl_release = true;
+                                    }
+                                }
+                                kv_offload.last_activity[kv_session] = now;
+                            }
+                            if (ttl_release) {
+                                release_pin = true;
+                                SRV_INF("kv_offload: pin TTL backstop release (session=%s) - held >= 4h with >= 30min idle - first user message becomes evictable\n",
+                                        kv_session.c_str());
+                            }
                         }
                     }
                     // task 15: clamp the evict stop target (threshold + retain) to the

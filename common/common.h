@@ -672,6 +672,13 @@ struct common_params {
     // (1-token re-prefill instead of the ~64s full-tail re-prefill). Off =
     // Option C (prompt text reduction, the default).
     bool        kv_offload_holes     = false;
+    // B4 task-anchor pin (2026-11-03: opt-in, default off). While enabled the
+    // session's first user message (the original task spec) is kept KV-resident
+    // - eviction starts after it - until the FocusMemory store releases it
+    // (pin_released) or the engine TTL backstop (4h hold + 30min idle) fires.
+    // Disabled = the first user message is a normal evictable candidate from
+    // the start (no pin polling, no TTL clocks).
+    bool        kv_pin               = false;
     // High/low watermark (hysteresis) for the holes-mode eviction gate. When > 0,
     // eviction is triggered only when the session's KV-resident count (the full
     // logical prompt minus the cumulative evicted) reaches this high watermark,
