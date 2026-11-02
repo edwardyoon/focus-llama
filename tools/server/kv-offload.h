@@ -13,6 +13,7 @@
 
 #include "json.h"
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -50,7 +51,19 @@ struct kv_offload_state {
     // sessions whose first-user-message pin has been released by the
     // FocusMemory state worker (the user revoked the original task).
     std::set<std::string> pin_released; // session ids
+    // TTL backstop clocks (2026-11-03): the worker's release path is
+    // hook-driven and dies on hook-less hosts, so the engine releases the pin
+    // itself after PIN_TTL_HOLD of holding with PIN_TTL_IDLE of inactivity
+    // (see the gate block in server-context.cpp).
+    std::map<std::string, std::chrono::steady_clock::time_point> pin_first_seen; // session -> first gate pass
+    std::map<std::string, std::chrono::steady_clock::time_point> last_activity;  // session -> last gate pass
 };
+
+// Pin TTL backstop: release the first-user-message pin once it has been held
+// for at least PIN_TTL_HOLD and the session has been idle (no gate-passing
+// request) for at least PIN_TTL_IDLE.
+inline constexpr std::chrono::seconds PIN_TTL_HOLD{4 * 3600};
+inline constexpr std::chrono::seconds PIN_TTL_IDLE{30 * 60};
 
 // --- pure utils ---
 // FNV-1a 64-bit of the segment text -> 16 hex chars (stable content key).
