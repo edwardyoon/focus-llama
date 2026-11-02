@@ -1037,6 +1037,7 @@ llama_model_dflash::graph_dsv4::graph_dsv4(const llama_model & model, const llm_
 // DeepSeek-V4.1 DSpark decoder (mtp.0..2), dual-mode by batch type like graph_dsv4:
 //   * embd batch  -> writes every stage's kv_norm(wkv(main_proj(target features))) into its window ring
 //   * token batch -> [anchor, noise...] block through the stages, single-pass mHC, no per-head q norm
+
 llama_model_dflash::graph_dsv41::graph_dsv41(const llama_model & model, const llm_graph_params & params) :
     llama_model_deepseek41::graph(params) {
     const int64_t n_embd_inp       = hparams.n_embd_inp_enc();
@@ -1130,15 +1131,15 @@ llama_model_dflash::graph_dsv41::graph_dsv41(const llama_model & model, const ll
 
     // window of a block = window of its first query, see n_swa
     {
-        ggml_tensor * m = inp_attn->self_kq_mask_swa_cnv;
+        ggml_tensor * m = inp_attn->self_attn_mask_swa.cnv;
         const int64_t n_blocks = ubatch.n_seqs_unq;
         const int64_t bd       = n_blocks > 0 ? n_tokens / n_blocks : 0;
         if (m && bd > 1 && n_tokens % n_blocks == 0 && m->ne[2] == 1 && m->ne[1] % bd == 0 && ggml_is_contiguous(m)) {
             ggml_tensor * m4 = ggml_reshape_4d(ctx0, m, m->ne[0], bd, m->ne[1]/bd, m->ne[3]);
             ggml_tensor * r0 = ggml_view_4d(ctx0, m4, m4->ne[0], 1, m4->ne[2], m4->ne[3], m4->nb[1], m4->nb[2], m4->nb[3], 0);
             m4 = ggml_repeat(ctx0, r0, m4);
-            inp_attn->self_kq_mask_swa_cnv = ggml_reshape_4d(ctx0, m4, m->ne[0], m->ne[1], 1, m->ne[3]);
-            cb(inp_attn->self_kq_mask_swa_cnv, "dspark_block_mask", -1);
+            inp_attn->self_attn_mask_swa.cnv = ggml_reshape_4d(ctx0, m4, m->ne[0], m->ne[1], 1, m->ne[3]);
+            cb(inp_attn->self_attn_mask_swa.cnv, "dspark_block_mask", -1);
         }
     }
 

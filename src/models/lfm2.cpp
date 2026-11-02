@@ -196,6 +196,7 @@ llama_model_lfm2::graph<iswa>::graph(const llama_model & model, const llm_graph_
     }
 }
 
+
 // Explicit template instantiations
 template struct llama_model_lfm2::graph<true>;
 template struct llama_model_lfm2::graph<false>;

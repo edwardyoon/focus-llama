@@ -301,6 +301,9 @@ const char * ggml_cuda_flash_attn_ext_mma_f16_sparse_fail(const int cc, const gg
     if (!GGML_CUDA_CC_IS_NVIDIA(cc) || !turing_mma_available(cc)) {
         return "no NVIDIA tensor cores";
     }
+    if (dst->src[5] != nullptr) {
+        return "kv_rows";
+    }
     if (mask == nullptr) {
         return "no mask";
     }
@@ -459,12 +462,15 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
     const ggml_tensor * V    = dst->src[2];
     const ggml_tensor * mask = dst->src[3];
 
+    // with kv_rows the kernel iterates over the mask columns
+    const int64_t n_kv = dst->src[5] ? dst->src[5]->ne[0] : K->ne[1];
+
     float max_bias = 0.0f;
     memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
 
     // Edge cases like no mask, ALiBi, unpadded K/V, or misaligned addresses for large data transfers
     //     are put into the template specialization without GQA optimizations.
-    bool use_gqa_opt = mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
+    bool use_gqa_opt = mask && max_bias == 0.0f && n_kv % FATTN_KQ_STRIDE == 0;
     for (const ggml_tensor * t : {Q, K, V, mask}) {
         if (t == nullptr || ggml_is_quantized(t->type)) {
             continue;
@@ -926,6 +932,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     const ggml_tensor * K     = dst->src[1];
     const ggml_tensor * V     = dst->src[2];
     const ggml_tensor * mask  = dst->src[3];
+    const ggml_tensor * kv_rows = dst->src[5];
+
+    // with kv_rows the kernel iterates over the mask columns
+    const int64_t n_kv = kv_rows ? kv_rows->ne[0] : K->ne[1];
 
     const int gqa_ratio = Q->ne[2] / K->ne[2];
     GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
@@ -935,7 +945,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     // The effective batch size for the kernel can be increased by gqa_ratio.
     // The kernel versions without this optimization are also used for ALiBi, if there is no mask, or if the KV cache is not padded,
-    bool gqa_opt_applies = gqa_ratio >= 2 && mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
+    bool gqa_opt_applies = gqa_ratio >= 2 && mask && max_bias == 0.0f && n_kv % FATTN_KQ_STRIDE == 0;
     for (const ggml_tensor * t : {Q, K, V, mask}) {
         if (t == nullptr || ggml_is_quantized(t->type)) {
             continue;
@@ -1005,6 +1015,12 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     if (mask && mask->ne[2] != 1) {
         return BEST_FATTN_KERNEL_NONE;
+    }
+
+    // only the MMA kernel reads K/V through kv_rows
+    if (kv_rows) {
+        return GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) && mask && Q->ne[0] != 40 && Q->ne[0] != 72 ?
+            BEST_FATTN_KERNEL_MMA_F16 : BEST_FATTN_KERNEL_NONE;
     }
 
     // For small batch sizes the vector kernel may be preferable over the kernels optimized for large batch sizes:

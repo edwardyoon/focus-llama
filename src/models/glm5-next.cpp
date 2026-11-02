@@ -1138,7 +1138,7 @@ llama_model_glm5_next::graph::build_dsa_layer(
         ggml_tensor * k = mctx_mla->get_k(ctx0, il);
         ggml_tensor * v = ggml_view_4d(ctx0, k, kv_lora_rank, k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
 
-        out = build_attn_mha(q_absorbed, k, v, nullptr, sel, nullptr, layer.wv_b, inp_kpool->n_sel, kq_scale, il);
+        out = build_attn_mha(q_absorbed, k, v, nullptr, sel, nullptr, nullptr, layer.wv_b, inp_kpool->n_sel, kq_scale, il);
     }
     cb(out, "kqv_out", il);
 
