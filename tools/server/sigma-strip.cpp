@@ -8,10 +8,18 @@
 // deterministic stubs. Shadow mode computes and logs only — the request body
 // is left untouched.
 //
+// K never crosses the last assistant tool_calls message: that round and the
+// tool results after it are the model's current working context — stubbing
+// them leaves the model nothing to act on (empty responses). If the cap
+// blocks the target, the target_unreachable path still advances what it can;
+// a session that stays above threshold is handed to the native compact
+// safety net.
+//
 // Guarantees:
 // - byte-identical rewrite for a fixed prefix + fixed K (deterministic stubs,
 //   no randomness / timestamps)
 // - message count and tool_call_id pairing are preserved
+// - the last assistant tool_calls round (current turn) is never stubbed
 // - prefix fingerprint (hash of messages[0..K)) mismatches reset K
 // - fail-open: any error leaves the request untouched
 #include "sigma-strip.h"
@@ -339,9 +347,22 @@ sigma_strip_result sigma_strip_maybe_rewrite(
         res.usage_before = resident / window;
         const double target_tokens = params.sigma_strip_target * window;
         if (res.usage_before >= params.sigma_strip_threshold) {
+            // K cap: the last assistant tool_calls round (and the tool results
+            // after it) is the current turn — never stub it. Earlier rounds in
+            // the same turn may still be stripped.
+            size_t K_cap = n;
+            for (size_t i = n; i-- > 0;) {
+                const common_json & m = messages.at(i);
+                if (m.is_object() && json_string_or(m, "role") == "assistant"
+                        && m.contains("tool_calls") && m.at("tool_calls").is_array()
+                        && !m.at("tool_calls").empty()) {
+                    K_cap = i;
+                    break;
+                }
+            }
             double stripped = resident;
             size_t K2 = st.K;
-            while (K2 < n && stripped > target_tokens) {
+            while (K2 < K_cap && stripped > target_tokens) {
                 stripped -= (double) savings[K2];
                 K2++;
             }

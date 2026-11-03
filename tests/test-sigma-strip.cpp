@@ -313,6 +313,64 @@ int main() {
         CHECK(user.at("content").at(0).at("type").get<std::string>() == "text");
     }
 
+    // --- K cap: the last assistant tool_calls round is never stubbed --------
+    // Two-turn layout: [0]=system [1]=user1 [2]=asst(tc call_0) [3]=tool
+    // [4]=asst(text) [5]=user2 [6]=asst(tc call_1) [7]=tool. K must stop at 6
+    // even though the target is unreachable from there (target_unreachable),
+    // and the current turn's tool result must survive verbatim.
+    {
+        common_json msgs = common_json::array();
+        auto add = [&msgs](const std::string & role, const std::string & content,
+                           const std::string & tcid = "", const std::string & tcargs = "") {
+            common_json m = common_json::object();
+            m["role"] = role;
+            m["content"] = content;
+            if (!tcid.empty()) {
+                common_json fn = common_json::object();
+                fn["name"] = std::string("read_file");
+                fn["arguments"] = tcargs;
+                common_json call = common_json::object();
+                call["id"] = tcid;
+                call["type"] = std::string("function");
+                call["function"] = fn;
+                common_json tcs = common_json::array();
+                tcs.push_back(call);
+                m["tool_calls"] = tcs;
+            }
+            if (!tcid.empty() && role == "tool") {
+                m["tool_call_id"] = tcid;
+                m["name"] = std::string("read_file");
+            }
+            msgs.push_back(m);
+        };
+        const std::string big(8000, 'x');
+        add("system", "You are a coding agent.");
+        add("user", "First request.");
+        add("assistant", "", "call_0", "{\"path\":\"/tmp/a.txt\"}");
+        add("tool", big, "call_0", "");
+        add("assistant", "First answer.");
+        add("user", "Second request.");
+        add("assistant", "", "call_1", "{\"path\":\"/tmp/b.txt\"}");
+        add("tool", big, "call_1", "");
+
+        common_json body = make_body(msgs);
+        const sigma_strip_result res =
+            sigma_strip_maybe_rewrite(nullptr, make_params("on", 3000), make_req("t-cap"), body, true);
+        CHECK(res.eligible);
+        CHECK(res.k_advanced);
+        CHECK(res.K == 6);                 // capped at the last assistant tool_calls
+        CHECK(res.n_stripped == 1);        // only the first round's tool result
+        CHECK(res.target_unreachable);     // protected round keeps the prompt above target
+        const common_json & out = body.at("messages");
+        CHECK(out.size() == 8);
+        const std::string stubbed = out.at(3).at("content").get<std::string>();
+        CHECK(stubbed.rfind("[", 0) == 0);
+        CHECK(stubbed.find("result stripped") != std::string::npos);
+        // the current turn's tool result survives verbatim
+        CHECK(out.at(7).at("content").get<std::string>() == big);
+        CHECK(out.at(7).at("tool_call_id").get<std::string>() == "call_1");
+    }
+
     if (n_failed) {
         std::printf("test-sigma-strip: %d check(s) FAILED\n", n_failed);
         return 1;
