@@ -1090,7 +1090,7 @@ llama_model_glm5_next::graph::build_dsa_layer(
     q_absorbed = ggml_permute(ctx0, q_absorbed, 0, 2, 1, 3);
     cb(q_absorbed, "q_absorbed", il);
 
-    ggml_tensor * kq_mask = inp_attn->self_attn_mask.cnv;
+    ggml_tensor * kq_mask = inp_attn->self_attn_mask.raw;
 
     ggml_tensor * sel = prev_sel;
     if (il >= (int) hparams.n_layer() || hparams.is_indexer_full(il)) { // the NextN block always has a full indexer

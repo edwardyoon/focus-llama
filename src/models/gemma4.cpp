@@ -214,9 +214,6 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
             inp_attn_prune.self_attn_mask.raw      = ggml_get_rows(ctx0, inp_attn_full.self_attn_mask.raw,      inp_out_ids);
             inp_attn_prune.self_attn_mask_swa.raw  = ggml_get_rows(ctx0, inp_attn_full.self_attn_mask_swa.raw,  inp_out_ids);
 
-            inp_attn_prune.self_attn_mask.cnv      = inp_attn_prune.self_attn_mask.raw;
-            inp_attn_prune.self_attn_mask_swa.cnv  = inp_attn_prune.self_attn_mask_swa.raw;
-
             n_rows = n_outputs;
 
             inp_attn = &inp_attn_prune;
