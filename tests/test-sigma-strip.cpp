@@ -421,6 +421,47 @@ int main() {
         CHECK(out.at(9).at("content").get<std::string>() == big);
     }
 
+    // --- token floor off: a plain target stop is not floor_limited ---------
+    // min_keep = 0 -> floor == target. The advance stops at the target with
+    // K below the cap (5 rounds, K_cap = 10): the old condition
+    // (K2 < K_cap && stripped <= floor) flagged this as floor-limited.
+    {
+        common_params p = make_params("on", 10000);
+        p.sigma_strip_target = 0.55;   // floor = target = 5500
+        common_json body = make_body(make_messages(5, 8000));
+        const sigma_strip_result res =
+            sigma_strip_maybe_rewrite(nullptr, p, make_req("t-flooroff"), body, true);
+        CHECK(res.eligible);
+        CHECK(res.k_advanced);
+        CHECK(res.K == 8);
+        CHECK(res.n_stripped == 3);
+        CHECK(!res.floor_limited);
+        CHECK(!res.target_unreachable);
+    }
+
+    // --- config check: unusable floors are rejected at startup -------------
+    // threshold 0.70 x window 10000 = 7000; 10% of window = 1000.
+    {
+        common_params p = make_params("on", 10000);
+        p.sigma_strip_min_keep_tokens = 7000;  // floor 7000 >= threshold 7000
+        CHECK(!sigma_strip_config_check(p).empty());
+        p.sigma_strip_min_keep_tokens = 0;
+        p.sigma_strip_target = 0.8;            // floor 8000 > threshold 7000
+        CHECK(!sigma_strip_config_check(p).empty());
+        p.sigma_strip_target = 0.68;           // floor 6800, margin 200 < 1000
+        CHECK(sigma_strip_config_check(p).empty());   // thin margin: warn only
+        p.sigma_strip_target = 0.35;           // floor 3500, margin 3500 >= 1000
+        CHECK(sigma_strip_config_check(p).empty());
+        p.sigma_strip_min_keep_tokens = 6500;  // floor 6500, margin 500 < 1000
+        CHECK(sigma_strip_config_check(p).empty());
+        common_params q = make_params("off", 10000);
+        q.sigma_strip_min_keep_tokens = 7000;
+        CHECK(sigma_strip_config_check(q).empty());  // feature off: no check
+        common_params r = make_params("on", 0);
+        r.sigma_strip_min_keep_tokens = 7000;
+        CHECK(sigma_strip_config_check(r).empty());  // no window: no check
+    }
+
     if (n_failed) {
         std::printf("test-sigma-strip: %d check(s) FAILED\n", n_failed);
         return 1;

@@ -251,7 +251,6 @@ std::string prefix_fingerprint(const common_json & messages, size_t K) {
 struct sigma_strip_session_state {
     size_t      K = 0;             // K after the last request
     std::string prefix_fp;         // hash16 of the original messages[0..K)
-    bool        floor_warned = false; // thin-margin warning already logged
 };
 
 std::mutex & sigma_strip_mutex() {
@@ -265,6 +264,33 @@ std::map<std::string, sigma_strip_session_state> & sigma_strip_sessions() {
 }
 
 } // namespace
+
+//
+// startup configuration validation
+//
+std::string sigma_strip_config_check(const common_params & params) {
+    if (params.sigma_strip_mode == "off" || params.sigma_strip_window_tokens <= 0) {
+        return "";
+    }
+    const double window = (double) params.sigma_strip_window_tokens;
+    const double floor = std::max(params.sigma_strip_target * window,
+                                  (double) params.sigma_strip_min_keep_tokens);
+    const double margin = params.sigma_strip_threshold * window - floor;
+    if (margin <= 0.0) {
+        return "sigma-strip: floor " + std::to_string((long long) floor) +
+               " tokens (max of --sigma-strip-target x window and --sigma-strip-min-keep-tokens) >= "
+               "threshold " + std::to_string((long long) (params.sigma_strip_threshold * window)) +
+               " tokens: the K advance cannot keep the usage below the threshold (stall or chain "
+               "re-prefill until native compact). Lower --sigma-strip-target or "
+               "--sigma-strip-min-keep-tokens, or raise --sigma-strip-threshold.";
+    }
+    if (margin < 0.10 * window) {
+        SRV_WRN("sigma-strip: thin margin (threshold - floor = %.0f tokens < 10%% of window): "
+                "post-advance usage lingers near the threshold -> repeated advances (chain re-prefill) "
+                "until native compact; lower the floors or raise the threshold", margin);
+    }
+    return "";
+}
 
 //
 // entry point
@@ -395,18 +421,12 @@ sigma_strip_result sigma_strip_maybe_rewrite(
                 st.prefix_fp = prefix_fingerprint(messages, st.K);
                 res.k_advanced = true;
             }
-            res.floor_limited = (K2 < K_cap && stripped <= floor_tokens);
+            // floor_limited: the token floor (above the target) stopped the
+            // advance before the cap. With min_keep = 0 the floor equals the
+            // target, so a plain target stop is not floor-limited.
+            res.floor_limited = (floor_tokens > target_tokens && K2 < K_cap && stripped <= floor_tokens);
             if (stripped > target_tokens) {
                 res.target_unreachable = true;
-            }
-            // Thin-margin warning: floor close to the threshold -> a full
-            // advance leaves the usage near the threshold -> repeated
-            // advances (chain re-prefill) until native compact. Log once.
-            if (res.k_advanced && !st.floor_warned
-                    && params.sigma_strip_threshold - floor_tokens / window < 0.10) {
-                st.floor_warned = true;
-                SRV_WRN("sigma-strip: session=%s thin margin (threshold %.2f - floor %.2f < 0.10): post-advance usage may linger near the threshold -> repeated advances; lower the threshold or shrink the floors",
-                        session.c_str(), params.sigma_strip_threshold, floor_tokens / window);
             }
         }
         res.K = st.K;
@@ -445,12 +465,13 @@ sigma_strip_result sigma_strip_maybe_rewrite(
         }
 
         // 6) shadow / on log line
-        SRV_INF("sigma-strip: session=%s mode=%s K=%zu/%zu reset=%d advanced=%d stripped=%zu tokens %lld->%lld usage %.3f->%.3f rewrite=%s%s",
+        SRV_INF("sigma-strip: session=%s mode=%s K=%zu/%zu reset=%d advanced=%d stripped=%zu tokens %lld->%lld usage %.3f->%.3f rewrite=%s%s%s",
                 session.c_str(), params.sigma_strip_mode.c_str(), res.K, n,
                 (int) res.prefix_reset, (int) res.k_advanced, res.n_stripped,
                 (long long) res.tokens_before, (long long) res.tokens_after,
                 res.usage_before, res.usage_after, res.rewrite_hash.c_str(),
-                res.target_unreachable ? " target-unreachable" : "");
+                res.target_unreachable ? " target-unreachable" : "",
+                res.floor_limited ? " floor-limited" : "");
         return res;
     } catch (const std::exception & e) {
         SRV_WRN("sigma-strip: fail-open (%s), request untouched", e.what());

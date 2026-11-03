@@ -4,6 +4,7 @@
 #include "server-cors-proxy.h"
 #include "server-stream.h"
 #include "server-tools.h"
+#include "sigma-strip.h"
 
 #include "arg.h"
 #include "build-info.h"
@@ -164,6 +165,14 @@ int llama_server(common_params & params, int argc, char ** argv) {
 
             params.n_parallel = 4;
             params.kv_unified = true;
+        }
+
+        // sigma-strip: reject floors that make the K advance unusable
+        // (floor >= threshold); a thin margin is warned inside the check
+        const std::string sigma_strip_err = sigma_strip_config_check(params);
+        if (!sigma_strip_err.empty()) {
+            SRV_ERR("%s\n", sigma_strip_err.c_str());
+            return 1;
         }
     }
 

@@ -70,3 +70,14 @@ sigma_strip_result sigma_strip_maybe_rewrite(
         const server_http_req & req,
         common_json & body,
         bool apply);
+
+// Startup validation of the sigma-strip configuration (call once before
+// serving). Returns a non-empty error when the floors make the K advance
+// unusable: floor = max(target x window, min_keep_tokens) >= threshold x
+// window means a full advance still leaves the usage at/above the
+// threshold, so the session either stalls (no advance) or re-advances
+// every request (chain re-prefill) until native compact. A thin margin
+// (floor within 10% of the window below the threshold) works but risks
+// the same chain, so it is warned, not rejected. Empty when the feature
+// is off or has no window.
+std::string sigma_strip_config_check(const common_params & params);
