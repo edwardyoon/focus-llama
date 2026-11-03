@@ -8,18 +8,22 @@
 // deterministic stubs. Shadow mode computes and logs only — the request body
 // is left untouched.
 //
-// K never crosses the last assistant tool_calls message: that round and the
-// tool results after it are the model's current working context — stubbing
-// them leaves the model nothing to act on (empty responses). If the cap
-// blocks the target, the target_unreachable path still advances what it can;
-// a session that stays above threshold is handed to the native compact
-// safety net.
+// Two floors limit the jump:
+// - protection: K never crosses the start of the last keep_recent tool
+//   rounds (tool_calls + their results) — recent working context. Stubbing
+//   it leaves the model nothing to act on (empty responses).
+// - token: the stripped prompt never drops below min_keep_tokens (effective
+//   goal = max(target x window, min_keep)).
+// If a floor blocks the target, the target_unreachable path still advances
+// what it can; a session that stays above threshold is handed to the native
+// compact safety net. A thin threshold-floor margin is warned once per
+// session (chain re-prefill risk).
 //
 // Guarantees:
 // - byte-identical rewrite for a fixed prefix + fixed K (deterministic stubs,
 //   no randomness / timestamps)
 // - message count and tool_call_id pairing are preserved
-// - the last assistant tool_calls round (current turn) is never stubbed
+// - the last keep_recent tool rounds are never stubbed
 // - prefix fingerprint (hash of messages[0..K)) mismatches reset K
 // - fail-open: any error leaves the request untouched
 #include "sigma-strip.h"
@@ -245,8 +249,9 @@ std::string prefix_fingerprint(const common_json & messages, size_t K) {
 // per-session state (in-memory, process lifetime — shadow phase)
 //
 struct sigma_strip_session_state {
-    size_t      K = 0;        // K after the last request
-    std::string prefix_fp;    // hash16 of the original messages[0..K)
+    size_t      K = 0;             // K after the last request
+    std::string prefix_fp;         // hash16 of the original messages[0..K)
+    bool        floor_warned = false; // thin-margin warning already logged
 };
 
 std::mutex & sigma_strip_mutex() {
@@ -347,22 +352,41 @@ sigma_strip_result sigma_strip_maybe_rewrite(
         res.usage_before = resident / window;
         const double target_tokens = params.sigma_strip_target * window;
         if (res.usage_before >= params.sigma_strip_threshold) {
-            // K cap: the last assistant tool_calls round (and the tool results
-            // after it) is the current turn — never stub it. Earlier rounds in
-            // the same turn may still be stripped.
+            // Protection floor: K never crosses the start of the last
+            // keep_recent tool rounds (tool_calls + their results) — recent
+            // working context ("what was I doing"). Fewer rounds than
+            // requested: protect them all.
+            const size_t keep_recent = (size_t) std::max<int32_t>(1, params.sigma_strip_keep_recent);
             size_t K_cap = n;
-            for (size_t i = n; i-- > 0;) {
-                const common_json & m = messages.at(i);
-                if (m.is_object() && json_string_or(m, "role") == "assistant"
-                        && m.contains("tool_calls") && m.at("tool_calls").is_array()
-                        && !m.at("tool_calls").empty()) {
-                    K_cap = i;
-                    break;
+            {
+                size_t rounds = 0, first_round = n;
+                for (size_t i = n; i-- > 0;) {
+                    const common_json & m = messages.at(i);
+                    if (m.is_object() && json_string_or(m, "role") == "assistant"
+                            && m.contains("tool_calls") && m.at("tool_calls").is_array()
+                            && !m.at("tool_calls").empty()) {
+                        ++rounds;
+                        first_round = i;
+                        if (rounds == keep_recent) {
+                            K_cap = i;
+                            break;
+                        }
+                    }
+                }
+                if (rounds < keep_recent) {
+                    K_cap = first_round;
                 }
             }
+            if (st.K > K_cap) {
+                st.K = K_cap;
+                st.prefix_fp = prefix_fingerprint(messages, st.K);
+            }
+            // Token floor: the stripped prompt never drops below
+            // max(target x window, min_keep_tokens).
+            const double floor_tokens = std::max(target_tokens, (double) params.sigma_strip_min_keep_tokens);
             double stripped = resident;
             size_t K2 = st.K;
-            while (K2 < K_cap && stripped > target_tokens) {
+            while (K2 < K_cap && stripped > floor_tokens) {
                 stripped -= (double) savings[K2];
                 K2++;
             }
@@ -371,8 +395,18 @@ sigma_strip_result sigma_strip_maybe_rewrite(
                 st.prefix_fp = prefix_fingerprint(messages, st.K);
                 res.k_advanced = true;
             }
+            res.floor_limited = (K2 < K_cap && stripped <= floor_tokens);
             if (stripped > target_tokens) {
                 res.target_unreachable = true;
+            }
+            // Thin-margin warning: floor close to the threshold -> a full
+            // advance leaves the usage near the threshold -> repeated
+            // advances (chain re-prefill) until native compact. Log once.
+            if (res.k_advanced && !st.floor_warned
+                    && params.sigma_strip_threshold - floor_tokens / window < 0.10) {
+                st.floor_warned = true;
+                SRV_WRN("sigma-strip: session=%s thin margin (threshold %.2f - floor %.2f < 0.10): post-advance usage may linger near the threshold -> repeated advances; lower the threshold or shrink the floors",
+                        session.c_str(), params.sigma_strip_threshold, floor_tokens / window);
             }
         }
         res.K = st.K;

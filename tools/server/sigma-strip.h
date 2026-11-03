@@ -8,7 +8,11 @@
 // --sigma-strip-threshold, its K boundary advances in one big jump so the
 // stripped usage reaches --sigma-strip-target, and every COMPACTABLE tool
 // result inside messages[0..K) is replaced by a deterministic stub (media
-// parts are dropped). The stub is a pure function of (tool, args, original
+// parts are dropped). Two floors limit the jump: K never crosses the start of
+// the last --sigma-strip-keep-recent tool rounds (recent working context), and
+// the stripped prompt never drops below --sigma-strip-min-keep-tokens (the
+// effective goal is max(target x window, min_keep)). The stub is a pure
+// function of (tool, args, original
 // token count) — no randomness, no timestamps — so the same input always
 // yields a byte-identical rewrite, and the frozen prefix [0..K) keeps the KV
 // prefix cacheable.
@@ -39,6 +43,7 @@ struct sigma_strip_result {
     bool        prefix_reset       = false; // K reset this request (client compact / /clear / resume)
     bool        k_advanced         = false; // K advanced this request
     bool        target_unreachable = false; // cannot reach target even stripping everything (phase-0 data)
+    bool        floor_limited      = false; // advance stopped at the token floor, before the cap
     size_t      K                  = 0;     // K after this request
     size_t      n_messages         = 0;
     size_t      n_stripped         = 0;     // tool results stubbed within [0, K)
@@ -53,6 +58,7 @@ struct sigma_strip_result {
 // Compute the sigma-strip rewrite plan for one chat request.
 //   vocab:  tokenizer (nullptr = deterministic byte/4 estimate, for unit tests)
 //   params: sigma_strip_mode / sigma_strip_threshold / sigma_strip_target /
+//           sigma_strip_min_keep_tokens / sigma_strip_keep_recent /
 //           sigma_strip_window_tokens
 //   req:    used only for session resolution (X-Session-Id / user)
 //   body:   the parsed /chat/completions request; with apply=true and mode
