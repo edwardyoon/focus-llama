@@ -9,7 +9,7 @@ focus-llama: 256k context, ~64k of VRAM, and up to ~35% faster decode than vanil
 ## How it works
 Vanilla llama.cpp allocates a contiguous KV buffer for the full -c (VRAM), and every decode step attends over all tokens currently in context, so per-token cost grows roughly linearly with context length (only the attention part; the weights matmul is constant). The two problems are separate: the allocation wastes VRAM, and the growing context slows decoding.
 
-focus-llama attacks both: the physical buffer is capped (~85k cells) so VRAM is bounded, and since the number of resident cells can't exceed the buffer, per-step attention cost is bounded by the buffer size instead of the logical context length. It based on 2 techniques declarative attention and skill.state, introduced by google deepmind.
+focus-llama attacks both: the physical buffer is capped (~85k cells) so VRAM is bounded, and since the number of resident cells can't exceed the buffer, per-step attention cost is bounded by the buffer size instead of the logical context length. It is based on two techniques, declarative attention and skill.state (Σ), introduced by Google DeepMind.
 
 ## Build
 
@@ -249,6 +249,10 @@ The two paths coexist (marker layout wins when present; auto takes over otherwis
 Production launch). Without either, requests run with full attention - the two projects remain
 independently usable.
 
+A third, independent mechanism - sigma-strip (see below) - acts on the wire prompt itself: it
+stubs the session's old tool results once its usage crosses a threshold, so a long session
+avoids the client's heavy compaction entirely.
+
 ## kv-offload (lossless evict/recall, auto-compaction alternative)
 
 `--fm-offload` provides a **lossless** evict/recall cycle backed by an external store (the
@@ -317,9 +321,10 @@ and with a `--kv-cache-size` set requires `high + n_batch + gen tail <= kv_cache
 must still fit the buffer before eviction can trigger.
 
 **Status: verified (v2.0)** - see *Verified: lossless evict/recall* above.
-Running in production (qwen3.8-27B MROPE, `-c 200000 --kv-offload-threshold 38672`,
-since 09-26) with `--kv-offload-holes`: evictions PUT to the store and holes cut the KV on
-every turn of a live session. The watermark gate (`--kv-offload-high`, `b98be7033`) is
+Running in production (qwen3.8-27B MROPE, `-c 230000 --kv-offload-threshold 57344
+--kv-offload-high 81920`, since 09-26) with `--kv-offload-holes`: evictions PUT to the store
+and holes cut the KV on the crossing turn of a live session. The watermark gate
+(`--kv-offload-high`, `b98be7033`) is
 verified by the startup checks (high < low refused, over-cap refused with the allowed max
 shown, non-holes warned and ignored) and the multi-turn journal: `kv_offload: gate`
 carries `resident=`/`high=` every turn, `kv_offload: watermark idle` marks the band
@@ -330,6 +335,94 @@ turns, and `kv_offload: evict plan` appears only on the crossing turn.
 > owns that name and the `LLAMA_ARG_KV_OFFLOAD` env var, so a `--kv-offload` here would be
 > silently consumed by the stock flag and eviction would never engage.
 
+## Σ-strip: server-side prompt reduction
+
+Clients such as qwen-code are stateless: every turn they resend the full,
+original history. Σ-strip lets the server shrink that history *before* the
+model sees it, so the client's own auto-compaction never has to fire: the
+response reports the reduced `usage.prompt_tokens`, the client anchors its
+compact gate on that value, and the heavy lossy compaction simply does not
+happen.
+
+```
+qwen-code ── full history (original) ──▶ focus-llama
+                                           │
+                                           ├─ below threshold (--sigma-strip-threshold, default 0.70 of window)
+                                           │    └─ pass through unchanged
+                                           │
+                                           └─ at or above threshold:
+                                                │
+                                                ├─ 1. advance K (one big jump, never backwards)
+                                                │      until usage reaches target
+                                                │      (bounded by the floors below)
+                                                │
+                                                ├─ 2. replace every old tool result in
+                                                │      messages[0..K) with a deterministic stub
+                                                │      "[read_file result stripped — path=..., N tokens. Re-read if needed]"
+                                                │
+                                                ├─ 3. insert a frozen Σ snapshot at K
+                                                │      (merged from focus-memory's periodic skill.state
+                                                │      extractions, when enabled)
+                                                │
+                                                └─ 4. run the model on the shorter prompt
+                                           │
+qwen-code ◀── response + usage.prompt_tokens (reduced) ──┘
+              └─ the client sees the lower value, so its own
+                 compaction threshold is not reached
+```
+
+The machinery:
+
+- **The gate** - the server tokenizes the request's `messages` and measures
+  *usage* = estimated tokens / `--sigma-strip-window-tokens` (the client's
+  context-window size). Below `--sigma-strip-threshold` the request passes
+  through byte-identical.
+- **The K boundary** - once usage reaches the threshold, the session's K
+  advances **in one big jump** (never backwards) until the stripped prompt
+  reaches `max(--sigma-strip-target × window, --sigma-strip-min-keep-tokens)`.
+  K is monotonic, and the rewrite is a pure function of (original prefix, K),
+  so re-sends of the same history rewrite to identical bytes and the KV cache
+  keeps matching - each advance costs one re-prefill, not one per turn.
+- **The stubs** - in `messages[0..K)`, every *compactable* tool result
+  (read_file, shell, grep, glob, web_fetch, web_search, edit, write_file,
+  search_memory, ...) is replaced by a deterministic one-line stub that keeps
+  the path/arguments and the original size: the model can re-read on demand.
+  Non-tool messages are untouched, media parts are dropped, and the message
+  count and `tool_call_id` pairing are preserved.
+- **The floors** - two floors bound the jump: the *protection floor* (K never
+  crosses the start of the last `--sigma-strip-keep-recent` tool rounds - the
+  working set the model is acting on) and the *token floor*
+  (`--sigma-strip-min-keep-tokens`). When the floors leave the stripped prompt
+  above the target, the line is marked `target-unreachable` and the client's
+  native compact remains the last-resort safety net.
+- **The reset** - a hash of the original `messages[0..K)` is the prefix
+  fingerprint; when it changes (client compact, `/clear`, resume) K resets to
+  0 and the machinery starts over.
+- **Fail-open** - any error, or a request without a real session key, leaves
+  the body untouched.
+
+Modes: `off` (default, no-op) | `shadow` (compute + log only, body untouched -
+used to verify the K machinery against a live session) | `on` (rewrite in
+place).
+
+| Flag | Meaning |
+|---|---|
+| `--sigma-strip off\|shadow\|on` | `shadow` computes and logs only; `on` rewrites the request |
+| `--sigma-strip-window-tokens N` | Client context window (usage denominator); must match the client |
+| `--sigma-strip-threshold F` | Usage fraction that triggers an advance (default 0.70) |
+| `--sigma-strip-target F` | Usage fraction an advance aims for (default 0.35) |
+| `--sigma-strip-min-keep-tokens N` | Token floor (effective goal = max(target x window, N); 0 = off) |
+| `--sigma-strip-keep-recent N` | Number of recent tool rounds kept verbatim (default 1) |
+
+**How it pairs with DA and kv-offload.** Σ-strip shrinks the *wire prompt*;
+`--da-auto` keeps *attention* over what remains cheap (the model's
+`<focus magic_chunks="N">` tags recall exactly the chunks it needs);
+kv-offload keeps the evicted *content* recoverable from the store. Together
+they let a long-running session grow past the point where a stateless client
+would normally compact: the strip keeps reported usage under the client's
+threshold, DA bounds each decode step, and the store holds what was stubbed
+or evicted (see *Production launch*).
+
 ## Production launch (recommended options)
 
 The production node runs the DA inference service - qwen3.8, multimodal - behind the
@@ -337,24 +430,35 @@ focus-memory backend. The recommended `llama-server` launch line is:
 
 ```bash
 llama-server \
+  -c 230000 \
   --parallel 1 \
   --metrics \
   --da-auto \
   --kv-unified \
   --da-min-ctx 2048 \
   --da-chunk-tokens 4096 \
-  --sparse-gate-threshold 60 \
+  --da-tail-keep 40960 \
+  --sparse-gate-threshold 80 \
   --spec-type draft-mtp-adaptive \
-  --spec-draft-n-max 4 \
+  --spec-draft-sampling probabilistic \
+  --spec-draft-n-max 6 \
   --spec-draft-ngl all \
-  --kv-cache-size 115536 \
+  --spec-draft-type-k q8_0 \
+  --spec-draft-type-v q8_0 \
+  --kv-cache-size 111630 \
   --fm-offload \
   --kv-offload-holes \
-  --kv-offload-threshold 38672 \
-  --kv-offload-high 55000 \
-  --kv-retain-tokens 6000 \
+  --kv-offload-threshold 57344 \
+  --kv-offload-high 81920 \
+  --kv-retain-tokens 4096 \
   --focus-memory-host http://<store-host>:3900 \
-  --focus-memory-token <CONTEXT_API_TOKEN>
+  --focus-memory-token <CONTEXT_API_TOKEN> \
+  --sigma-strip on \
+  --sigma-strip-window-tokens 230000 \
+  --sigma-strip-threshold 0.73 \
+  --sigma-strip-target 0.17 \
+  --sigma-strip-min-keep-tokens 30960 \
+  --sigma-strip-keep-recent 3
 ```
 
 (`--da-auto` is the production path: it re-chunks the whole rendered prompt, so DA restricts
@@ -371,23 +475,32 @@ Backend A vs B below.)
 
 | Option | What it does | Why it is on |
 |--------|--------------|--------------|
+| `-c 230000` | Logical context window (tokens) | Matches the client window (`--sigma-strip-window-tokens`); the physical buffer stays capped by `--kv-cache-size` |
 | `--metrics` | Exposes Prometheus metrics on the server port | Observability for a long-running service |
 | `--da-auto` | **Auto-chunking**: when a rendered prompt has no client layout markers and is at least `--da-min-ctx` tokens, the server splits it into magic chunks by message boundaries so the model's `<focus magic_chunks="N">` tags can restrict attention over the whole conversation | Production path for **physical** KV read reduction - re-chunks system + history + tool I/O, not just an injected index |
 | `--kv-unified` | Enables backend B (reversible two-stream KV) | Required by `--da-auto`: the A path (`seq_rm`) is irreversible, a wrong focus permanently deletes the answer chunk |
 | `--da-min-ctx 2048` | Minimum prompt length (tokens) before auto-chunking engages | Short prompts stay full-attention (no DA overhead); default is 0 (always) |
 | `--da-chunk-tokens 4096` | Target magic-chunk size (tokens); hard cap 5/4 × target | Production chunk size (default 2048); larger = fewer, coarser spans |
-| `--da-tail-keep 8192` | **DA tail floor**: the most recent N tokens before the removal boundary are always kept in the DA keep set (the union of the tag selection, the Sigma anchor and the tail), so the work in progress survives a B switch even when no magic_chunks tag covers it. 0 = legacy behavior (no floor) | Default 8192: without the floor, the region the model was just working in (not covered by any magic_chunks tag) is masked out whole at a B switch and the model forgets what it just did; the floor trades part of the read reduction for keeping that tail readable |
-| `--sparse-gate-threshold 60` | **DA sparse FA gate**: the sparse (gather) attention path is used only while the finite KV rows are at most 60% of the cache, dense below that (1-100, default 50) | Default 50 would run dense in the production steady state (threshold + retain ≈ 44.7K of 85536, ~52%); 60 keeps the sparse path engaged there, and it still flips to dense once finite rows pass 60%, where the gather overhead would not pay off |
-| `--spec-type draft-mtp` | **Speculative decoding** with the model's MTP draft head | Speed-up on top of DA. Spec and DA **coexist**: while a slot is in DA mode (`da_seq` active) spec is paused automatically and resumes on the return to global attention - so spec stays ON without breaking DA |
-| `--spec-draft-n-max 4` | Up to 4 draft tokens per step | Enough to overlap decode with drafting, without so many that rejections waste work |
+| `--da-tail-keep 40960` | **DA tail floor**: the most recent N tokens before the removal boundary are always kept in the DA keep set (the union of the tag selection, the Sigma anchor and the tail), so the work in progress survives a B switch even when no magic_chunks tag covers it. 0 = legacy behavior (no floor) | ~10 chunks: the floor covers the active working set, so the region the model is currently operating in is never masked out whole at a B switch |
+| `--sparse-gate-threshold 80` | **DA sparse FA gate**: the sparse (gather) attention path is used only while the finite KV rows are at most 80% of the cache, dense above that (1-100, default 50) | The steady-state resident (threshold + retain ≈ 61.4k up to the high watermark 81.9k) sits at 55-74% of the 111630-cell buffer; 80 keeps the sparse path engaged across the whole watermark band and flips to dense only where the gather overhead would not pay off |
+| `--spec-type draft-mtp-adaptive` | **Speculative decoding** with the model's MTP draft head, adaptive draft depth | Speed-up on top of DA. Spec and DA **coexist**: while a slot is in DA mode (`da_seq` active) spec is paused automatically and resumes on the return to global attention - so spec stays ON without breaking DA |
+| `--spec-draft-sampling probabilistic` | The draft is sampled (not argmax) and the target verifies it by rejection sampling (default: greedy) | The server runs at temperature 0.9; probabilistic drafting matches the target's sampling distribution, which greedy under-accepts |
+| `--spec-draft-n-max 6` | Up to 6 draft tokens per step | Enough to overlap decode with drafting, without so many that rejections waste work |
 | `--spec-draft-ngl all` | Puts the whole draft model on the GPU | The draft model is small; keeping it fully on-GPU avoids CPU round-trips that would erase the spec gain |
-| `--kv-cache-size 85536` | Physical KV buffer size in cells; decoupled from the logical position range - cells wrap while positions extend to `-c` (0 = default: n_ctx_seq) | Sized for the watermark worst case - high + n_batch + gen tail + 16384 headroom (60000 + 2048 + 16384 = 78432 ≤ 85536, enforced at startup) - so a request sitting just below the high watermark still fits before eviction can trigger; an over-buffer request is rejected before a find_slot failure |
+| `--spec-draft-type-k q8_0` / `--spec-draft-type-v q8_0` | Quantizes the draft's KV cache to q8_0 (default: f16) | Halves the draft's KV VRAM so the 6-token draft window fits the buffer budget |
+| `--kv-cache-size 111630` | Physical KV buffer size in cells; decoupled from the logical position range - cells wrap while positions extend to `-c` (0 = default: n_ctx_seq) | Sized for the watermark worst case - high + n_batch + gen tail + 16384 headroom (81920 + 1024 + 12302 = 95246 ≤ 111630, enforced at startup) - so a request sitting just below the high watermark still fits before eviction can trigger; an over-buffer request is rejected before a find_slot failure |
 | `--fm-offload` | **kv-offload**: evict the oldest middle messages to the focus-memory store once the prompt exceeds `--kv-offload-threshold`, and re-prefill them on demand when the model focuses an offloaded chunk | Replaces lossy auto-compaction with a lossless evict/refill cycle (see *kv-offload* above). Optional - off by default |
-| `--kv-offload-threshold 38672` | Token count at which kv-offload eviction engages (the **low** watermark when `--kv-offload-high` is set - the drain target, not a trigger) | Size it at ~8-9 × `--da-chunk-tokens` (4096 → 38672): high enough that short sessions never evict, low enough that eviction engages long before the client's auto-compaction point, so the prompt stays a few chunks over the threshold instead of ballooning |
-| `--kv-offload-high 60000` | kv-offload holes-mode **high watermark**: the only eviction trigger - when the session's KV-resident (full prompt minus cumulative evicted) reaches 60k, drain to the low target (`--kv-offload-threshold` + `--kv-retain-tokens`) in one shot; between low and high the gate is idle (no per-turn plan/PUT/hole work). 0 = legacy per-turn gate | Without it a session past the threshold re-runs the evict plan + PUT + hole re-apply every turn, shaving only the per-turn increment; the watermark makes each crossing cost a single drain. Sized under the buffer cap: `high + n_batch + gen tail <= 85536 - 16384` (60000 + 2048 fits, verified at startup) |
-| `--kv-retain-tokens 6000` | kv-offload: minimum recent tokens kept in the KV cache beyond `--kv-offload-threshold` when evicting (0 = evict down to the threshold only; default 0) | Keeps the active tail resident after each eviction so the hottest context never goes to the store; the buffer is sized to honor it, so retain is never clamped (see `--kv-cache-size`) |
+| `--kv-offload-threshold 57344` | Token count at which kv-offload eviction engages (the **low** watermark when `--kv-offload-high` is set - the drain target, not a trigger) | 14 × `--da-chunk-tokens` (4096 → 57344): high enough that short sessions never evict, low enough that eviction engages long before the client's auto-compaction point; it is also where a Σ-strip drain lands, so a stripped session needs no KV eviction |
+| `--kv-offload-high 81920` | kv-offload holes-mode **high watermark**: the only eviction trigger - when the session's KV-resident (full prompt minus cumulative evicted) reaches 81.9k, drain to the low target (`--kv-offload-threshold` + `--kv-retain-tokens` ≈ 61.4k) in one shot; between low and high the gate is idle (no per-turn plan/PUT/hole work). 0 = legacy per-turn gate | Without it a session past the threshold re-runs the evict plan + PUT + hole re-apply every turn, shaving only the per-turn increment; the watermark makes each crossing cost a single drain. Sized under the buffer cap: `high + n_batch + gen tail <= 111630 - 16384` (81920 + 1024 + 12302 fits, verified at startup) |
+| `--kv-retain-tokens 4096` | kv-offload: minimum recent tokens kept in the KV cache beyond `--kv-offload-threshold` when evicting (0 = evict down to the threshold only; default 0) | Keeps the active tail resident after each eviction so the hottest context never goes to the store; one chunk (4096) is the minimum useful working tail; the buffer is sized to honor it, so retain is never clamped (see `--kv-cache-size`) |
 | `--focus-memory-host` | Base URL of the focus-memory KV store (`PUT`/`GET` `/v1/kv-offload/chunk`) | Empty = kv-offload disabled even with `--fm-offload` on (fail-open) |
 | `--focus-memory-token` | Bearer token for the store API (`CONTEXT_API_TOKEN`) | Empty = no auth header; set it to match the store |
+| `--sigma-strip on` | **Σ-strip**: server-side prompt reduction - once the session's usage crosses `--sigma-strip-threshold`, the K boundary advances and the old compactable tool results in `messages[0..K)` are stubbed in place; the response reports the reduced `usage.prompt_tokens`, so the client's heavy auto-compaction never fires (see *Σ-strip* above) | Long-session continuity without lossy compaction; DA then keeps attention cheap over the reduced prompt. `shadow` verifies the machinery against a live session before `on` |
+| `--sigma-strip-window-tokens 230000` | The client's context-window size in tokens - the usage denominator (0 = the feature stays inactive) | Set to `-c`: the node serves one client window, and the threshold/target fractions are fractions of it |
+| `--sigma-strip-threshold 0.73` | Usage fraction at which the K boundary advances (default 0.70); one big jump per crossing, not per turn | The crossing point of the session: 0.73 × 230000 ≈ 167.9k, far above the drain floor (≈39.1k), so one drain lands deep below the threshold and the next crossing is far away |
+| `--sigma-strip-target 0.17` | Post-strip usage target (default 0.35): K advances until the stripped prompt reaches `max(target × window, --sigma-strip-min-keep-tokens)` | A deep drain: 0.17 × 230000 ≈ 39.1k lands **below the kv-offload threshold (57344)**, so a stripped session needs no KV eviction and the DA buffer sees a short prompt |
+| `--sigma-strip-min-keep-tokens 30960` | Token floor: K never advances the stripped prompt below this (effective goal = `max(target × window, N)`; 0 = off, default 0) | Safety floor if the target is ever lowered; in this configuration the target (≈39.1k) is above it, so the target binds |
+| `--sigma-strip-keep-recent 3` | Keep the last N assistant tool rounds (tool_calls + their results) verbatim - K never crosses their start (default 1) | The model keeps its active working set (the last 3 tool calls + results) verbatim, so it continues the task without re-reading what it just did |
 
 **Scope of the effect.** The two paths are not two settings of the same effect. The marker
 path restricts attention only over the client-declared marker region (the focus-memory index
@@ -422,7 +535,7 @@ request used from the scan log: `da_scan: ... - A path` vs `da_scan: ... - B pat
 **Verifying DA in the journal.** After a chat that carries DA markers, confirm the DA path ran:
 
 ```bash
-journalctl -u qwen3.8-focus --since "10 min ago" | grep -E 'da_scan:|da_auto:|da_tag:|kv_offload:'
+journalctl -u qwen3.8-focus --since "10 min ago" | grep -E 'da_scan:|da_auto:|da_tag:|kv_offload:|sigma-strip:'
 ```
 
 - `da_scan:` - the prompt scanner found the `[[da:N]]`/`<da:N>` markers and built the chunk-to-range map (marker path)
@@ -433,6 +546,7 @@ journalctl -u qwen3.8-focus --since "10 min ago" | grep -E 'da_scan:|da_auto:|da
 - `kv_offload: evict plan` / `PUT ok` / `evicted N segment(s)` - the eviction sequence: the plan, each successful store PUT, and the KV cut (holes mode) or prompt shrink (default mode); with the watermark on, only on the turn the resident crosses the high watermark
 - `kv_offload: get-on-focus` / `GET ok ... re-prefilling` - the model focused an offloaded chunk and it was fetched + re-prefilled at the tail
 - `kv_offload: disabled` (one-time warning) - `--fm-offload` was not parsed or `--focus-memory-host` is empty, so eviction can never engage
+- `sigma-strip: session=... mode=on K=x/y reset=0 advanced=1 stripped=N tokens 22148->9816 usage 0.612->0.271 rewrite=<hash>` - one line per request on a Σ-strip-enabled node: the K boundary, `reset` (1 = the prefix fingerprint changed, K restarted), `advanced` (1 = the crossing turn, the one big jump), `stripped` (stubbed tool results), tokens before→after, usage before→after, and the rewrite hash; a `target-unreachable` / `floor-limited` suffix when a floor stopped the jump. `sigma-strip: fail-open (...)` is a warning - the request was left untouched
 
 A chat with no markers and a prompt below `--da-min-ctx` produces no `da_scan:`/`da_auto:` line
 and runs with full attention - that is the intended fail-open behavior. On a node running
