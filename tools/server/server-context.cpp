@@ -2,6 +2,7 @@
 #include "da-tag.h"
 #include "da-layout.h"
 #include "recall-sanitize.h"
+#include "sigma-strip.h"
 #include "server-context.h"
 #include "server-chat.h"
 #include "server-common.h"
@@ -8866,6 +8867,20 @@ void server_routes::init_routes() {
         auto res = create_response();
         std::vector<raw_buffer> files;
         json body = json::parse(req.body);
+        // Sigma-strip (direction B, plans/2026-11-03-compressfast-auto-
+        // trigger.md): server-side prompt compression at the messages-JSON
+        // stage, before oaicompat_chat_params_parse tokenizes. "off" (default)
+        // is skipped entirely (zero overhead); "shadow" computes + logs only
+        // (body untouched); "on" rewrites body["messages"] in place. The
+        // function is fail-open: any anomaly leaves the request untouched.
+        if (params.sigma_strip_mode != "off") {
+            sigma_strip_maybe_rewrite(
+                ctx_server.vocab,
+                params,
+                req,
+                body,
+                params.sigma_strip_mode == "on");
+        }
         json body_parsed = oaicompat_chat_params_parse(
             body,
             meta->chat_params,

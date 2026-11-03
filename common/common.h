@@ -699,6 +699,20 @@ struct common_params {
     // already-finished task. Enable with --sigma-fetch to restore the anchor
     // injection.
     bool        kv_sigma_fetch       = false;
+    // Sigma-strip (direction B, plans/2026-11-03-compressfast-auto-trigger.md):
+    // server-side prompt compression at the messages-JSON stage. "off"
+    // (default) = no-op, "shadow" = compute + log only (body untouched),
+    // "on" = rewrite body["messages"] in place (refresh/Σ wiring is step 3).
+    std::string sigma_strip_mode = "off";
+    // Usage (estimated prompt tokens / sigma_strip_window_tokens) at or above
+    // which the session's K boundary advances in one big jump.
+    double      sigma_strip_threshold      = 0.70;
+    // Stripped-usage target: K advances until the stripped prompt reaches this
+    // fraction of the window in the same request (one big jump, not gradual).
+    double      sigma_strip_target         = 0.35;
+    // Client context-window size in tokens (the usage denominator). 0 = no
+    // denominator, the feature stays inactive even in shadow/on mode.
+    int32_t     sigma_strip_window_tokens  = 0;
     // sparse FA gate (DA n_kv_max): the CUDA/Metal sparse (gather) path is used
     // only while the finite KV rows are at most this % of the cache; dense
     // below. Bridged to FOCUS_SPARSE_GATE_THRESHOLD in the server main (1-100).

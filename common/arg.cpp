@@ -1783,6 +1783,48 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_SIGMA_FETCH").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
+        {"--sigma-strip"}, "MODE",
+        "sigma-strip (direction B): server-side prompt compression at the messages-JSON stage - off (default, no-op) | shadow (compute + log only, request body untouched) | on (rewrite the request's messages in place; the refresh/snapshot wiring is a later step)",
+        [](common_params & params, const std::string & value) {
+            if (value != "off" && value != "shadow" && value != "on") {
+                throw std::invalid_argument("error: --sigma-strip must be off, shadow or on (got '" + value + "')");
+            }
+            params.sigma_strip_mode = value;
+        }
+    ).set_env("LLAMA_ARG_SIGMA_STRIP").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        {"--sigma-strip-threshold"}, "FRAC",
+        "sigma-strip: advance the session's K boundary (and stub the older tool results) once usage (prompt tokens / --sigma-strip-window-tokens) reaches this fraction of the window (0-1, default: 0.70)",
+        [](common_params & params, const std::string & value) {
+            const double frac = std::stod(value);
+            if (frac <= 0.0 || frac >= 1.0) {
+                throw std::invalid_argument("error: --sigma-strip-threshold must be in (0,1) (got " + value + ")");
+            }
+            params.sigma_strip_threshold = frac;
+        }
+    ).set_env("LLAMA_ARG_SIGMA_STRIP_THRESHOLD").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        {"--sigma-strip-target"}, "FRAC",
+        "sigma-strip: K advances in one big jump until the stripped prompt reaches this fraction of the window (0-1, default: 0.35)",
+        [](common_params & params, const std::string & value) {
+            const double frac = std::stod(value);
+            if (frac <= 0.0 || frac >= 1.0) {
+                throw std::invalid_argument("error: --sigma-strip-target must be in (0,1) (got " + value + ")");
+            }
+            params.sigma_strip_target = frac;
+        }
+    ).set_env("LLAMA_ARG_SIGMA_STRIP_TARGET").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        {"--sigma-strip-window-tokens"}, "N",
+        "sigma-strip: the client context-window size in tokens (the usage denominator); 0 = the feature stays inactive even in shadow/on mode (default: 0)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("error: --sigma-strip-window-tokens must be >= 0 (got " + std::to_string(value) + ")");
+            }
+            params.sigma_strip_window_tokens = value;
+        }
+    ).set_env("LLAMA_ARG_SIGMA_STRIP_WINDOW_TOKENS").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
         {"--sparse-gate-threshold"}, "PCT",
         "DA sparse FA gate: use the sparse (gather) path only while the finite KV rows are at most PCT% of the cache, dense below that (1-100, default: 50)",
         [](common_params & params, int value) {

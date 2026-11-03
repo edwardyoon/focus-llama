@@ -18,6 +18,8 @@ add_library(${TARGET} STATIC
     da-tag.h
     kv-offload.cpp
     kv-offload.h
+    sigma-strip.cpp
+    sigma-strip.h
     da-layout.cpp
     da-layout.h
     recall-sanitize.cpp
