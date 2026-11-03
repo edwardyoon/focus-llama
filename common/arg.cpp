@@ -1815,6 +1815,26 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_SIGMA_STRIP_TARGET").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
+        {"--sigma-strip-min-keep-tokens"}, "N",
+        "sigma-strip: token floor - K never advances the stripped prompt below this many tokens (effective goal = max(--sigma-strip-target x window, N); 0 = off, default: 0)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("error: --sigma-strip-min-keep-tokens must be >= 0 (got " + std::to_string(value) + ")");
+            }
+            params.sigma_strip_min_keep_tokens = value;
+        }
+    ).set_env("LLAMA_ARG_SIGMA_STRIP_MIN_KEEP_TOKENS").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        {"--sigma-strip-keep-recent"}, "N",
+        "sigma-strip: keep the last N assistant tool rounds (tool_calls + their results) verbatim - K never crosses their start (default: 1)",
+        [](common_params & params, int value) {
+            if (value < 1) {
+                throw std::invalid_argument("error: --sigma-strip-keep-recent must be >= 1 (got " + std::to_string(value) + ")");
+            }
+            params.sigma_strip_keep_recent = value;
+        }
+    ).set_env("LLAMA_ARG_SIGMA_STRIP_KEEP_RECENT").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
         {"--sigma-strip-window-tokens"}, "N",
         "sigma-strip: the client context-window size in tokens (the usage denominator); 0 = the feature stays inactive even in shadow/on mode (default: 0)",
         [](common_params & params, int value) {

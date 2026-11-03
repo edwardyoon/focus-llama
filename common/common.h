@@ -710,6 +710,13 @@ struct common_params {
     // Stripped-usage target: K advances until the stripped prompt reaches this
     // fraction of the window in the same request (one big jump, not gradual).
     double      sigma_strip_target         = 0.35;
+    // Token floor: K never advances the stripped prompt below this many
+    // tokens, even if the target would go further (effective goal =
+    // max(target x window, min_keep); 0 = off).
+    int32_t     sigma_strip_min_keep_tokens  = 0;
+    // Protection floor: the last N assistant tool rounds (tool_calls + their
+    // results) are kept verbatim - K never crosses their start.
+    int32_t     sigma_strip_keep_recent      = 1;
     // Client context-window size in tokens (the usage denominator). 0 = no
     // denominator, the feature stays inactive even in shadow/on mode.
     int32_t     sigma_strip_window_tokens  = 0;

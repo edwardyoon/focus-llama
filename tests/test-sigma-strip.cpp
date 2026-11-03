@@ -371,6 +371,56 @@ int main() {
         CHECK(out.at(7).at("tool_call_id").get<std::string>() == "call_1");
     }
 
+    // --- token floor: min_keep stops the advance before the cap ------------
+    // 5 rounds (K_cap=10 with keep_recent=1). Target-only would strip all 5
+    // results (K=10); min_keep=4500 stops it after 3 (tokens_after ~4100
+    // <= 4500, K=8 < 10) -> floor_limited.
+    {
+        common_params p = make_params("on", 3000);
+        p.sigma_strip_min_keep_tokens = 4500;
+        common_json body = make_body(make_messages(5, 8000));
+        const size_t n = 12;
+        const sigma_strip_result res =
+            sigma_strip_maybe_rewrite(nullptr, p, make_req("t-floor"), body, true);
+        CHECK(res.eligible);
+        CHECK(res.k_advanced);
+        CHECK(res.K == 8);
+        CHECK(res.n_stripped == 3);
+        CHECK(res.floor_limited);
+        CHECK(res.target_unreachable);
+        const std::string big(8000, 'x');
+        const common_json & out = body.at("messages");
+        CHECK(out.size() == n);
+        CHECK(out.at(3).at("content").get<std::string>() != big);
+        CHECK(out.at(9).at("content").get<std::string>() == big);
+        CHECK(out.at(11).at("content").get<std::string>() == big);
+    }
+
+    // --- protection floor: keep_recent=2 keeps the last two rounds ---------
+    // 4 rounds (tool_calls at 2,4,6,8). K_cap=6: the last two rounds
+    // (results 7,9) survive verbatim; the older two (results 3,5) are stubbed.
+    {
+        common_params p = make_params("on", 3000);
+        p.sigma_strip_keep_recent = 2;
+        common_json body = make_body(make_messages(4, 8000));
+        const size_t n = 10;
+        const sigma_strip_result res =
+            sigma_strip_maybe_rewrite(nullptr, p, make_req("t-keeprecent"), body, true);
+        CHECK(res.eligible);
+        CHECK(res.k_advanced);
+        CHECK(res.K == 6);
+        CHECK(res.n_stripped == 2);
+        CHECK(!res.floor_limited);
+        CHECK(res.target_unreachable);
+        const std::string big(8000, 'x');
+        const common_json & out = body.at("messages");
+        CHECK(out.size() == n);
+        CHECK(out.at(3).at("content").get<std::string>() != big);
+        CHECK(out.at(5).at("content").get<std::string>() != big);
+        CHECK(out.at(7).at("content").get<std::string>() == big);
+        CHECK(out.at(9).at("content").get<std::string>() == big);
+    }
+
     if (n_failed) {
         std::printf("test-sigma-strip: %d check(s) FAILED\n", n_failed);
         return 1;
