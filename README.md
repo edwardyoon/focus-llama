@@ -414,6 +414,12 @@ place).
 | `--sigma-strip-min-keep-tokens N` | Token floor (effective goal = max(target x window, N); 0 = off) |
 | `--sigma-strip-keep-recent N` | Number of recent tool rounds kept verbatim (default 1) |
 
+`--sigma-strip-window-tokens` must match the client's context window
+size. Mismatches are not auto-corrected: the server logs a warning when a
+response reports more tokens than the configured window (client window
+larger) or after repeated prefix resets (client compacts below the server
+threshold, i.e. client window smaller).
+
 **How it pairs with DA and kv-offload.** Σ-strip shrinks the *wire prompt*;
 `--da-auto` keeps *attention* over what remains cheap (the model's
 `<focus magic_chunks="N">` tags recall exactly the chunks it needs);

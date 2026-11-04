@@ -49,8 +49,9 @@ struct sigma_strip_result {
     size_t      n_stripped         = 0;     // tool results stubbed within [0, K)
     int64_t     tokens_before      = 0;     // estimated prompt tokens of the original messages
     int64_t     tokens_after       = 0;     // estimated prompt tokens of the rewritten messages
-    double      usage_before       = 0.0;   // resident usage before this request's decision
-    double      usage_after        = 0.0;   // resident usage after this request
+    double      usage_before       = 0.0;   // (resident + est_offset) / window before this request's decision
+    double      usage_after        = 0.0;   // (tokens_after + est_offset) / window after this request
+    int64_t     est_offset         = 0;     // reported-space offset applied to this request's gate/floors
     std::string rewrite_hash;               // hash16 of the rewritten messages dump ("" when not eligible)
     std::string session;
 };
@@ -70,6 +71,21 @@ sigma_strip_result sigma_strip_maybe_rewrite(
         const server_http_req & req,
         common_json & body,
         bool apply);
+
+// Capture the reported prompt-token count of a completed chat response and
+// update the session's est offset: offset = clamp(reported - last_est, 0,
+// window/2), where last_est is the previous request's post-rewrite
+// estimate. The server's message-level estimate omits the chat template,
+// tool schemas and system overhead that the client's full prompt carries,
+// so the gate and floors run in reported space (estimate + offset). Also
+// logs the per-response observation line. The window is read from the
+// session state (stamped by sigma_strip_maybe_rewrite), so this takes no
+// common_params — it can be called from the response path (server_context),
+// which does not hold one. No-op when the session is unknown (non-chat
+// endpoints, sigma off, no session key) or has no previous request.
+void sigma_strip_note_response(
+        const std::string & session,
+        int64_t reported_prompt_tokens);
 
 // Startup validation of the sigma-strip configuration (call once before
 // serving). Returns a non-empty error when the floors make the K advance
