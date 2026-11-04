@@ -3020,6 +3020,10 @@ private:
         res->truncated             = slot.truncated;
         res->n_decoded             = slot.stats.n_gen;
         res->n_prompt_tokens       = slot.task->n_tokens();
+        // sigma-strip (E1/E2): calibrate the session's est offset from the
+        // reported prompt-token count and log the per-response observation
+        // line. No-op for sessions that never went through sigma-strip.
+        sigma_strip_note_response(slot.task->params.sigma_session, slot.task->n_tokens());
         res->n_prompt_tokens_cache = slot.stats.n_prompt_cached;
         res->n_tokens_cached       = slot.prompt.n_tokens();
         res->has_new_line          = slot.has_new_line;
@@ -7412,6 +7416,11 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     params,
                     meta->logit_bias_eog,
                     data);
+
+            // sigma-strip (E1): carry the session key so the response path can
+            // calibrate the est offset (sigma_strip_note_response is a no-op
+            // for sessions that never went through sigma_strip_maybe_rewrite).
+            task.params.sigma_session = kv_offload_resolve_session(req, data);
 
             // Both DA paths need a strict char->token mapping of the rendered
             // prompt string. An mtmd prompt that contains media has

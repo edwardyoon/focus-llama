@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <functional>
 #include <string>
+#include <vector>
 
 static int n_failed = 0;
 
@@ -460,6 +461,156 @@ int main() {
         common_params r = make_params("on", 0);
         r.sigma_strip_min_keep_tokens = 7000;
         CHECK(sigma_strip_config_check(r).empty());  // no window: no check
+    }
+
+    // --- E1-1: est offset calibrates the gate into reported space ---------
+    // 5 rounds x 3200 chars -> raw estimate 4059 < 0.70 x 10000: no advance.
+    // The response reports 3000 more (template/tool-schema/system overhead
+    // the message-level estimate omits) -> est_offset = 3000. The identical
+    // re-send now measures (4059+3000)/10000 = 0.706 >= 0.70: the offset
+    // alone triggers the advance (to the K_cap at 10).
+    {
+        common_params p = make_params("shadow", 10000);
+        common_json body = make_body(make_messages(5, 3200));
+        const sigma_strip_result r1 =
+            sigma_strip_maybe_rewrite(nullptr, p, make_req("t-e1-1"), body, true);
+        CHECK(r1.eligible);
+        CHECK(r1.tokens_before == 4059);
+        CHECK(r1.usage_before < 0.70);
+        CHECK(r1.K == 0);
+        CHECK(!r1.k_advanced);
+        sigma_strip_note_response("t-e1-1", r1.tokens_before + 3000);
+        common_json body2 = make_body(make_messages(5, 3200));
+        const sigma_strip_result r2 =
+            sigma_strip_maybe_rewrite(nullptr, p, make_req("t-e1-1"), body2, true);
+        CHECK(r2.est_offset == 3000);
+        CHECK(r2.usage_before >= 0.70);
+        CHECK(r2.k_advanced);
+        CHECK(r2.K == 10);
+        CHECK(r2.n_stripped == 4);
+    }
+
+    // --- E1-2: prefix reset voids the est calibration ----------------------
+    // After the advance (K=10, off=3000) the client compacts (system prompt
+    // changed inside [0,K)) -> K resets and est_offset drops to 0; the
+    // request is judged on the raw estimate (0.406 < 0.70) until a fresh
+    // response re-anchors the offset.
+    {
+        common_params p = make_params("shadow", 10000);
+        common_json b1 = make_body(make_messages(5, 3200));
+        const sigma_strip_result r1 =
+            sigma_strip_maybe_rewrite(nullptr, p, make_req("t-e1-2"), b1, true);
+        sigma_strip_note_response("t-e1-2", r1.tokens_before + 3000);
+        common_json b2 = make_body(make_messages(5, 3200));
+        const sigma_strip_result r2 =
+            sigma_strip_maybe_rewrite(nullptr, p, make_req("t-e1-2"), b2, true);
+        CHECK(r2.k_advanced);
+        CHECK(r2.K == 10);
+        common_json b3 = make_body(make_messages(5, 3200, "A different system prompt."));
+        const sigma_strip_result r3 =
+            sigma_strip_maybe_rewrite(nullptr, p, make_req("t-e1-2"), b3, true);
+        CHECK(r3.prefix_reset);
+        CHECK(r3.est_offset == 0);
+        CHECK(r3.K == 0);
+        CHECK(!r3.k_advanced);
+        CHECK(r3.usage_before < 0.70);
+    }
+
+    // --- E1-3: K safety boundary (parallel tool group) ---------------------
+    // Layout: [0]=system [1]=user [2]=asst (2 parallel calls) [3]=tool
+    // [4]=tool [5]=asst [6]=tool. Raw estimate 7238 >= 0.70 x 10000, target
+    // 0.65 -> floor 6500 stops the raw advance at K2=4, inside the parallel
+    // group. K must roll back to the group-start assistant at 2 — never to a
+    // tool message — and the rollback is a no-op rewrite (nothing compactable
+    // below 2).
+    {
+        common_params p = make_params("shadow", 10000);
+        p.sigma_strip_target = 0.65;
+        common_json msgs = common_json::array();
+        auto add_asst_calls = [&msgs](const std::vector<std::string> & ids) {
+            common_json tcs = common_json::array();
+            for (const std::string & id : ids) {
+                common_json fn = common_json::object();
+                fn["name"] = std::string("read_file");
+                fn["arguments"] = std::string("{\"path\":\"/tmp/\"") + id.substr(5) + ".txt\"}";
+                common_json call = common_json::object();
+                call["id"] = id;
+                call["type"] = std::string("function");
+                call["function"] = fn;
+                tcs.push_back(call);
+            }
+            common_json m = common_json::object();
+            m["role"] = std::string("assistant");
+            m["content"] = std::string("");
+            m["tool_calls"] = tcs;
+            msgs.push_back(m);
+        };
+        auto add_tool = [&msgs](const std::string & tcid, const std::string & content) {
+            common_json m = common_json::object();
+            m["role"] = std::string("tool");
+            m["content"] = content;
+            m["tool_call_id"] = tcid;
+            m["name"] = std::string("read_file");
+            msgs.push_back(m);
+        };
+        {
+            common_json m = common_json::object();
+            m["role"] = std::string("system");
+            m["content"] = std::string("You are a coding agent.");
+            msgs.push_back(m);
+        }
+        {
+            common_json m = common_json::object();
+            m["role"] = std::string("user");
+            m["content"] = std::string("Do the task.");
+            msgs.push_back(m);
+        }
+        const std::string big(9600, 'x');
+        add_asst_calls({ "call_0", "call_1" });
+        add_tool("call_0", big);
+        add_tool("call_1", big);
+        add_asst_calls({ "call_2" });
+        add_tool("call_2", big);
+        common_json body = make_body(msgs);
+        const sigma_strip_result res =
+            sigma_strip_maybe_rewrite(nullptr, p, make_req("t-e1-3"), body, true);
+        CHECK(res.eligible);
+        CHECK(res.tokens_before == 7238);
+        CHECK(res.usage_before >= 0.70);
+        CHECK(res.k_advanced);
+        CHECK(res.K == 2);
+        // the invariant: K is 0 or points at a user/assistant message, so a
+        // future insertion at K cannot break tool_call_id pairing
+        const std::string roleK = msgs.at(res.K).at("role").get<std::string>();
+        CHECK(res.K == 0 || roleK == "user" || roleK == "assistant");
+        CHECK(res.n_stripped == 0);
+        CHECK(res.tokens_after == res.tokens_before);
+    }
+
+    // --- E1-4: the token floor runs in reported space ----------------------
+    // min_keep 6000 > target x window 3500. With est_offset 3000 the
+    // effective floor is floor_adj = 6000 - 3000 = 3000, so the advance goes
+    // further (K=8) than the raw floor 6000 would allow (K=4) and stops
+    // floor-limited.
+    {
+        common_params p = make_params("shadow", 10000);
+        p.sigma_strip_min_keep_tokens = 6000;
+        common_json b1 = make_body(make_messages(5, 4800));
+        const sigma_strip_result r1 =
+            sigma_strip_maybe_rewrite(nullptr, p, make_req("t-e1-4"), b1, true);
+        CHECK(r1.tokens_before == 6059);
+        CHECK(r1.K == 0);
+        CHECK(!r1.k_advanced);
+        sigma_strip_note_response("t-e1-4", r1.tokens_before + 3000);
+        common_json b2 = make_body(make_messages(5, 4800));
+        const sigma_strip_result r2 =
+            sigma_strip_maybe_rewrite(nullptr, p, make_req("t-e1-4"), b2, true);
+        CHECK(r2.est_offset == 3000);
+        CHECK(r2.k_advanced);
+        CHECK(r2.K == 8);
+        CHECK(r2.n_stripped == 3);
+        CHECK(r2.floor_limited);
+        CHECK(r2.target_unreachable);
     }
 
     if (n_failed) {

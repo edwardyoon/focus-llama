@@ -132,6 +132,13 @@ struct task_params {
     // exist first). Empty in Option C (prompt text reduction).
     std::vector<std::pair<int32_t, int32_t>> kv_hole_pending;
 
+    // sigma-strip (E1): session key carried from the request so the response
+    // path (send_final_response) can calibrate the session's est offset via
+    // sigma_strip_note_response. Resolved with kv_offload_resolve_session
+    // (same X-Session-Id / user fallback). note_response is a no-op for
+    // sessions that never went through sigma_strip_maybe_rewrite.
+    std::string sigma_session;
+
     int64_t t_max_prompt_ms  = -1; // TODO: implement
     int64_t t_max_predict_ms = -1; // if positive, limit the generation phase to this time limit
 
