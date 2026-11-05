@@ -1875,6 +1875,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_SIGMA_SUM_TIMEOUT_MS").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
+        {"--sigma-sum-fetch-cooldown-ms"}, "N",
+        "sigma-strip stage 2: cooldown in ms after a failed focus-memory /sigma/refresh before the next attempt (llm mode, default: 5000; 0 = retry every request)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("error: --sigma-sum-fetch-cooldown-ms must be >= 0 (got " + std::to_string(value) + ")");
+            }
+            params.sigma_sum_fetch_cooldown_ms = value;
+        }
+    ).set_env("LLAMA_ARG_SIGMA_SUM_FETCH_COOLDOWN_MS").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
         {"--sparse-gate-threshold"}, "PCT",
         "DA sparse FA gate: use the sparse (gather) path only while the finite KV rows are at most PCT% of the cache, dense below that (1-100, default: 50)",
         [](common_params & params, int value) {

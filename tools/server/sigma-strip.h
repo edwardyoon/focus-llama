@@ -111,3 +111,11 @@ void sigma_strip_note_response(
 // the same chain, so it is warned, not rejected. Empty when the feature
 // is off or has no window.
 std::string sigma_strip_config_check(const common_params & params);
+
+// Test-only fault injection (tests/test-sigma-strip.cpp): when on, the
+// stage-2 fetch in [B] throws before the HTTP request is sent, verifying
+// the fail-open path releases the per-session inflight flag. Compiled into
+// test builds only (SIGMA_STRIP_TESTS) — not part of the production binary.
+#ifdef SIGMA_STRIP_TESTS
+void sigma_strip_test_set_fetch_fault(bool on);
+#endif

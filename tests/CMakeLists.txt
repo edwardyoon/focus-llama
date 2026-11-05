@@ -187,6 +187,7 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-sigma-strip.cpp)
     target_include_directories(test-sigma-strip PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     target_link_libraries(test-sigma-strip PRIVATE server-context)
+    target_compile_definitions(test-sigma-strip PRIVATE SIGMA_STRIP_TESTS)
     llama_build_and_test(test-json-schema-to-grammar.cpp)
 
     if (NOT GGML_BACKEND_DL)

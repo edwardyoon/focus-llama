@@ -730,6 +730,9 @@ struct common_params {
     int32_t     sigma_sum_max_tokens = 0;
     // focus-memory /sigma/refresh timeout in ms (stage 2 "llm" mode).
     int32_t     sigma_sum_timeout_ms = 10000;
+    // Cooldown in ms after a failed focus-memory /sigma/refresh before the
+    // next attempt (stage 2 "llm" mode). 0 = retry on the next request.
+    int32_t     sigma_sum_fetch_cooldown_ms = 5000;
     // sparse FA gate (DA n_kv_max): the CUDA/Metal sparse (gather) path is used
     // only while the finite KV rows are at most this % of the cache; dense
     // below. Bridged to FOCUS_SPARSE_GATE_THRESHOLD in the server main (1-100).
