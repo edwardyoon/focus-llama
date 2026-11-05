@@ -12,9 +12,18 @@
 #include "server-http.h"
 #include "common.h"
 
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <functional>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 static int n_failed = 0;
@@ -47,6 +56,145 @@ static common_params make_params(const std::string & mode, int32_t window) {
     p.sigma_strip_window_tokens = window;
     return p;
 }
+
+// Minimal local HTTP server standing in for focus-memory's /sigma/refresh.
+// Records the parsed request (session/cut/wait) and answers with a
+// configured JSON body. Raw sockets (no httplib) so the test does not link
+// the server's http layer; the wire format is plain HTTP/1.1.
+struct llm_mock_request {
+    std::string session;
+    uint64_t    cut  = 0;
+    bool        wait = true;
+    bool        seen = false;
+};
+
+class llm_mock_server {
+public:
+    bool start() {
+        listen_fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (listen_fd_ < 0) return false;
+        int one = 1;
+        ::setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+        sockaddr_in a{};
+        a.sin_family = AF_INET;
+        a.sin_port = 0;                    // ephemeral port
+        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        if (::bind(listen_fd_, (sockaddr *) &a, sizeof(a)) != 0) return false;
+        if (::listen(listen_fd_, 16) != 0) return false;
+        socklen_t alen = sizeof(a);
+        if (::getsockname(listen_fd_, (sockaddr *) &a, &alen) != 0) return false;
+        port_ = ntohs(a.sin_port);
+        accept_thr_ = std::thread([this] { accept_loop(); });
+        return true;
+    }
+    void stop() {
+        if (listen_fd_ < 0) return;
+        // wake the accept loop: self-connect (it may be blocked in accept),
+        // then close the listener so the next accept returns -1
+        int c = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (c >= 0) {
+            sockaddr_in a{};
+            a.sin_family = AF_INET;
+            a.sin_port = htons(port_);
+            a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            ::connect(c, (sockaddr *) &a, sizeof(a));
+            ::close(c);
+        }
+        ::close(listen_fd_);
+        listen_fd_ = -1;
+        if (accept_thr_.joinable()) accept_thr_.join();
+    }
+    ~llm_mock_server() { stop(); }
+    std::string url() const { return "http://127.0.0.1:" + std::to_string(port_); }
+    void set_response(std::string r) {
+        std::lock_guard<std::mutex> lock(m_);
+        response_ = std::move(r);
+    }
+    bool wait_requests(size_t n, int timeout_ms) {
+        const auto deadline = std::chrono::steady_clock::now()
+                + std::chrono::milliseconds(timeout_ms);
+        for (;;) {
+            {
+                std::lock_guard<std::mutex> lock(m_);
+                if (requests_.size() >= n) return true;
+            }
+            if (std::chrono::steady_clock::now() >= deadline) return false;
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+    }
+    llm_mock_request last() {
+        std::lock_guard<std::mutex> lock(m_);
+        return requests_.empty() ? llm_mock_request() : requests_.back();
+    }
+private:
+    void accept_loop() {
+        for (;;) {
+            int c = ::accept(listen_fd_, nullptr, nullptr);
+            if (c < 0) break;
+            handle_one(c);
+        }
+    }
+    void handle_one(int c) {
+        std::string data;
+        char buf[4096];
+        size_t header_end = std::string::npos;
+        while (header_end == std::string::npos) {
+            const ssize_t r = ::recv(c, buf, sizeof(buf), 0);
+            if (r <= 0) { ::close(c); return; }   // includes the stop wakeup
+            data.append(buf, (size_t) r);
+            header_end = data.find("\r\n\r\n");
+        }
+        const size_t body_start = header_end + 4;
+        size_t body_len = 0;
+        const size_t cl_pos = data.find("Content-Length:");
+        if (cl_pos != std::string::npos) {
+            body_len = (size_t) std::strtoul(data.c_str() + cl_pos + 15, nullptr, 10);
+        }
+        while (data.size() < body_start + body_len) {
+            const ssize_t r = ::recv(c, buf, sizeof(buf), 0);
+            if (r <= 0) break;
+            data.append(buf, (size_t) r);
+        }
+        llm_mock_request rq;
+        try {
+            common_json j = common_json::parse(data.substr(body_start, body_len));
+            if (j.contains("session") && j["session"].is_string()) {
+                rq.session = j["session"].get<std::string>();
+            }
+            if (j.contains("cut") && j["cut"].is_number()) {
+                rq.cut = (uint64_t) j["cut"].get<uint64_t>();
+            }
+            if (j.contains("wait") && j["wait"].is_boolean()) {
+                rq.wait = j["wait"].get<bool>();
+            }
+            rq.seen = true;
+        } catch (const std::exception &) {
+            rq.session = "<parse error>";
+        }
+        std::string resp;
+        {
+            std::lock_guard<std::mutex> lock(m_);
+            requests_.push_back(rq);
+            resp = response_;
+        }
+        const std::string out = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                "Content-Length: " + std::to_string(resp.size()) + "\r\n"
+                "Connection: close\r\n\r\n" + resp;
+        size_t off = 0;
+        while (off < out.size()) {
+            const ssize_t w = ::send(c, out.data() + off, out.size() - off, 0);
+            if (w <= 0) break;
+            off += (size_t) w;
+        }
+        ::close(c);
+    }
+    int          listen_fd_ = -1;
+    uint16_t     port_      = 0;
+    std::thread  accept_thr_;
+    std::mutex   m_;
+    std::string  response_ = R"({"block":"","partial":false})";
+    std::vector<llm_mock_request> requests_;
+};
 
 // system + user + n_rounds x (assistant tool_call + tool result).
 // Each result is result_chars of 'x' -> byte/4 estimate = result_chars/4.
@@ -96,6 +244,68 @@ static common_json make_body(const common_json & messages) {
     common_json body = common_json::object();
     body["messages"] = messages;
     return body;
+}
+
+// Stage-2 params: window 3000, target 0.35 (floor 1050), Σ rule mode with a
+// 500-token block budget -> compute_k_sum's floor2 = 1050 - 500 = 550.
+static common_params make_sum_params(const std::string & mode) {
+    common_params p = make_params(mode, 3000);
+    p.sigma_strip_target = 0.35;
+    p.sigma_strip_min_keep_tokens = 0;
+    p.sigma_strip_keep_recent = 1;
+    p.sigma_sum_mode = std::string("rule");
+    p.sigma_sum_max_tokens = 500;
+    return p;
+}
+
+// Stage-2 scenario, 13 messages:
+//   [0]=system [1]=user1 (20000 chars = 5000 tok)
+//   [2]=asst tc call_0 [3]=tool 8000 'x' [4]=asst tc call_1 [5]=tool 8000 'x'
+//   [6]=asst text [7]=user2 [8]=asst tc call_2 [9]=tool 200 'x'
+//   [10]=asst text [11]=user3 [12]=asst text
+// keep_recent=1 -> K_cap = 8 (the last tool round starts at 8). Stage 1
+// stalls at K=8 target_unreachable (the protected 2000-tok result at 9 keeps
+// the prompt above the 1050 target). Stage 2: user boundaries in [1,8] are
+// 1 and 7; at b=7, system + suffix[7] ~= 7 + 145 <= 550 -> K_sum = 7.
+static common_json make_sum_scenario() {
+    common_json msgs = common_json::array();
+    auto add = [&msgs](const std::string & role, const std::string & content,
+                       const std::string & tcid = "", const std::string & path = "") {
+        common_json m = common_json::object();
+        m["role"] = role;
+        m["content"] = content;
+        if (!tcid.empty() && role == "assistant") {
+            common_json fn = common_json::object();
+            fn["name"] = std::string("read_file");
+            fn["arguments"] = std::string("{\"path\":\"") + path + "\"}";
+            common_json call = common_json::object();
+            call["id"] = tcid;
+            call["type"] = std::string("function");
+            call["function"] = fn;
+            common_json tcs = common_json::array();
+            tcs.push_back(call);
+            m["tool_calls"] = tcs;
+        }
+        if (!tcid.empty() && role == "tool") {
+            m["tool_call_id"] = tcid;
+            m["name"] = std::string("read_file");
+        }
+        msgs.push_back(m);
+    };
+    add("system", "You are a coding agent.");
+    add("user", std::string(20000, 'a'));
+    add("assistant", "", "call_0", "/tmp/a.txt");
+    add("tool", std::string(8000, 'x'), "call_0", "");
+    add("assistant", "", "call_1", "/tmp/b.txt");
+    add("tool", std::string(8000, 'x'), "call_1", "");
+    add("assistant", "First answer.");
+    add("user", "SECOND_MARKER " + std::string(88, 'q'));
+    add("assistant", "", "call_2", "/tmp/c.txt");
+    add("tool", std::string(200, 'x'), "call_2", "");
+    add("assistant", "Second answer.");
+    add("user", std::string(100, 'r'));
+    add("assistant", "Third answer.");
+    return msgs;
 }
 
 int main() {
@@ -611,6 +821,240 @@ int main() {
         CHECK(r2.n_stripped == 3);
         CHECK(r2.floor_limited);
         CHECK(r2.target_unreachable);
+    }
+
+    // --- stage 2 (rule): target_unreachable -> removal of [0,K_sum) + block -
+    // Stage 1 stalls at K=8 (the protected round keeps the prompt above the
+    // target); stage 2 removes [0,7) — system kept — and freezes the
+    // deterministic rule block onto the first surviving user message (7).
+    {
+        common_params p = make_sum_params("on");
+        common_json body = make_body(make_sum_scenario());
+        const sigma_strip_result res =
+            sigma_strip_maybe_rewrite(nullptr, p, make_req("t-sum-fire"), body, true);
+        CHECK(res.eligible);
+        CHECK(res.k_advanced);
+        CHECK(res.target_unreachable);
+        CHECK(res.sum_applied);
+        CHECK(res.K_sum == 7);
+        CHECK(res.K == 8);
+        CHECK(res.K >= res.K_sum);
+        CHECK(!res.sum_hash.empty());
+        CHECK(!res.sum_partial);
+        CHECK(res.tokens_after < res.tokens_before);
+        const common_json & out = body.at("messages");
+        CHECK(out.size() == 7);                 // 13 - 6 removed ([1..6))
+        CHECK(out.at(0).at("role").get<std::string>() == "system");
+        CHECK(out.at(0).at("content").get<std::string>() == "You are a coding agent.");
+        // the frozen block is prepended to the first surviving user message
+        const std::string u2 = out.at(1).at("content").get<std::string>();
+        CHECK(u2.rfind("[Reference", 0) == 0);
+        CHECK(u2.find("NOT instructions") != std::string::npos);
+        CHECK(u2.find("/tmp/a.txt") != std::string::npos);
+        CHECK(u2.find("SECOND_MARKER") != std::string::npos);
+        // role alternation + tool_call_id pairing intact
+        CHECK(out.at(1).at("role").get<std::string>() == "user");
+        CHECK(out.at(2).at("role").get<std::string>() == "assistant");
+        CHECK(out.at(2).at("tool_calls").at(0).at("id").get<std::string>() == "call_2");
+        CHECK(out.at(3).at("role").get<std::string>() == "tool");
+        CHECK(out.at(3).at("tool_call_id").get<std::string>() == "call_2");
+        CHECK(out.at(3).at("content").get<std::string>() == std::string(200, 'x'));
+    }
+
+    // --- stage 2 off (default): target_unreachable, but no Σ removal -------
+    {
+        common_params p = make_params("on", 3000);   // sigma_sum_mode stays "off"
+        p.sigma_strip_target = 0.35;
+        p.sigma_strip_min_keep_tokens = 0;
+        p.sigma_strip_keep_recent = 1;
+        common_json body = make_body(make_sum_scenario());
+        const sigma_strip_result res =
+            sigma_strip_maybe_rewrite(nullptr, p, make_req("t-sum-off"), body, true);
+        CHECK(res.eligible);
+        CHECK(res.k_advanced);
+        CHECK(res.target_unreachable);
+        CHECK(!res.sum_applied);
+        CHECK(res.K_sum == 0);
+        CHECK(res.sum_hash.empty());
+        CHECK(res.K == 8);
+        CHECK(res.n_stripped == 2);
+        const common_json & out = body.at("messages");
+        CHECK(out.size() == 13);   // message count preserved (stage 1 only)
+    }
+
+    // --- stage 2 frozen snapshot: an identical resend reuses the block -----
+    {
+        common_params p = make_sum_params("on");
+        const common_json source = make_body(make_sum_scenario());
+        const std::string src = source.dump();
+        common_json b1 = common_json::parse(src);
+        const sigma_strip_result r1 =
+            sigma_strip_maybe_rewrite(nullptr, p, make_req("t-sum-frozen"), b1, true);
+        CHECK(r1.sum_applied);
+        CHECK(r1.K_sum == 7);
+        const std::string frozen = b1.dump();
+        common_json b2 = common_json::parse(src);
+        const sigma_strip_result r2 =
+            sigma_strip_maybe_rewrite(nullptr, p, make_req("t-sum-frozen"), b2, true);
+        CHECK(!r2.prefix_reset);
+        CHECK(!r2.k_advanced);
+        CHECK(r2.sum_applied);            // committed block re-applied
+        CHECK(r2.K_sum == r1.K_sum);
+        CHECK(r2.sum_hash == r1.sum_hash); // frozen, byte-identical
+        CHECK(r2.sum_fetch_ms == 0);       // no re-fetch
+        CHECK(b2.dump() == frozen);        // byte-identical rewrite
+    }
+
+    // --- stage 2 prefix reset: a changed system prompt voids the snapshot --
+    {
+        common_params p = make_sum_params("on");
+        common_json b1 = make_body(make_sum_scenario());
+        const sigma_strip_result r1 =
+            sigma_strip_maybe_rewrite(nullptr, p, make_req("t-sum-reset"), b1, true);
+        CHECK(r1.sum_applied);
+        CHECK(r1.K_sum == 7);
+        // client compact: the system prompt changes inside [0,K)
+        common_json b2 = make_body(make_sum_scenario());
+        b2.at("messages").at(0).at("content") = std::string("A different system prompt.");
+        const sigma_strip_result r2 =
+            sigma_strip_maybe_rewrite(nullptr, p, make_req("t-sum-reset"), b2, true);
+        CHECK(r2.prefix_reset);
+        CHECK(r2.sum_applied);             // re-fires on the new prefix
+        CHECK(r2.K_sum == r1.K_sum);
+        CHECK(r2.sum_hash == r1.sum_hash); // same removed region -> same block
+    }
+
+    // --- stage 2 shadow: computed and logged, body untouched ----------------
+    {
+        common_params p = make_sum_params("shadow");
+        common_json body = make_body(make_sum_scenario());
+        const std::string before = body.dump();
+        const sigma_strip_result res =
+            sigma_strip_maybe_rewrite(nullptr, p, make_req("t-sum-shadow"), body, true);
+        CHECK(res.eligible);
+        CHECK(res.sum_applied);
+        CHECK(res.K_sum == 7);
+        CHECK(body.dump() == before);   // shadow: body untouched
+    }
+
+    // --- stage 2 llm: the fetched block replaces the rule block -------------
+    // The mock focus-memory answers wait:true with a rendered block; it is
+    // committed and prepended to the first surviving user message, and the
+    // request carried session + cut=K_sum + wait:true.
+    {
+        llm_mock_server mock;
+        CHECK(mock.start());
+        mock.set_response(R"({"block":"LLM_BLOCK_MARKER summary of the removed region","partial":false})");
+        common_params p = make_sum_params("on");
+        p.sigma_sum_mode = "llm";
+        p.focus_memory_host = mock.url();
+        common_json body = make_body(make_sum_scenario());
+        const sigma_strip_result res =
+            sigma_strip_maybe_rewrite(nullptr, p, make_req("t-sum-llm"), body, true);
+        CHECK(res.eligible);
+        CHECK(res.target_unreachable);
+        CHECK(res.sum_applied);
+        CHECK(res.K_sum == 7);
+        CHECK(res.K == 8);
+        CHECK(!res.sum_partial);
+        CHECK(res.sum_fail == 0);
+        CHECK(!res.sum_hash.empty());
+        CHECK(res.tokens_after < res.tokens_before);
+        const common_json & out = body.at("messages");
+        CHECK(out.size() == 7);
+        CHECK(out.at(0).at("role").get<std::string>() == "system");
+        const std::string u2 = out.at(1).at("content").get<std::string>();
+        CHECK(u2.rfind("LLM_BLOCK_MARKER", 0) == 0);   // fetched block, not the rule block
+        CHECK(u2.find("[Reference") == std::string::npos);
+        CHECK(u2.find("SECOND_MARKER") != std::string::npos);
+        CHECK(mock.wait_requests(1, 2000));
+        const llm_mock_request rq = mock.last();
+        CHECK(rq.seen);
+        CHECK(rq.session == "t-sum-llm");
+        CHECK(rq.cut == 7);
+        CHECK(rq.wait == true);
+    }
+
+    // --- stage 2 llm: a partial block is accepted and flagged ---------------
+    {
+        llm_mock_server mock;
+        CHECK(mock.start());
+        mock.set_response(R"({"block":"LLM_PARTIAL_MARKER","partial":true})");
+        common_params p = make_sum_params("on");
+        p.sigma_sum_mode = "llm";
+        p.focus_memory_host = mock.url();
+        common_json body = make_body(make_sum_scenario());
+        const sigma_strip_result res =
+            sigma_strip_maybe_rewrite(nullptr, p, make_req("t-sum-llm-partial"), body, true);
+        CHECK(res.sum_applied);
+        CHECK(res.sum_partial);
+        CHECK(res.sum_fail == 0);
+        CHECK(res.K_sum == 7);
+    }
+
+    // --- stage 2 llm: failures hold stage 2, 3 strikes -> rule fallback -----
+    // An empty block is a fetch failure. While the consecutive-failure count
+    // is below 3 the request passes through on stage-1 only (no removal);
+    // the 4th fire (3 failures already recorded) commits the deterministic
+    // rule block instead and resets the counter.
+    {
+        llm_mock_server mock;
+        CHECK(mock.start());
+        mock.set_response(R"({"block":"","partial":false})");
+        common_params p = make_sum_params("on");
+        p.sigma_sum_mode = "llm";
+        p.focus_memory_host = mock.url();
+        for (int i = 1; i <= 3; ++i) {
+            common_json body = make_body(make_sum_scenario());
+            const sigma_strip_result r =
+                sigma_strip_maybe_rewrite(nullptr, p, make_req("t-sum-llm-fail"), body, true);
+            CHECK(r.eligible);
+            CHECK(r.target_unreachable);
+            CHECK(!r.sum_applied);
+            CHECK(r.K == 8);
+            CHECK(r.sum_fail == i);
+            CHECK(body.at("messages").size() == 13);   // stage 1 only: no removal
+        }
+        common_json body = make_body(make_sum_scenario());
+        const sigma_strip_result r =
+            sigma_strip_maybe_rewrite(nullptr, p, make_req("t-sum-llm-fail"), body, true);
+        CHECK(r.sum_applied);
+        CHECK(r.K_sum == 7);
+        CHECK(r.sum_fail == 0);                        // fallback reset the counter
+        const std::string u2 = body.at("messages").at(1).at("content").get<std::string>();
+        CHECK(u2.rfind("[Reference", 0) == 0);         // the deterministic rule block
+        CHECK(mock.wait_requests(4, 2000));
+        const llm_mock_request rq = mock.last();
+        CHECK(rq.session == "t-sum-llm-fail");
+        CHECK(rq.cut == 7);
+        CHECK(rq.wait == true);
+    }
+
+    // --- stage 2 llm: a stage-1 advance fires the async wait:false refresh --
+    // Stage 1 reaches the target (no stage-2 fire); the background absorption
+    // POSTs /sigma/refresh with wait:false and cut = st.K.
+    {
+        llm_mock_server mock;
+        CHECK(mock.start());
+        common_params p = make_params("on", 10000);
+        p.sigma_strip_target = 0.55;
+        p.sigma_sum_mode = "llm";
+        p.focus_memory_host = mock.url();
+        common_json body = make_body(make_messages(5, 8000));
+        const sigma_strip_result res =
+            sigma_strip_maybe_rewrite(nullptr, p, make_req("t-sum-llm-async"), body, true);
+        CHECK(res.eligible);
+        CHECK(res.k_advanced);
+        CHECK(res.K == 8);
+        CHECK(!res.target_unreachable);
+        CHECK(!res.sum_applied);                       // stage 2 never fired
+        CHECK(mock.wait_requests(1, 2000));
+        const llm_mock_request rq = mock.last();
+        CHECK(rq.seen);
+        CHECK(rq.session == "t-sum-llm-async");
+        CHECK(rq.cut == 8);
+        CHECK(rq.wait == false);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));  // let the detached thread finish
     }
 
     if (n_failed) {

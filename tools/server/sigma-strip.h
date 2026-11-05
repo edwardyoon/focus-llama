@@ -18,7 +18,10 @@
 // prefix cacheable.
 //
 // Modes: off (default, no-op), shadow (compute + log only, body untouched),
-// on (rewrites body["messages"] in place; the refresh/Σ wiring is step 3).
+// on (rewrites body["messages"] in place). Stage 2 (--sigma-sum
+// off|rule|llm) adds whole-message removal of [0,K_sum) + a frozen Σ block:
+// rule = deterministic local block, llm = fetched from focus-memory
+// /sigma/refresh (rule fallback after repeated failures).
 //
 // Fail-open: any anomaly (no messages, no session key, malformed JSON,
 // exception) leaves the request untouched.
@@ -53,6 +56,17 @@ struct sigma_strip_result {
     double      usage_after        = 0.0;   // (tokens_after + est_offset) / window after this request
     int64_t     est_offset         = 0;     // reported-space offset applied to this request's gate/floors
     std::string rewrite_hash;               // hash16 of the rewritten messages dump ("" when not eligible)
+    // stage 2 (Σ block, plans/sigma_strip_compaction.md): whole-message removal
+    // of [0,K_sum) + a frozen Σ block prepended to the first surviving user
+    // message. sum_applied means the block was committed this request (or was
+    // already committed and re-applied); K_sum/sum_hash describe the committed
+    // boundary/snapshot after this request.
+    bool        sum_applied        = false; // stage 2 in effect for this request's rewrite
+    size_t      K_sum              = 0;     // committed removal boundary after this request
+    std::string sum_hash;                  // hash16 of the frozen Σ block ("" when none committed)
+    int64_t     sum_fetch_ms       = 0;     // Σ block generation/fetch time (rule: local gen)
+    bool        sum_partial        = false; // block was partial (llm mode)
+    int         sum_fail           = 0;     // consecutive stage-2 fetch failures (0 = healthy)
     std::string session;
 };
 
