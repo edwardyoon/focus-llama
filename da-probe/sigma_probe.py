@@ -489,11 +489,13 @@ class Probe:
 
         res6 = self.chat(r4, s)
         l6, _ = self.sigma_line(s)
-        self.check("S6 성장(R3+ack+user): adv=0, usage<임계 (resident 기준)",
+        # no-advance 라인: usage_before/after=(resident+off)/window=raw 재전송 크기(off 포함)
+        # → 임계 비교 불가. 재전진 회귀의 실질 검증: adv=0 + K 안정 + strip 유효(tokens_after<raw)
+        self.check("S6 성장(R3+ack+user): adv=0 K 안정, strip 유효 (raw 재전진 회귀)",
                    l6 and l3 and l6["advanced"] == 0 and l6["K"] == l3["K"]
-                   and l6["usage_before"] < THRESHOLD,
-                   f"K={l6['K']}/{l6['n']} usage_before={l6['usage_before']:.3f} "
-                   f"(raw={l6['tokens_before']})" if l6 else "no log line")
+                   and l6["tokens_after"] < l6["tokens_before"],
+                   f"K={l6['K']}/{l6['n']} tokens {l6['tokens_before']}->{l6['tokens_after']} "
+                   f"(raw usage_before={l6['usage_before']:.3f})" if l6 else "no log line")
 
     def case_reset(self, r3, r5):
         s = self.sess("reset")
@@ -711,13 +713,14 @@ class Probe:
                        f"timings.cache_n 부재 — timings keys={sorted(res3['timings'].keys())} "
                        f"(TTFT로 간접 확인: O3 wall={res3['wall']:.1f}s)", inconclusive=True)
 
-        # O4 — 성장: adv=0, usage 작게 유지, 캐시 적중
+        # O4 — 성장: adv=0, strip 유효, 캐시 적중
+        # no-advance: usage_before=(resident+off)/window=raw 재전송 크기(off 포함) → 임계 비교 불가
         res4 = self.chat(r4, s)
         l4, _ = self.sigma_line(s)
-        self.check("O4 성장: adv=0, K 안정, usage<임계",
+        self.check("O4 성장: adv=0, K 안정, strip 유효 (tokens_after<raw)",
                    l4 and l2 and l4["advanced"] == 0 and l4["K"] == l2["K"]
-                   and l4["usage_before"] < THRESHOLD,
-                   f"K={l4['K']}/{l4['n']} usage_before={l4['usage_before']:.3f} "
+                   and l4["tokens_after"] < l4["tokens_before"],
+                   f"K={l4['K']}/{l4['n']} tokens {l4['tokens_before']}->{l4['tokens_after']} "
                    f"api={res4['prompt_tokens']}" if l4 else "no log line")
         if res2["prompt_tokens"] and res4["cache_n"] is not None:
             self.check("O4 캐시 적중: 접두어(W3) 재사용",
