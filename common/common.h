@@ -720,6 +720,16 @@ struct common_params {
     // Client context-window size in tokens (the usage denominator). 0 = no
     // denominator, the feature stays inactive even in shadow/on mode.
     int32_t     sigma_strip_window_tokens  = 0;
+    // Sigma-strip stage 2 (plans/sigma_strip_compaction.md): whole-message
+    // removal of the older region [0,K_sum) replaced by a frozen Σ block.
+    // "off" (default) = stage 2 disabled (stage 1 only); "rule" = the server
+    // generates the block deterministically from the removed messages (no
+    // focus-memory); "llm" = fetch the block from focus-memory (step 4).
+    std::string sigma_sum_mode = "off";
+    // Token budget for the Σ block (stage 2). 0 = a sensible default is used.
+    int32_t     sigma_sum_max_tokens = 0;
+    // focus-memory /sigma/refresh timeout in ms (stage 2 "llm" mode).
+    int32_t     sigma_sum_timeout_ms = 10000;
     // sparse FA gate (DA n_kv_max): the CUDA/Metal sparse (gather) path is used
     // only while the finite KV rows are at most this % of the cache; dense
     // below. Bridged to FOCUS_SPARSE_GATE_THRESHOLD in the server main (1-100).

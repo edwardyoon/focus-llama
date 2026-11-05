@@ -23,8 +23,10 @@ v2에서 추가된 검증 (v1의 허점 보강):
   - 역사 축소(클라이언트 compact 모사): reset=1 (지문 불일치 감지)
   - 병렬 tool 라운드 2개: 첫 쌍 stub + 마지막 라운드 K cap(현재 턴) 보호,
     target_unreachable (native compact 위임 시그널)
+  - stage-2(Σ 블록): target_unreachable + 서버 --sigma-sum rule/llm이면
+    [0,K_sum) 영역 전체 제거 → 동결 Σ 블록으로 교체 (U1-U3, O6).
+    서비스 --sigma-sum off면 K_sum=0 sum=0 → INCONCLUSIVE(설정 힌트)
   - SESSION은 실행마다 uuid (K 영속화 이후 재실행 안전)
-  - Σ 스냅샷: refresh 연동 전이라 SKIP (연동 후 케이스 추가 필요)
 
 케이스 (모드별, 각각 독립 uuid 세션):
   shadow:
@@ -37,11 +39,17 @@ v2에서 추가된 검증 (v1의 허점 보강):
                C3(+reasoning_content: delta = reasoning 효과, 갭 재현)
     parallel : P1(병렬 라운드 2개 → 첫 쌍 stub, K=7/10 cap, target_unreachable,
                본체 미변경)
+    sum      : S13(13 메시지: 대형 user1 + 대형 tool 2개 + 작은 마지막 라운드)
+               U1(발화: K_sum=7 sum=1 target_unreachable, 본체 미변경)
+               U2(동결 재전송: block 동일 fetch_ms=0)
+               U3(system 변경 → reset=1, K_sum 재발화, block 동일)
   on:
     base     : O1(R1: 미변경+오버헤드 측정) O2(R3: F2 급감+정합성)
                O3(R3 재전송: advanced=0, cache_n≈O2) O4(R4 성장: advanced=0,
                usage 작게 유지, cache_n≈O2)
     parallel : P1(첫 병렬 쌍 stub, F2 급감, K=7/10 cap, 응답 non-empty)
+    sum      : S13(O6: stage-2 발화 K_sum=7 sum=1, F2 급감 api<25% raw,
+               응답 non-empty)
 
 참고:
   - 대상 모델이 E2B(Gemma)면 토크나이저/템플릿이 프로덕션(Qwen)과 다르다.
@@ -70,13 +78,16 @@ WINDOW = 60000   # e2b.service --sigma-strip-window-tokens
 THRESHOLD = 0.58  # e2b.service --sigma-strip-threshold (트리거점 34.8k)
 CONSISTENCY_PCT = 2.0  # |est - api| / api 허용
 
-# rewrite= 필드 뒤에 줄바꿈이 없어 다음 로그 엔트리의 타임스탬프
-# (0.05.432.784 형식)가 붙는다 — kv_offload_hash16의 16hex 해시로 앵커
-# (타임스탬프는 점을 포함해 16연속 hex를 만들 수 없음).
+# rewrite=/block= 필드는 비어 있을 수 있다 (rewrite 미발생, Σ 미적용).
+# 뒤에 ` sum=` 같은 명확한 구분자가 이어지므로 16hex가 없어도 매칭된다.
+# stage-2(Σ) 필드: K_sum, off, sum, block, fetch_ms, partial, fail +
+# 접미사 target-unreachable / floor-limited (sigma-strip.cpp:1183).
 LOG_RE = re.compile(
-    r"sigma-strip: session=(\S+) mode=(\S+) K=(\d+)/(\d+) reset=(\d) "
-    r"advanced=(\d) stripped=(\d+) tokens (\d+)->(\d+) usage ([\d.]+)->([\d.]+) "
-    r"rewrite=([0-9a-f]{16})?( target-unreachable)?")
+    r"sigma-strip: session=(\S+) mode=(\S+) K=(\d+)/(\d+) K_sum=(\d+) "
+    r"reset=(\d) advanced=(\d) stripped=(\d+) tokens (\d+)->(\d+) "
+    r"usage ([\d.]+)->([\d.]+) off=(-?\d+) rewrite=([0-9a-f]{16})? "
+    r"sum=(\d+) block=([0-9a-f]{16})? fetch_ms=(-?\d+) partial=(\d) fail=(\d)"
+    r"( target-unreachable)?( floor-limited)?")
 
 # ---------------------------------------------------------------------------
 # fixtures
@@ -270,6 +281,43 @@ def build_parallel():
     ]
 
 
+def build_sum_scenario():
+    """S13 — stage-2(Σ 블록) fixture, 13 메시지 (window 60000, 임계 0.58, target 0.35).
+
+    [0]=system [1]=user1(대형 — stage 1이 줄 수 없는 user 메시지)
+    [2]=asst tc call_s0 [3]=tool(대형, stage 1 stub) [4]=asst tc call_s1 [5]=tool(대형, stage 1 stub)
+    [6]=asst text [7]=user2 [8]=asst tc call_s2 [9]=tool(작은 — 마지막 라운드, K_cap 보호)
+    [10]=asst text [11]=user3 [12]=asst text
+
+    keep_recent=1 → K_cap=8(마지막 tool 라운드 시작). stage 1은 3,5를 stub하지만
+    user1(대형 user)은 줄 수 없어 잔여 ~30.8k > target 21k → target_unreachable.
+    stage 2: [1,8]의 user 경계는 1,7. b=1은 system+suffix[1]≈raw(43k) > floor2(19.5k)
+    미달, b=7은 system+suffix[7]≈450 <= floor2 → K_sum=7.
+    rewrite: [0,7) 제거(system 유지) + 동결 Σ 블록을 첫 생존 user(7)에 전치 → 7 메시지.
+    """
+    return [
+        {"role": "system", "content": SYSTEM},
+        {"role": "user", "content": filler(130000, seed=21)},
+        {"role": "assistant", "content": None,
+         "tool_calls": [tc("call_s0", "read_file", {"file_path": "/tmp/s0.txt"})]},
+        {"role": "tool", "tool_call_id": "call_s0", "name": "read_file",
+         "content": filler(28000, seed=22)},
+        {"role": "assistant", "content": None,
+         "tool_calls": [tc("call_s1", "read_file", {"file_path": "/tmp/s1.txt"})]},
+        {"role": "tool", "tool_call_id": "call_s1", "name": "read_file",
+         "content": filler(28000, seed=23)},
+        {"role": "assistant", "content": "Read the first two files."},
+        {"role": "user", "content": "Now read /tmp/s2.txt."},
+        {"role": "assistant", "content": None,
+         "tool_calls": [tc("call_s2", "read_file", {"file_path": "/tmp/s2.txt"})]},
+        {"role": "tool", "tool_call_id": "call_s2", "name": "read_file",
+         "content": filler(800, seed=24)},
+        {"role": "assistant", "content": "Read /tmp/s2.txt."},
+        {"role": "user", "content": "Summarize what you found across the three files."},
+        {"role": "assistant", "content": "I found the data spread across the three files."},
+    ]
+
+
 # ---------------------------------------------------------------------------
 # probe
 # ---------------------------------------------------------------------------
@@ -341,12 +389,18 @@ class Probe:
         return {
             "session": m.group(1), "mode": m.group(2),
             "K": int(m.group(3)), "n": int(m.group(4)),
-            "reset": int(m.group(5)), "advanced": int(m.group(6)),
-            "stripped": int(m.group(7)),
-            "tokens_before": int(m.group(8)), "tokens_after": int(m.group(9)),
-            "usage_before": float(m.group(10)), "usage_after": float(m.group(11)),
-            "rewrite": m.group(12) or "",
-            "target_unreachable": bool(m.group(13)),
+            "K_sum": int(m.group(5)),
+            "reset": int(m.group(6)), "advanced": int(m.group(7)),
+            "stripped": int(m.group(8)),
+            "tokens_before": int(m.group(9)), "tokens_after": int(m.group(10)),
+            "usage_before": float(m.group(11)), "usage_after": float(m.group(12)),
+            "off": int(m.group(13)),
+            "rewrite": m.group(14) or "",
+            "sum": int(m.group(15)), "block": m.group(16) or "",
+            "fetch_ms": int(m.group(17)),
+            "partial": int(m.group(18)), "fail": int(m.group(19)),
+            "target_unreachable": bool(m.group(20)),
+            "floor_limited": bool(m.group(21)),
         }
 
     def chat(self, messages, session, max_tokens=48, extra=None):
@@ -534,6 +588,58 @@ class Probe:
                    (res["prompt_tokens"] or 0) > 15000,
                    f"api={res['prompt_tokens']}")
 
+    def _sum_gate(self, l):
+        """stage-2(Σ) 활성화 여부 — 서비스가 --sigma-sum rule/llm 인지.
+
+        비활성(off)이면 K_sum=0, sum=0 → (False, 설정 힌트)로 INCONCLUSIVE 처리.
+        """
+        if not l:
+            return False, "no log line"
+        if l["K_sum"] > 0 or l["sum"] > 0:
+            return True, ""
+        return (False, "서버 --sigma-sum off (K_sum=0 sum=0) — "
+                       "e2b-test.env에 LLAMA_ARG_SIGMA_SUM=rule 설정 후 재시작 필요")
+
+    def case_sum_shadow(self, s13):
+        s = self.sess("sum")
+        # U1 — stage-2 발화: K_sum=7, sum=1, target_unreachable, 본체 미변경(shadow)
+        res1 = self.chat(s13, s)
+        l1, _ = self.sigma_line(s)
+        on, hint = self._sum_gate(l1)
+        if not on:
+            self.check("U1 stage-2 발화(K_sum=7 sum=1)", False, hint, inconclusive=True)
+            return
+        self.check("U1 stage-2 발화: adv=1 K_sum=7 sum=1 target_unreachable",
+                   l1["advanced"] == 1 and l1["K_sum"] == 7 and l1["sum"] == 1
+                   and l1["target_unreachable"] and l1["K"] >= l1["K_sum"],
+                   f"K={l1['K']}/{l1['n']} K_sum={l1['K_sum']} "
+                   f"tokens {l1['tokens_before']}->{l1['tokens_after']} "
+                   f"block={l1['block'][:12]}")
+        self.check("U1 shadow 본체 미변경 (api=raw)",
+                   (res1["prompt_tokens"] or 0) > 20000,
+                   f"api={res1['prompt_tokens']} (raw est={l1['tokens_before']})")
+
+        # U2 — 동결 스냅샷: 동일 재전송 → K_sum/sum 유지, block hash 동일, fetch_ms=0
+        self.chat(s13, s)
+        l2, _ = self.sigma_line(s)
+        self.check("U2 동결 재전송: adv=0 K_sum=7 sum=1 block 동일 fetch_ms=0",
+                   l2 and l1 and l2["advanced"] == 0 and l2["K_sum"] == 7 and l2["sum"] == 1
+                   and l2["block"] != "" and l2["block"] == l1["block"] and l2["fetch_ms"] == 0,
+                   f"K_sum={l2['K_sum']} block={l2['block'][:12] if l2 else '?'} "
+                   f"fetch_ms={l2['fetch_ms'] if l2 else '?'}" if l2 else "no log line")
+
+        # U3 — prefix reset: system 변경 → reset=1, K_sum 재발화(7), block 동일(제거 영역 동일)
+        s13_reset = [dict(m) for m in s13]
+        s13_reset[0] = dict(s13_reset[0], content="(compacted) system prompt changed.")
+        self.chat(s13_reset, s)
+        l3, _ = self.sigma_line(s)
+        self.check("U3 system 변경: reset=1, K_sum 재발화(7), block 동일",
+                   l3 and l3["reset"] == 1 and l3["K_sum"] == 7 and l3["sum"] == 1
+                   and l3["block"] == l1["block"],
+                   f"reset={l3['reset'] if l3 else '?'} K_sum={l3['K_sum'] if l3 else '?'} "
+                   f"block={l3['block'][:12] if l3 else '?'}/{l1['block'][:12]}"
+                   if l3 else "no log line")
+
     # -- on cases -----------------------------------------------------------
 
     def case_base_on(self, r1, r3, r4):
@@ -645,14 +751,47 @@ class Probe:
             self.check("O5 응답 non-empty (마지막 병렬 라운드 보존)", False,
                        f"wall={res['wall']:.1f}s text='' finish_reason={res['finish_reason']}")
 
+    def case_sum_on(self, s13):
+        s = self.sess("sumon")
+        res = self.chat(s13, s, max_tokens=64)
+        l, _ = self.sigma_line(s)
+        on, hint = self._sum_gate(l)
+        if not on:
+            self.check("O6 stage-2 발화(K_sum=7 sum=1)", False, hint, inconclusive=True)
+            return
+        self.check("O6 stage-2 발화: adv=1 K_sum=7 sum=1 target_unreachable mode=on",
+                   l["advanced"] == 1 and l["K_sum"] == 7 and l["sum"] == 1
+                   and l["target_unreachable"] and l["mode"] == "on" and l["K"] >= l["K_sum"],
+                   f"K={l['K']}/{l['n']} K_sum={l['K_sum']} "
+                   f"tokens {l['tokens_before']}->{l['tokens_after']}")
+        if res["prompt_tokens"]:
+            # 급감 = raw 대비 — stage 2는 [0,7) 대형 영역 전체 제거(stage 1만이면 ~30k 잔여).
+            # api는 ~tokens_after(≈1.2k) + 오버헤드 → raw(43k)의 25% 미만.
+            self.check("O6 F2: api 급감 (stage 2 영역 제거)",
+                       50 < res["prompt_tokens"] < l["tokens_before"] * 0.25,
+                       f"api={res['prompt_tokens']} (raw est={l['tokens_before']}, "
+                       f"tokens_after={l['tokens_after']})")
+        t = res["text"].strip()
+        if t:
+            self.check("O6 응답 non-empty (rewrite well-formed)", True,
+                       f"wall={res['wall']:.1f}s text={t[:60]!r}")
+        elif res["finish_reason"] == "stop":
+            self.check("O6 응답 non-empty (rewrite well-formed)", True,
+                       f"wall={res['wall']:.1f}s text='' finish_reason=stop — "
+                       f"소형 모델 특성 (Qwen에서 재검증)", inconclusive=True)
+        else:
+            self.check("O6 응답 non-empty (rewrite well-formed)", False,
+                       f"wall={res['wall']:.1f}s text='' finish_reason={res['finish_reason']}")
+
     # -- driver -------------------------------------------------------------
 
-    SHADOW_CASES = ("grow", "reset", "shrink", "args", "parallel")
-    ON_CASES = ("base", "parallel")
+    SHADOW_CASES = ("grow", "reset", "shrink", "args", "parallel", "sum")
+    ON_CASES = ("base", "parallel", "sum")
 
     def run(self):
         r1, r2, r3, r4, r5, r3shrink = build_conversation()
         p1 = build_parallel()
+        s13 = build_sum_scenario()
         print(f"\n== {self.mode}: {self.base} (log {self.log_path}, run {self.run_id}) ==")
         self.log_off = self.log_size() + 1  # 기동 로그 스킵
         if self.mode == "shadow":
@@ -666,12 +805,15 @@ class Probe:
                 self.case_args()
             if "parallel" in self.cases:
                 self.case_parallel(p1)
+            if "sum" in self.cases:
+                self.case_sum_shadow(s13)
         else:
             if "base" in self.cases:
                 self.case_base_on(r1, r3, r4)
             if "parallel" in self.cases:
                 self.case_parallel_on(p1)
-        print("  [SKIP] Σ 스냅샷 삽입 — refresh 연동 전 (단계 3 이후 케이스 추가)")
+            if "sum" in self.cases:
+                self.case_sum_on(s13)
         self.finish()
 
     def finish(self):
@@ -693,8 +835,8 @@ def main():
     ap.add_argument("--log-ssh", required=True, help="user@host (123)")
     ap.add_argument("--log-path", required=True, help="server log path on 123")
     ap.add_argument("--cases", default="all",
-                    help="comma-separated case filter (shadow: grow,reset,shrink,args,parallel; "
-                         "on: base,parallel) or 'all'")
+                    help="comma-separated case filter (shadow: grow,reset,shrink,args,parallel,sum; "
+                         "on: base,parallel,sum) or 'all'")
     args = ap.parse_args()
     Probe(args).run()
 

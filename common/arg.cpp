@@ -1845,6 +1845,36 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_SIGMA_STRIP_WINDOW_TOKENS").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
+        {"--sigma-sum"}, "MODE",
+        "sigma-strip stage 2: whole-message removal of the older region replaced by a frozen summary block - off (default, stage 2 disabled) | rule (server generates the block from the removed messages, no focus-memory) | llm (fetch the block from focus-memory /sigma/refresh; rule fallback after repeated failures)",
+        [](common_params & params, const std::string & value) {
+            if (value != "off" && value != "rule" && value != "llm") {
+                throw std::invalid_argument("error: --sigma-sum must be off, rule or llm (got '" + value + "')");
+            }
+            params.sigma_sum_mode = value;
+        }
+    ).set_env("LLAMA_ARG_SIGMA_SUM").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        {"--sigma-sum-max-tokens"}, "N",
+        "sigma-strip stage 2: token budget for the summary block (0 = a sensible default is used, default: 0)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("error: --sigma-sum-max-tokens must be >= 0 (got " + std::to_string(value) + ")");
+            }
+            params.sigma_sum_max_tokens = value;
+        }
+    ).set_env("LLAMA_ARG_SIGMA_SUM_MAX_TOKENS").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        {"--sigma-sum-timeout-ms"}, "N",
+        "sigma-strip stage 2: focus-memory /sigma/refresh timeout in ms (llm mode, default: 10000)",
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("error: --sigma-sum-timeout-ms must be > 0 (got " + std::to_string(value) + ")");
+            }
+            params.sigma_sum_timeout_ms = value;
+        }
+    ).set_env("LLAMA_ARG_SIGMA_SUM_TIMEOUT_MS").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
         {"--sparse-gate-threshold"}, "PCT",
         "DA sparse FA gate: use the sparse (gather) path only while the finite KV rows are at most PCT% of the cache, dense below that (1-100, default: 50)",
         [](common_params & params, int value) {
