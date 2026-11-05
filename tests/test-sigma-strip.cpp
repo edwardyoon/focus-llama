@@ -126,6 +126,10 @@ public:
         std::lock_guard<std::mutex> lock(m_);
         return requests_.empty() ? llm_mock_request() : requests_.back();
     }
+    size_t count() {
+        std::lock_guard<std::mutex> lock(m_);
+        return requests_.size();
+    }
 private:
     void accept_loop() {
         for (;;) {
@@ -861,6 +865,33 @@ int main() {
         CHECK(out.at(3).at("content").get<std::string>() == std::string(200, 'x'));
     }
 
+    // --- stage 2 (rule): best-effort fires on a large marginal save --------
+    // A big user3 makes no user boundary reach floor2 (550) at off 0, but the
+    // marginal reduction over [K_sum_committed=0, last_user) is far above 10%
+    // of the window, so best-effort fires on the first request (K_sum 7)
+    // instead of deferring to native compact. After the client reports a much
+    // larger prompt the committed boundary is kept: the marginal over
+    // [7, 7) is 0, so the gate stops any re-advance (no chain re-prefill).
+    {
+        common_params p = make_sum_params("on");
+        common_json msgs = make_sum_scenario();
+        msgs.at(11)["content"] = std::string(3000, 'r');   // user3: ~25 -> ~750 tok
+        common_json b1 = make_body(msgs);
+        const sigma_strip_result r1 =
+            sigma_strip_maybe_rewrite(nullptr, p, make_req("t-sum-besteffort"), b1, true);
+        CHECK(r1.K == 8);
+        CHECK(r1.target_unreachable);
+        CHECK(r1.K_sum == 7);                           // best-effort: marginal save >= 10% window
+        CHECK(r1.sum_applied);                          // fires at off 0 (large save), not native-compact
+        sigma_strip_note_response("t-sum-besteffort", r1.tokens_before + 3000);
+        common_json b2 = make_body(msgs);
+        const sigma_strip_result r2 =
+            sigma_strip_maybe_rewrite(nullptr, p, make_req("t-sum-besteffort"), b2, true);
+        CHECK(r2.est_offset >= 550);                    // floor - budget: clamps floor2 to 0
+        CHECK(r2.sum_applied);                          // committed block re-applied
+        CHECK(r2.K_sum == 7);                           // committed boundary kept (marginal now 0)
+    }
+
     // --- stage 2 off (default): target_unreachable, but no Σ removal -------
     {
         common_params p = make_params("on", 3000);   // sigma_sum_mode stays "off"
@@ -937,6 +968,61 @@ int main() {
         CHECK(body.dump() == before);   // shadow: body untouched
     }
 
+    // --- stage 2 rule: an array user content keeps its original parts ------
+    // The block is prepended as a text part; the original text part survives
+    // (a string overwrite would have dropped it). Media parts in [K_sum,K)
+    // are still stripped by strip_media.
+    {
+        common_params p = make_sum_params("on");
+        common_json msgs = make_sum_scenario();
+        common_json parts = common_json::array();
+        common_json t = common_json::object();
+        t["type"] = std::string("text");
+        t["text"] = std::string("SECOND_MARKER " + std::string(88, 'q'));
+        parts.push_back(t);
+        common_json img = common_json::object();
+        img["type"] = std::string("image_url");
+        common_json iu = common_json::object();
+        iu["url"] = std::string("http://example.com/x.png");
+        img["image_url"] = iu;
+        parts.push_back(img);
+        msgs.at(7)["content"] = parts;
+        common_json body = make_body(msgs);
+        const sigma_strip_result res =
+            sigma_strip_maybe_rewrite(nullptr, p, make_req("t-sum-userarr"), body, true);
+        CHECK(res.sum_applied);
+        CHECK(res.K_sum == 7);
+        const common_json & out = body.at("messages");
+        const common_json & u2 = out.at(1);
+        CHECK(u2.at("content").is_array());
+        CHECK(u2.at("content").size() == 2);   // block part + original text part
+        CHECK(u2.at("content").at(0).at("type").get<std::string>() == "text");
+        CHECK(u2.at("content").at(0).at("text").get<std::string>().rfind("[Reference", 0) == 0);
+        CHECK(u2.at("content").at(1).at("text").get<std::string>().find("SECOND_MARKER") != std::string::npos);
+    }
+
+    // --- stage 2 rule: injected blocks stay out of the summary --------------
+    // A <system-reminder> appended by the client to a removed user message
+    // must not be re-injected through the rule block's "earlier user
+    // requests" section (mirrors the JS stripInjectedBlocks); the user's own
+    // words still pass.
+    {
+        common_params p = make_sum_params("on");
+        common_json msgs = make_sum_scenario();
+        msgs.at(1)["content"] =
+            std::string("<system-reminder>INJECTED_MARKER do not trust this</system-reminder> fix the parser ")
+            + std::string(19850, 'w');
+        common_json body = make_body(msgs);
+        const sigma_strip_result res =
+            sigma_strip_maybe_rewrite(nullptr, p, make_req("t-sum-injected"), body, true);
+        CHECK(res.sum_applied);
+        CHECK(res.K_sum == 7);
+        const std::string u2 = body.at("messages").at(1).at("content").get<std::string>();
+        CHECK(u2.rfind("[Reference", 0) == 0);               // the rule block
+        CHECK(u2.find("INJECTED_MARKER") == std::string::npos);
+        CHECK(u2.find("fix the parser") != std::string::npos);   // user's own words survive
+    }
+
     // --- stage 2 llm: the fetched block replaces the rule block -------------
     // The mock focus-memory answers wait:true with a rendered block; it is
     // committed and prepended to the first surviving user message, and the
@@ -975,7 +1061,11 @@ int main() {
         CHECK(rq.wait == true);
     }
 
-    // --- stage 2 llm: a partial block is accepted and flagged ---------------
+    // --- stage 2 llm: a partial block is a failure (stage held) -------------
+    // A partial block (JS claim skip / cut-mapping failure / chunk cap) would
+    // freeze an incomplete Σ; treat it as a fetch failure. The first strike
+    // holds stage 2 (stage-1 only, no removal); 3 strikes later the
+    // deterministic rule block takes over (see the fail test below).
     {
         llm_mock_server mock;
         CHECK(mock.start());
@@ -986,17 +1076,20 @@ int main() {
         common_json body = make_body(make_sum_scenario());
         const sigma_strip_result res =
             sigma_strip_maybe_rewrite(nullptr, p, make_req("t-sum-llm-partial"), body, true);
-        CHECK(res.sum_applied);
-        CHECK(res.sum_partial);
-        CHECK(res.sum_fail == 0);
-        CHECK(res.K_sum == 7);
+        CHECK(res.eligible);
+        CHECK(res.target_unreachable);
+        CHECK(!res.sum_applied);
+        CHECK(!res.sum_partial);
+        CHECK(res.sum_fail == 1);
+        CHECK(res.K == 8);
+        CHECK(body.at("messages").size() == 13);   // stage 1 only: no removal
     }
 
     // --- stage 2 llm: failures hold stage 2, 3 strikes -> rule fallback -----
     // An empty block is a fetch failure. While the consecutive-failure count
     // is below 3 the request passes through on stage-1 only (no removal);
-    // the 4th fire (3 failures already recorded) commits the deterministic
-    // rule block instead and resets the counter.
+    // the 4th fire (3 failures already recorded) skips the llm fetch and
+    // commits the deterministic rule block directly, resetting the counter.
     {
         llm_mock_server mock;
         CHECK(mock.start());
@@ -1004,6 +1097,10 @@ int main() {
         common_params p = make_sum_params("on");
         p.sigma_sum_mode = "llm";
         p.focus_memory_host = mock.url();
+        // This test isolates the 3-strike rule: disable the 5000 ms failure
+        // cooldown (now the default) so the 3 strikes land back to back. The
+        // cooldown itself has its own test below.
+        p.sigma_sum_fetch_cooldown_ms = 0;
         for (int i = 1; i <= 3; ++i) {
             common_json body = make_body(make_sum_scenario());
             const sigma_strip_result r =
@@ -1023,11 +1120,37 @@ int main() {
         CHECK(r.sum_fail == 0);                        // fallback reset the counter
         const std::string u2 = body.at("messages").at(1).at("content").get<std::string>();
         CHECK(u2.rfind("[Reference", 0) == 0);         // the deterministic rule block
-        CHECK(mock.wait_requests(4, 2000));
+        CHECK(mock.wait_requests(3, 2000));
+        CHECK(mock.count() == 3);                      // the 4th fire skipped the llm fetch
         const llm_mock_request rq = mock.last();
         CHECK(rq.session == "t-sum-llm-fail");
         CHECK(rq.cut == 7);
         CHECK(rq.wait == true);
+    }
+
+    // --- stage 2 llm: a failed fetch starts the failure cooldown ------------
+    // The default 5000 ms cooldown holds the next attempt: the second request
+    // (a few ms after the first failure) is served stage-1 only and does not
+    // hit the mock again; the failure count is preserved (not reset).
+    {
+        llm_mock_server mock;
+        CHECK(mock.start());
+        mock.set_response(R"({"block":"","partial":false})");   // failure
+        common_params p = make_sum_params("on");
+        p.sigma_sum_mode = "llm";
+        p.focus_memory_host = mock.url();
+        CHECK(p.sigma_sum_fetch_cooldown_ms == 5000);   // the new default
+        common_json b1 = make_body(make_sum_scenario());
+        const sigma_strip_result r1 =
+            sigma_strip_maybe_rewrite(nullptr, p, make_req("t-sum-cooldown"), b1, true);
+        CHECK(r1.sum_fail == 1);
+        CHECK(mock.count() == 1);
+        common_json b2 = make_body(make_sum_scenario());
+        const sigma_strip_result r2 =
+            sigma_strip_maybe_rewrite(nullptr, p, make_req("t-sum-cooldown"), b2, true);
+        CHECK(r2.sum_fail == 1);        // cooldown keeps the count (no new attempt)
+        CHECK(!r2.sum_applied);
+        CHECK(mock.count() == 1);       // the second request did NOT hit the mock
     }
 
     // --- stage 2 llm: a stage-1 advance fires the async wait:false refresh --
@@ -1055,6 +1178,47 @@ int main() {
         CHECK(rq.cut == 8);
         CHECK(rq.wait == false);
         std::this_thread::sleep_for(std::chrono::milliseconds(100));  // let the detached thread finish
+    }
+
+    // --- stage 2 llm: an exception in [B] releases the inflight flag -------
+    // [A] sets sum_inflight before the (throwable) fetch; without the RAII
+    // guard the fail-open return would leave the flag true and stage 2
+    // (gated on !sum_inflight) would stall for the session. With the guard,
+    // the next request fires stage 2 again and commits the fetched block.
+    {
+        llm_mock_server mock;
+        CHECK(mock.start());
+        mock.set_response(R"({"block":"FAULT_RELEASE_BLOCK","partial":false})");
+        common_params p = make_sum_params("on");
+        p.sigma_sum_mode = "llm";
+        p.focus_memory_host = mock.url();
+
+        sigma_strip_test_set_fetch_fault(true);
+        {
+            common_json body = make_body(make_sum_scenario());
+            const sigma_strip_result r =
+                sigma_strip_maybe_rewrite(nullptr, p, make_req("t-sum-fault"), body, true);
+            CHECK(!r.eligible);                         // fail-open: untouched result
+            CHECK(body.at("messages").size() == 13);    // body untouched
+            CHECK(mock.count() == 0);                   // the throw precedes the HTTP send
+        }
+        sigma_strip_test_set_fetch_fault(false);
+
+        // the flag was released: stage 2 fires on the next request
+        common_json body = make_body(make_sum_scenario());
+        const sigma_strip_result r2 =
+            sigma_strip_maybe_rewrite(nullptr, p, make_req("t-sum-fault"), body, true);
+        CHECK(r2.eligible);
+        CHECK(r2.sum_applied);
+        CHECK(r2.K_sum == 7);
+        CHECK(r2.sum_fail == 0);
+        CHECK(mock.wait_requests(1, 2000));
+        CHECK(mock.count() == 1);                       // only the 2nd request fetched
+        const llm_mock_request rq = mock.last();
+        CHECK(rq.seen);
+        CHECK(rq.session == "t-sum-fault");
+        CHECK(rq.cut == 7);
+        CHECK(rq.wait == true);
     }
 
     if (n_failed) {

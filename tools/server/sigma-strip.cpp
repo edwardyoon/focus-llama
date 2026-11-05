@@ -33,6 +33,7 @@
 #include "common.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <map>
@@ -142,46 +143,66 @@ bool is_compactable_tool(const std::string & name) {
     return false;
 }
 
-// Resolve the tool name + arguments for a role=tool message: explicit "name"
-// field first, then tool_call_id matched against earlier assistant tool_calls.
-bool resolve_tool_call(const common_json & messages, const common_json & msg,
+// tool_call_id -> (name, args) over all assistant tool_calls, in message
+// order (the first non-empty name wins, matching the old per-id scan).
+using tool_call_map_t = std::map<std::string, std::pair<std::string, std::string>>;
+
+// Built once per request so each tool message resolves its call in O(1)
+// instead of scanning every message (O(n^2) overall for long sessions).
+static tool_call_map_t build_tool_call_map(const common_json & messages) {
+    tool_call_map_t m;
+    for (size_t i = 0; i < messages.size(); ++i) {
+        const common_json & msg = messages.at(i);
+        if (!msg.is_object() || json_string_or(msg, "role") != "assistant") {
+            continue;
+        }
+        if (!msg.contains("tool_calls") || !msg.at("tool_calls").is_array()) {
+            continue;
+        }
+        for (auto it = msg.at("tool_calls").begin(); it != msg.at("tool_calls").end(); ++it) {
+            const common_json & tc = *it;
+            if (!tc.is_object()) {
+                continue;
+            }
+            const std::string id = json_string_or(tc, "id");
+            if (id.empty() || m.count(id) != 0) {
+                continue;
+            }
+            std::string name, args;
+            if (tc.contains("function") && tc.at("function").is_object()) {
+                name = json_string_or(tc.at("function"), "name");
+                if (tc.at("function").contains("arguments")) {
+                    const common_json & a = tc.at("function").at("arguments");
+                    if (a.is_string()) {
+                        args = a.get<std::string>();
+                    } else if (!a.is_null()) {
+                        args = a.dump();
+                    }
+                }
+            }
+            if (name.empty()) {
+                name = json_string_or(tc, "name");
+            }
+            if (!name.empty()) {
+                m[id] = std::make_pair(name, args);
+            }
+        }
+    }
+    return m;
+}
+
+// Resolve the tool name + arguments for a role=tool message: tool_call_id
+// looked up in the prebuilt call map, explicit "name" field as fallback.
+bool resolve_tool_call(const tool_call_map_t & calls, const common_json & msg,
         std::string & out_name, std::string & out_args) {
     const std::string explicit_name = json_string_or(msg, "name");
     const std::string id = json_string_or(msg, "tool_call_id");
     if (!id.empty()) {
-        for (size_t i = 0; i < messages.size(); ++i) {
-            const common_json & m = messages.at(i);
-            if (!m.is_object() || json_string_or(m, "role") != "assistant") {
-                continue;
-            }
-            if (!m.contains("tool_calls") || !m.at("tool_calls").is_array()) {
-                continue;
-            }
-            for (auto it = m.at("tool_calls").begin(); it != m.at("tool_calls").end(); ++it) {
-                const common_json & tc = *it;
-                if (!tc.is_object() || json_string_or(tc, "id") != id) {
-                    continue;
-                }
-                std::string name;
-                if (tc.contains("function") && tc.at("function").is_object()) {
-                    name = json_string_or(tc.at("function"), "name");
-                    if (tc.at("function").contains("arguments")) {
-                        const common_json & a = tc.at("function").at("arguments");
-                        if (a.is_string()) {
-                            out_args = a.get<std::string>();
-                        } else if (!a.is_null()) {
-                            out_args = a.dump();
-                        }
-                    }
-                }
-                if (name.empty()) {
-                    name = json_string_or(tc, "name");
-                }
-                if (!name.empty()) {
-                    out_name = name;
-                    return true;
-                }
-            }
+        const auto it = calls.find(id);
+        if (it != calls.end()) {
+            out_name = it->second.first;
+            out_args = it->second.second;
+            return true;
         }
     }
     if (!explicit_name.empty()) {
@@ -284,6 +305,7 @@ struct sigma_strip_session_state {
     uint64_t    sum_gen = 0;               // generation counter (revalidation)
     bool        sum_inflight = false;      // a refresh is in flight (llm mode)
     int         sum_fetch_fail_count = 0;  // consecutive refresh failures
+    int64_t     sum_last_fail_ms = 0;      // steady-clock ms of last fetch failure (cooldown)
 };
 
 std::mutex & sigma_strip_mutex() {
@@ -295,6 +317,40 @@ std::map<std::string, sigma_strip_session_state> & sigma_strip_sessions() {
     static std::map<std::string, sigma_strip_session_state> m;
     return m;
 }
+
+// Test-only fault injection (tests/test-sigma-strip.cpp): when set, the
+// stage-2 fetch in [B] throws before the HTTP request is sent, exercising
+// the fail-open path that must release the per-session inflight flag.
+// Never set in production.
+std::atomic<bool> g_test_fetch_fault{false};
+
+// RAII release of the per-session sum_inflight flag. [A] sets the flag before
+// the (throwable) [B] fetch and [C] settles it; if [B] or [C] throws, the
+// outer catch returns fail-open and a plain flag would stay true forever —
+// stage 2 and the stage-1 async absorption (both gated on !sum_inflight)
+// would stall for the session until a prefix reset. The guard releases the
+// flag on scope exit, but only when this request still owns it (sum_gen
+// unchanged): a prefix reset or a newer request has already taken over.
+// gen == 0 means the guard is inactive (no fetch was set in [A]).
+struct inflight_guard {
+    const std::string & session;
+    uint64_t gen = 0;
+    inflight_guard(const std::string & s) : session(s) {}
+    inflight_guard(const inflight_guard &) = delete;
+    inflight_guard & operator=(const inflight_guard &) = delete;
+    ~inflight_guard() {
+        if (gen == 0) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(sigma_strip_mutex());
+        auto it = sigma_strip_sessions().find(session);
+        if (it != sigma_strip_sessions().end()
+                && it->second.sum_inflight
+                && it->second.sum_gen == gen) {
+            it->second.sum_inflight = false;
+        }
+    }
+};
 
 //
 // step-1 diagnostic: classification of the post-stage-1 message composition.
@@ -399,6 +455,39 @@ std::string clamp_chars(const std::string & s, size_t max) {
     return out + "…";
 }
 
+// Removes client-appended context blocks (user-prompt-submit context, system
+// reminders) so the rule block keeps the user's own words — mirrors
+// stripInjectedBlocks in focus-memory (kvoffload.js). Without this, a
+// <system-reminder> from the removed region is re-injected into the active
+// context through the frozen summary (the old contamination path). Only
+// complete tag pairs are removed, matching the JS regex; the result is
+// trimmed.
+std::string strip_injected_blocks(const std::string & s) {
+    static const struct { const char * open; const char * close; } kTags[] = {
+        { "<qwen:user-prompt-submit-context>", "</qwen:user-prompt-submit-context>" },
+        { "<system-reminder>", "</system-reminder>" },
+    };
+    std::string out = s;
+    for (const auto & tag : kTags) {
+        const std::string o(tag.open);
+        const std::string c(tag.close);
+        size_t pos = 0;
+        while ((pos = out.find(o, pos)) != std::string::npos) {
+            const size_t end = out.find(c, pos + o.size());
+            if (end == std::string::npos) {
+                break;   // unclosed tag: leave as-is (same as the JS regex)
+            }
+            out.erase(pos, (end + c.size()) - pos);
+        }
+    }
+    const size_t b = out.find_first_not_of(" \t\r\n");
+    if (b == std::string::npos) {
+        return "";
+    }
+    const size_t e = out.find_last_not_of(" \t\r\n");
+    return out.substr(b, e - b + 1);
+}
+
 // Best-effort ok/error for a shell command: scan the first 200 chars of the
 // matching tool result for error markers. The body itself is never placed in
 // the block (plan §4.5 "no tool bodies") — only a status flag is derived.
@@ -435,14 +524,18 @@ std::string shell_status(const common_json & messages, const std::string & tool_
 // max(target x window, min_keep) - block_budget - off. The first surviving
 // message being a user keeps role alternation intact and anchors the block
 // (plan §5.4). Returns 0 when no boundary reaches the floor (native-compact
-// territory). O(n) via prefix/suffix token sums.
+// territory) — except when the floor itself is at or below the offset
+// (floor2 == 0, target x window - budget < off): the estimate can never hit
+// the target, so it returns the largest user boundary within K_cap as a
+// best-effort shrink instead. O(n) via prefix/suffix token sums.
 size_t compute_k_sum(const common_json & messages,
         const std::vector<int64_t> & orig,
         const std::vector<std::string> & stubs,
         const std::vector<int64_t> & savings,
         size_t K, size_t K_cap, size_t n,
         int64_t tokens_before, double floor_tokens,
-        int64_t block_budget, int64_t off) {
+        int64_t block_budget, int64_t off,
+        double window, size_t K_sum_committed) {
     (void) tokens_before;
     const int64_t floor2 = std::max<int64_t>(0, (int64_t) floor_tokens - block_budget - off);
     // final non-block tokens at boundary b = (system tokens in [0,b))
@@ -452,23 +545,62 @@ size_t compute_k_sum(const common_json & messages,
     std::vector<int64_t> prefix_system(n + 1, 0);
     std::vector<int64_t> suffix(n + 2, 0);
     for (size_t i = 0; i < n; ++i) {
-        const int64_t contrib = (i < K && !stubs[i].empty())
-            ? (orig[i] - savings[i]) : orig[i];
-        suffix[i] = suffix[i + 1] + contrib;
         const bool sys = messages.at(i).is_object()
             && json_string_or(messages.at(i), "role") == "system";
         prefix_system[i + 1] = prefix_system[i] + (sys ? orig[i] : 0);
     }
+    // suffix must be built backwards: suffix[i] = sum of contrib[i..n). A
+    // forward loop reads suffix[i+1] before it is set (still 0), collapsing
+    // the sum to a single contrib[i] and undercounting the post-removal total.
+    for (size_t i = n; i > 0; --i) {
+        const size_t j = i - 1;
+        const int64_t contrib = (j < K && !stubs[j].empty())
+            ? (orig[j] - savings[j]) : orig[j];
+        suffix[j] = suffix[j + 1] + contrib;
+    }
     const size_t limit = std::min(K_cap, n - 1); // a survivor must exist
+    size_t last_user = 0; // largest user boundary within K_cap (best-effort fallback)
+    size_t result = 0;
     for (size_t b = 1; b <= limit; ++b) {
         if (!messages.at(b).is_object() || json_string_or(messages.at(b), "role") != "user") {
             continue; // not a user boundary
         }
+        last_user = b;
         if (prefix_system[b] + suffix[b] <= floor2) {
-            return b; // smallest user boundary that reaches the floor
+            result = b; // smallest user boundary that reaches the floor
+            break;
         }
     }
-    return 0;
+    // Best-effort: no boundary reached the floor. This covers both the
+    // floor2 == 0 case (the reported-space offset dominates — the estimate
+    // can never hit the target, the target-0.17 / off-45k launch-line case)
+    // and the case where floor2 > 0 but every user boundary still leaves the
+    // prompt above it (coarse boundaries, e.g. floor2 7.5k but system + the
+    // protected round alone weigh 15k). Remove up to the largest user
+    // boundary within K_cap to shrink the prompt as much as safely possible
+    // instead of never firing.
+    //
+    // Gate: the removal must save at least 10% of the window, measured over
+    // [K_sum_committed, last_user) — the MARGINAL reduction this advance
+    // adds, not the whole removed region. A trivially small save is not worth
+    // the re-prefill; and because best-effort cannot reach the target (usage
+    // lingers above the threshold), the marginal gate is what stops the chain
+    // of re-advances that would otherwise fire on every new user boundary.
+    if (result == 0 && last_user > 0 && window > 0) {
+        int64_t reduction = 0;
+        for (size_t i = K_sum_committed; i < last_user && i < n; ++i) {
+            if (messages.at(i).is_object()
+                    && json_string_or(messages.at(i), "role") == "system") {
+                continue; // system is kept, not removed
+            }
+            reduction += (i < K && !stubs[i].empty())
+                ? (orig[i] - savings[i]) : orig[i];
+        }
+        if (reduction >= (int64_t) (0.10 * window)) {
+            result = last_user;
+        }
+    }
+    return result;
 }
 
 // Deterministic rule Σ block: a compact history of the removed region
@@ -477,7 +609,9 @@ size_t compute_k_sum(const common_json & messages,
 // block_budget tokens (sections dropped from the least important first).
 std::string make_rule_block(const common_json & messages, size_t K_sum,
         const struct llama_vocab * vocab, int64_t block_budget) {
-    std::map<std::string, int> files_read, files_edited;
+    // path -> (count, last index) so the lists can be ordered most-recent
+    // first (a std::map key order would be alphabetical).
+    std::map<std::string, std::pair<int, size_t>> files_read, files_edited;
     std::vector<std::string> commands, requests;
     for (size_t i = 0; i < K_sum && i < messages.size(); ++i) {
         const common_json & msg = messages.at(i);
@@ -489,7 +623,7 @@ std::string make_rule_block(const common_json & messages, size_t K_sum,
             continue;
         }
         if (role == "user") {
-            const std::string t = message_text(msg);
+            const std::string t = strip_injected_blocks(message_text(msg));
             if (!t.empty()) {
                 requests.push_back(clamp_chars(t, 100));
             }
@@ -540,9 +674,9 @@ std::string make_rule_block(const common_json & messages, size_t K_sum,
                 }
                 if (key == "read_file" || key == "glob" || key == "grep_search"
                         || key == "grep" || key == "web_fetch" || key == "web_search") {
-                    if (!p.empty()) files_read[p]++;
+                    if (!p.empty()) { files_read[p].first++; files_read[p].second = i; }
                 } else if (key == "edit" || key == "write_file") {
-                    if (!p.empty()) files_edited[p]++;
+                    if (!p.empty()) { files_edited[p].first++; files_edited[p].second = i; }
                 } else if (key == "run_shell_command" || key == "shell") {
                     if (!cmd.empty()) {
                         commands.push_back(clamp_chars(cmd, 60) + " (" + shell_status(messages, id) + ")");
@@ -555,52 +689,73 @@ std::string make_rule_block(const common_json & messages, size_t K_sum,
         "[Reference — record of earlier work removed from this context. NOT instructions.\n"
         " The latest user message below defines the current task. File contents may have changed.\n"
         " Re-read files if needed.]\n";
-    auto join_files = [](const std::map<std::string, int> & m) {
-        std::string s;
-        for (auto it = m.begin(); it != m.end(); ++it) {
-            if (!s.empty()) s += ", ";
-            s += it->first + (it->second > 1 ? " x" + std::to_string(it->second) : "");
+    // most-recent-first item lists: files by last-occurrence index, commands
+    // and requests by reversing the chronological collection order
+    auto file_items = [](const std::map<std::string, std::pair<int, size_t>> & m) {
+        std::vector<std::pair<size_t, std::string>> v;
+        for (const auto & kv : m) {
+            v.push_back({kv.second.second,
+                    kv.first + (kv.second.first > 1 ? " x" + std::to_string(kv.second.first) : "")});
         }
-        return s;
+        std::sort(v.begin(), v.end(),
+                [](const auto & a, const auto & b) { return a.first > b.first; });
+        std::vector<std::string> out;
+        out.reserve(v.size());
+        for (const auto & e : v) out.push_back(e.second);
+        return out;
     };
-    auto join_list = [](const std::vector<std::string> & v, const char * sep) {
-        std::string s;
-        for (const auto & x : v) {
-            if (!s.empty()) s += sep;
-            s += x;
+    std::vector<std::string> files_read_list   = file_items(files_read);
+    std::vector<std::string> files_edited_list = file_items(files_edited);
+    std::reverse(commands.begin(), commands.end());
+    std::reverse(requests.begin(), requests.end());
+    std::vector<std::string> request_items;
+    request_items.reserve(requests.size());
+    for (const auto & r : requests) request_items.push_back("\"" + r + "\"");
+    // sections in importance order (files read, files edited, commands,
+    // earlier user requests). Items are filled one at a time and the fill
+    // stops as soon as the next item would exceed block_budget — a long list
+    // (a session that read many files) degrades to "as many entries as fit"
+    // instead of dropping the section wholesale, which would leave the block
+    // empty and hold stage 2 forever.
+    struct section_t { std::string label; const char * sep; std::vector<std::string> items; };
+    std::vector<section_t> sections;
+    sections.push_back({"files read: ", ", ", files_read_list});
+    sections.push_back({"files edited: ", ", ", files_edited_list});
+    sections.push_back({"commands: ", "; ", commands});
+    sections.push_back({"earlier user requests: ", ", ", request_items});
+    int64_t used = block_budget > 0 ? estimate_tokens(vocab, block) : 0;
+    bool any = false;
+    bool budget_full = false;
+    for (const auto & sec : sections) {
+        if (budget_full || sec.items.empty()) {
+            continue;
         }
-        return s;
-    };
-    // sections in importance order; drop from the end when over budget
-    std::vector<std::string> sections;
-    if (!files_read.empty()) sections.push_back("files read: " + join_files(files_read));
-    if (!files_edited.empty()) sections.push_back("files edited: " + join_files(files_edited));
-    if (!commands.empty()) sections.push_back("commands: " + join_list(commands, "; "));
-    if (!requests.empty()) {
-        std::string s;
-        for (const auto & r : requests) {
-            if (!s.empty()) s += ", ";
-            s += "\"" + r + "\"";
-        }
-        sections.push_back("earlier user requests: " + s);
-    }
-    if (block_budget > 0) {
-        int64_t used = estimate_tokens(vocab, block);
-        for (const auto & s : sections) {
-            const std::string line = s + "\n";
-            const int64_t cost = estimate_tokens(vocab, line);
-            if (used + cost > block_budget) {
-                break;
+        std::string line;
+        bool first = true;
+        for (const auto & item : sec.items) {
+            const std::string piece = first ? sec.label + item : std::string(sec.sep) + item;
+            const std::string new_line = line.empty() ? piece : line + piece;
+            if (block_budget > 0) {
+                const int64_t cost = estimate_tokens(vocab, new_line + "\n");
+                if (used + cost > block_budget) {
+                    budget_full = true;
+                    break;
+                }
             }
-            block += line;
-            used += cost;
+            line = new_line;
+            first = false;
         }
-    } else {
-        for (const auto & s : sections) {
-            block += s + "\n";
+        if (!line.empty()) {
+            block += line + "\n";
+            used += estimate_tokens(vocab, line + "\n");
+            any = true;
         }
     }
-    return block;
+    // A header-only block (nothing to summarize, or no item fit the budget)
+    // carries no information — return "" so the caller does not commit an
+    // empty shell (block_ok = !block.empty() stays false and stage 2 is held
+    // for this request).
+    return any ? block : "";
 }
 
 // Stage-2 llm mode: after this many consecutive /sigma/refresh failures the
@@ -747,6 +902,7 @@ sigma_strip_result sigma_strip_maybe_rewrite(
         std::vector<int64_t> orig(n, 0);
         std::vector<int64_t> savings(n, 0);
         std::vector<std::string> stubs(n);
+        const tool_call_map_t tool_calls = build_tool_call_map(messages);
         for (size_t i =0; i < n; ++i) {
             const common_json & msg = messages.at(i);
             if (!msg.is_object()) {
@@ -757,7 +913,7 @@ sigma_strip_result sigma_strip_maybe_rewrite(
             if (json_string_or(msg, "role") == "tool") {
                 std::string tool;
                 std::string args;
-                if (resolve_tool_call(messages, msg, tool, args) && is_compactable_tool(tool)) {
+                if (resolve_tool_call(tool_calls, msg, tool, args) && is_compactable_tool(tool)) {
                     stubs[i] = make_stub(tool, args, orig[i]);
                     savings[i] = std::max<int64_t>(0, orig[i] - estimate_tokens(vocab, stubs[i]));
                 }
@@ -776,6 +932,7 @@ sigma_strip_result sigma_strip_maybe_rewrite(
 
         // stage-2 decision locals: set in [A], consumed in [B]/[C]
         bool do_fetch = false;
+        bool rule_fallback = false;  // threshold reached in [A]: rule block, no llm fetch
         size_t K_sum_cand = 0;
         uint64_t gen_at = 0;
         std::string fp_at;
@@ -783,6 +940,9 @@ sigma_strip_result sigma_strip_maybe_rewrite(
         size_t K_cap = n;
         size_t K_stage1 = 0;
         int64_t off = 0;
+        // Releases sum_inflight on any scope exit (including the outer
+        // catch's fail-open return) when this request still owns it.
+        inflight_guard guard{session};
 
         // ===== [A] compute — under the lock, pure decision, no commit =====
         {
@@ -951,14 +1111,40 @@ sigma_strip_result sigma_strip_maybe_rewrite(
             // that finds another mid-fetch passes through on committed state.
             if (sum_enabled && res.target_unreachable) {
                 K_sum_cand = compute_k_sum(messages, orig, stubs, savings,
-                        st.K, K_cap, n, tokens_before, floor_tokens, sum_budget, off);
+                        st.K, K_cap, n, tokens_before, floor_tokens, sum_budget, off,
+                        window, st.K_sum);
                 if (K_sum_cand > st.K_sum && !st.sum_inflight) {
-                    do_fetch = true;
-                    st.sum_inflight = true;
-                    st.sum_gen++;
-                    gen_at = st.sum_gen;
-                    fp_at = prefix_fingerprint(messages, st.K);
-                    fail_count_at = st.sum_fetch_fail_count;
+                    bool fire = true;
+                    // Cooldown: after a failed llm fetch, skip the next
+                    // attempt(s) for sigma_sum_fetch_cooldown_ms so a down
+                    // focus-memory does not cost up to sigma_sum_timeout_ms
+                    // on every request. Only in the 1..(N-1) failure range —
+                    // at N consecutive failures the rule fallback (no HTTP)
+                    // takes over.
+                    if (params.sigma_sum_mode == "llm"
+                            && !params.focus_memory_host.empty()
+                            && st.sum_fetch_fail_count > 0
+                            && st.sum_fetch_fail_count < SIGMA_SUM_RULE_FALLBACK_FAILS
+                            && params.sigma_sum_fetch_cooldown_ms > 0) {
+                        const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch()).count();
+                        if (now_ms - st.sum_last_fail_ms < params.sigma_sum_fetch_cooldown_ms) {
+                            fire = false;
+                            SRV_INF("sigma-strip: session=%s /sigma/refresh in cooldown (%lld ms since last fail < %d ms): stage 1 only this request\n",
+                                    session.c_str(), (long long) (now_ms - st.sum_last_fail_ms),
+                                    params.sigma_sum_fetch_cooldown_ms);
+                        }
+                    }
+                    if (fire) {
+                        do_fetch = true;
+                        st.sum_inflight = true;
+                        st.sum_gen++;
+                        gen_at = st.sum_gen;
+                        guard.gen = gen_at;
+                        fp_at = prefix_fingerprint(messages, st.K);
+                        fail_count_at = st.sum_fetch_fail_count;
+                        rule_fallback = (fail_count_at >= SIGMA_SUM_RULE_FALLBACK_FAILS);
+                    }
                 }
             }
             // (lock released here)
@@ -972,29 +1158,46 @@ sigma_strip_result sigma_strip_maybe_rewrite(
         // fetch out of the lock so a slow one cannot stall every session's
         // strip decision. Failure rule (plan §5.3 rule 2): hold stage 2
         // (stage-1 only) until SIGMA_SUM_RULE_FALLBACK_FAILS consecutive
-        // failures, then advance with the deterministic rule block.
+        // failures, then advance with the deterministic rule block — from
+        // that point on the llm fetch is skipped entirely (an attempt would
+        // only cost up to sigma_sum_timeout_ms per request for the same
+        // rule outcome).
         std::string block;
         bool block_ok = false;
         bool block_partial = false;
         int64_t fetch_ms = 0;
         if (do_fetch) {
+            if (g_test_fetch_fault.load(std::memory_order_relaxed)) {
+                throw std::runtime_error("injected fetch fault (unit test)");
+            }
             const auto t0 = std::chrono::steady_clock::now();
-            if (params.sigma_sum_mode == "llm" && !params.focus_memory_host.empty()) {
+            if (rule_fallback) {
+                // The consecutive-failure threshold was already reached when
+                // [A] decided: skip the llm fetch and commit the
+                // deterministic rule block (plan §5.3 rule 2).
+                SRV_WRN("sigma-strip: session=%s /sigma/refresh failed %d times in a row: rule block, llm fetch skipped\n",
+                        session.c_str(), fail_count_at);
+                block = make_rule_block(messages, K_sum_cand, vocab, sum_budget);
+                block_ok = !block.empty();
+            } else if (params.sigma_sum_mode == "llm" && !params.focus_memory_host.empty()) {
                 std::string err;
-                if (sigma_refresh_fetch(params.focus_memory_host, params.focus_memory_token,
+                const bool fetched = sigma_refresh_fetch(params.focus_memory_host, params.focus_memory_token,
                             session, K_sum_cand, /*wait*/ true, params.sigma_sum_timeout_ms,
-                            block, block_partial, err)) {
+                            block, block_partial, err);
+                if (fetched && !block_partial) {
                     block_ok = true;
-                    if (block_partial) {
-                        SRV_WRN("sigma-strip: session=%s /sigma/refresh returned a partial block (accepted)\n",
-                                session.c_str());
-                    }
-                } else if (fail_count_at >= SIGMA_SUM_RULE_FALLBACK_FAILS) {
-                    SRV_WRN("sigma-strip: session=%s /sigma/refresh failed %d times in a row (%s): falling back to the rule block\n",
-                            session.c_str(), fail_count_at, err.c_str());
-                    block = make_rule_block(messages, K_sum_cand, vocab, sum_budget);
-                    block_ok = !block.empty();
+                } else if (fetched) {
+                    // A partial block (JS-side claim skip, cut-mapping failure,
+                    // or the chunk cap) would freeze an incomplete Σ until the
+                    // next K_sum advance. Treat it as a failure instead: after
+                    // SIGMA_SUM_RULE_FALLBACK_FAILS strikes the complete,
+                    // deterministic rule block takes over.
+                    SRV_WRN("sigma-strip: session=%s /sigma/refresh returned a partial block: treated as failure, stage 1 only this request\n",
+                            session.c_str());
                 } else {
+                    // fail_count_at < SIGMA_SUM_RULE_FALLBACK_FAILS here: a
+                    // request at or above the threshold takes the
+                    // rule_fallback path above instead of paying the fetch.
                     SRV_WRN("sigma-strip: session=%s /sigma/refresh failed (%s), failure %d of %d: stage 1 only this request\n",
                             session.c_str(), err.c_str(), fail_count_at + 1, SIGMA_SUM_RULE_FALLBACK_FAILS);
                 }
@@ -1027,8 +1230,17 @@ sigma_strip_result sigma_strip_maybe_rewrite(
                         && st.sum_gen == gen_at
                         && st.prefix_fp == fp_at
                         && block_ok);
-                st.sum_inflight = false;
-                st.sum_fetch_fail_count = block_ok ? 0 : st.sum_fetch_fail_count + 1;
+                if (st.sum_gen == gen_at) {
+                    // still own the inflight slot: settle the failure count
+                    // (the guard releases the flag on scope exit —
+                    // an unconditional clear here could drop a newer
+                    // request's flag after a prefix reset).
+                    st.sum_fetch_fail_count = block_ok ? 0 : st.sum_fetch_fail_count + 1;
+                    if (!block_ok) {
+                        st.sum_last_fail_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch()).count();
+                    }
+                }
                 if (!commit_ok) {
                     do_fetch = false; // discard; use committed state below
                 }
@@ -1086,11 +1298,26 @@ sigma_strip_result sigma_strip_maybe_rewrite(
                     // the block: prepend to the first surviving user message
                     if (res.sum_applied && !block_placed
                             && msg.is_object() && json_string_or(msg, "role") == "user") {
-                        std::string content;
-                        if (msg.contains("content") && msg.at("content").is_string()) {
-                            content = msg.at("content").get<std::string>();
+                        if (msg.contains("content") && msg.at("content").is_array()) {
+                            // parts array: prepend a text part so the original
+                            // parts survive the rewrite (a string overwrite would
+                            // drop them)
+                            common_json part = common_json::object();
+                            part["type"] = std::string("text");
+                            part["text"] = st.sum_block;
+                            common_json new_content = common_json::array();
+                            new_content.push_back(part);
+                            for (const auto & e : msg.at("content")) {
+                                new_content.push_back(e);
+                            }
+                            msg["content"] = std::move(new_content);
+                        } else {
+                            std::string content;
+                            if (msg.contains("content") && msg.at("content").is_string()) {
+                                content = msg.at("content").get<std::string>();
+                            }
+                            msg["content"] = st.sum_block + "\n\n" + content;
                         }
-                        msg["content"] = st.sum_block + "\n\n" + content;
                         block_placed = true;
                         tokens_after += estimate_tokens(vocab, st.sum_block);
                     }
@@ -1129,11 +1356,14 @@ sigma_strip_result sigma_strip_maybe_rewrite(
                 && res.k_advanced && !did_stage2) {
             bool fire = false;
             size_t cut = 0;
+            uint64_t gen = 0;
             {
                 std::lock_guard<std::mutex> lock(sigma_strip_mutex());
                 sigma_strip_session_state & st = sigma_strip_sessions()[session];
                 if (!st.sum_inflight) {
                     st.sum_inflight = true;
+                    st.sum_gen++;
+                    gen = st.sum_gen;
                     fire = true;
                     cut = st.K;
                 }
@@ -1142,7 +1372,7 @@ sigma_strip_result sigma_strip_maybe_rewrite(
                 const std::string host = params.focus_memory_host;
                 const std::string token = params.focus_memory_token;
                 const int timeout_ms = params.sigma_sum_timeout_ms;
-                std::thread([host, token, session, cut, timeout_ms]() {
+                std::thread([host, token, session, cut, timeout_ms, gen]() {
                     std::string block;
                     bool partial = false;
                     std::string err;
@@ -1153,7 +1383,12 @@ sigma_strip_result sigma_strip_maybe_rewrite(
                     }
                     std::lock_guard<std::mutex> lock(sigma_strip_mutex());
                     auto it = sigma_strip_sessions().find(session);
-                    if (it != sigma_strip_sessions().end()) {
+                    // Only release the flag if this generation still owns it —
+                    // a prefix reset or a newer fire bumped sum_gen, and an
+                    // unconditional clear would drop the newer owner's flag.
+                    if (it != sigma_strip_sessions().end()
+                            && it->second.sum_inflight
+                            && it->second.sum_gen == gen) {
                         it->second.sum_inflight = false;
                     }
                 }).detach();
@@ -1238,4 +1473,10 @@ void sigma_strip_note_response(
             session.c_str(), (long long) reported_prompt_tokens, (long long) st.last_est,
             (long long) st.est_offset, st.last_K, st.last_stripped,
             (int) st.last_advanced, (int) st.last_floor_limited);
+}
+
+// Test-only fault injection (tests/test-sigma-strip.cpp) — see
+// g_test_fetch_fault above.
+void sigma_strip_test_set_fetch_fault(bool on) {
+    g_test_fetch_fault.store(on, std::memory_order_relaxed);
 }
