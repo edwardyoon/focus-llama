@@ -23,6 +23,7 @@
 #include <cstring>
 #include <deque>
 #include <functional>
+#include <map>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -107,6 +108,16 @@ public:
         ::close(listen_fd_);
         listen_fd_ = -1;
         if (accept_thr_.joinable()) accept_thr_.join();
+        // join per-connection workers (they may still be in a response delay)
+        std::vector<std::thread> workers;
+        {
+            std::lock_guard<std::mutex> lock(m_);
+            workers = std::move(worker_thr_);
+            worker_thr_.clear();
+        }
+        for (auto & t : workers) {
+            if (t.joinable()) t.join();
+        }
     }
     ~llm_mock_server() { stop(); }
     std::string url() const { return "http://127.0.0.1:" + std::to_string(port_); }
@@ -117,10 +128,20 @@ public:
     // Queue responses in order (drain test: the partial block for the
     // stage-2 wait:true fetch, then the complete block for the drain's
     // wait:false pass). status mirrors the real server (200 for wait:true,
-    // 202 for wait:false). Falls back to response_ once the queue is empty.
-    void push_response(std::string r, int status = 200) {
+    // 202 for wait:false). delay_ms holds the response before sending (used
+    // to land a commit while a drain pass is in flight). Falls back to
+    // response_ once the queue is empty.
+    void push_response(std::string r, int status = 200, int delay_ms = 0) {
         std::lock_guard<std::mutex> lock(m_);
-        response_queue_.push_back({status, std::move(r)});
+        response_queue_.push_back({status, std::move(r), delay_ms});
+    }
+    // Deterministic routing for concurrent workers: a response matched by
+    // (wait, cut) regardless of connection order. Reused (not popped) since
+    // each (wait, cut) pair is unique per test.
+    void set_keyed_response(bool wait, uint64_t cut, std::string r,
+                            int status = 200, int delay_ms = 0) {
+        std::lock_guard<std::mutex> lock(m_);
+        keyed_responses_[{wait, cut}] = {status, std::move(r), delay_ms};
     }
     bool wait_requests(size_t n, int timeout_ms) {
         const auto deadline = std::chrono::steady_clock::now()
@@ -151,7 +172,12 @@ private:
         for (;;) {
             int c = ::accept(listen_fd_, nullptr, nullptr);
             if (c < 0) break;
-            handle_one(c);
+            // per-connection worker: a delayed response on one connection
+            // must not block accepting the others (P0-2 residual test)
+            {
+                std::lock_guard<std::mutex> lock(m_);
+                worker_thr_.emplace_back([this, c] { handle_one(c); });
+            }
         }
     }
     void handle_one(int c) {
@@ -196,16 +222,26 @@ private:
         }
         std::string resp;
         int resp_status = 200;
+        int resp_delay = 0;
         {
             std::lock_guard<std::mutex> lock(m_);
             requests_.push_back(rq);
-            if (!response_queue_.empty()) {
+            auto it = keyed_responses_.find({rq.wait, rq.cut});
+            if (it != keyed_responses_.end()) {
+                resp_status = it->second.status;
+                resp = it->second.body;
+                resp_delay = it->second.delay_ms;
+            } else if (!response_queue_.empty()) {
                 resp_status = response_queue_.front().status;
                 resp = std::move(response_queue_.front().body);
+                resp_delay = response_queue_.front().delay_ms;
                 response_queue_.pop_front();
             } else {
                 resp = response_;
             }
+        }
+        if (resp_delay > 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(resp_delay));
         }
         const std::string status_line = (resp_status == 202) ? "202 Accepted" : "200 OK";
         const std::string out = "HTTP/1.1 " + status_line + "\r\nContent-Type: application/json\r\n"
@@ -222,10 +258,17 @@ private:
     int          listen_fd_ = -1;
     uint16_t     port_      = 0;
     std::thread  accept_thr_;
+    std::vector<std::thread> worker_thr_;   // per-connection workers (joined in stop)
     std::mutex   m_;
-    struct resp { int status; std::string body; };
+    struct resp { int status; std::string body; int delay_ms; };
     std::string  response_ = R"({"block":"","partial":false})";
     std::deque<resp> response_queue_;
+    // Keyed by (wait, cut): deterministic routing when worker threads handle
+    // connections concurrently (the FIFO queue can mis-map a response to the
+    // wrong request when two workers race for the front). Checked first in
+    // handle_one; reused (not popped) since each (wait, cut) pair is unique
+    // per test.
+    std::map<std::pair<bool, uint64_t>, resp> keyed_responses_;
     std::vector<llm_mock_request> requests_;
 };
 
@@ -1379,6 +1422,65 @@ int main() {
         }
         CHECK(drain_passes == 2);        // one thread: pass 1 (cut 7) + pass 2 (cut 12)
         CHECK(new_cut_passes == 1);      // the running thread picked up the new cut
+    }
+
+    // --- P0-2 residual: K_sum moves while a COMPLETE (partial:false) pass is in flight ---
+    // The drain's pass 1 fetches cut 7; the mock answers partial:false (the
+    // old cut's region is "complete"). But before that response reaches the
+    // drain, request 2 commits K_sum=12 (a newer region; its own drain spawn
+    // is rejected because the running drain holds the flag). The drain must
+    // NOT stop on the stale complete answer — the completion branch sees
+    // K_sum (12) != cut (7) and continues; the next pass re-queries the new
+    // cut and finishes it. The keyed mock response + a 600 ms delay on the
+    // stale pass makes the race deterministic (the delay holds the drain's
+    // response while request 2 lands).
+    {
+        llm_mock_server mock;
+        CHECK(mock.start());
+        // FIFO: req1 stage-2 (7, partial), req2 stage-2 (new cut, partial),
+        // drain pass 2 (new cut, complete). The stale drain pass 1 (cut 7,
+        // complete) is keyed + delayed so it cannot mis-map the FIFO while it
+        // is in flight with request 2.
+        mock.push_response(R"({"block":"P2R_D1","partial":true})", 200);
+        mock.push_response(R"({"block":"P2R_D3","partial":true})", 200);
+        mock.push_response(R"({"block":"P2R_D4","partial":false})", 202);
+        mock.set_keyed_response(false, 7,
+                R"({"block":"P2R_D2_STALE","partial":false})", 202, 600);
+        common_params p = make_sum_params("on");
+        p.sigma_sum_mode = "llm";
+        p.focus_memory_host = mock.url();
+        p.sigma_sum_drain = true;
+        p.sigma_sum_drain_delay_ms = 100;
+        p.sigma_strip_min_gain = 0.0;
+        p.sigma_strip_rearm_delta = 0.0;
+        common_json body = make_body(make_sum_scenario());
+        const sigma_strip_result res =
+            sigma_strip_maybe_rewrite(nullptr, p, make_req("t-p02r"), body, true);
+        CHECK(res.sum_partial);
+        CHECK(res.K_sum == 7);
+        // req1 stage-2 + drain pass 1 (the stale response is held 600 ms)
+        CHECK(mock.wait_requests(2, 5000));
+        // while the stale pass-1 response is held: request 2 advances K_sum
+        // (second partial commit; its drain spawn must be rejected)
+        common_json body2 = make_body(make_sum_scenario_extended());
+        const sigma_strip_result res2 =
+            sigma_strip_maybe_rewrite(nullptr, p, make_req("t-p02r"), body2, true);
+        CHECK(res2.sum_partial);
+        CHECK(res2.K_sum > 7);
+        // drain pass 1 wakes: K_sum != cut (7) -> continue, not stop. Pass 2
+        // re-queries the new cut and completes -> 2 drain passes, one on the
+        // new cut.
+        CHECK(mock.wait_requests(4, 8000));
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        int drain_passes = 0, new_cut_passes = 0;
+        for (const auto & r : mock.all()) {
+            if (r.wait == false) {
+                ++drain_passes;
+                if (r.cut == res2.K_sum) ++new_cut_passes;
+            }
+        }
+        CHECK(drain_passes == 2);        // stale pass 1 (cut 7) + pass 2 (new cut)
+        CHECK(new_cut_passes == 1);      // the running thread finished the new cut
     }
 
     // --- P0-1 (reset): a prefix reset discards the pending Σ ----------------
