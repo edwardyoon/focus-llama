@@ -20,6 +20,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <functional>
 #include <mutex>
 #include <string>
@@ -110,6 +111,13 @@ public:
         std::lock_guard<std::mutex> lock(m_);
         response_ = std::move(r);
     }
+    // Queue responses in order (drain test: the partial block for the
+    // stage-2 wait:true fetch, then the complete block for the drain's
+    // wait:false pass). Falls back to response_ once the queue is empty.
+    void push_response(std::string r) {
+        std::lock_guard<std::mutex> lock(m_);
+        response_queue_.push_back(std::move(r));
+    }
     bool wait_requests(size_t n, int timeout_ms) {
         const auto deadline = std::chrono::steady_clock::now()
                 + std::chrono::milliseconds(timeout_ms);
@@ -179,7 +187,12 @@ private:
         {
             std::lock_guard<std::mutex> lock(m_);
             requests_.push_back(rq);
-            resp = response_;
+            if (!response_queue_.empty()) {
+                resp = std::move(response_queue_.front());
+                response_queue_.pop_front();
+            } else {
+                resp = response_;
+            }
         }
         const std::string out = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
                 "Content-Length: " + std::to_string(resp.size()) + "\r\n"
@@ -197,6 +210,7 @@ private:
     std::thread  accept_thr_;
     std::mutex   m_;
     std::string  response_ = R"({"block":"","partial":false})";
+    std::deque<std::string> response_queue_;
     std::vector<llm_mock_request> requests_;
 };
 
@@ -1061,11 +1075,12 @@ int main() {
         CHECK(rq.wait == true);
     }
 
-    // --- stage 2 llm: a partial block is a failure (stage held) -------------
-    // A partial block (JS claim skip / cut-mapping failure / chunk cap) would
-    // freeze an incomplete Σ; treat it as a fetch failure. The first strike
-    // holds stage 2 (stage-1 only, no removal); 3 strikes later the
-    // deterministic rule block takes over (see the fail test below).
+    // --- stage 2 llm: a partial block is applied (partial Σ) ---------------
+    // A partial block (JS claim skip / cut-mapping failure / chunk cap) is a
+    // valid cumulative Σ of what the server has absorbed so far. Apply it
+    // (commit K_sum, prepend the block) instead of holding stage 2: the
+    // server's hist_last_bytes advances only to the consumed bytes, so the
+    // next refresh absorbs the remainder and completes the Σ.
     {
         llm_mock_server mock;
         CHECK(mock.start());
@@ -1078,11 +1093,75 @@ int main() {
             sigma_strip_maybe_rewrite(nullptr, p, make_req("t-sum-llm-partial"), body, true);
         CHECK(res.eligible);
         CHECK(res.target_unreachable);
-        CHECK(!res.sum_applied);
-        CHECK(!res.sum_partial);
-        CHECK(res.sum_fail == 1);
+        CHECK(res.sum_applied);
+        CHECK(res.sum_partial);
+        CHECK(res.sum_fail == 0);
+        CHECK(res.K_sum == 7);
         CHECK(res.K == 8);
-        CHECK(body.at("messages").size() == 13);   // stage 1 only: no removal
+        CHECK(!res.sum_hash.empty());
+        CHECK(res.tokens_after < res.tokens_before);
+        const common_json & out = body.at("messages");
+        CHECK(out.size() == 7);
+        CHECK(out.at(0).at("role").get<std::string>() == "system");
+        const std::string u2 = out.at(1).at("content").get<std::string>();
+        CHECK(u2.rfind("LLM_PARTIAL_MARKER", 0) == 0);   // partial block applied
+        CHECK(mock.wait_requests(1, 2000));
+        const llm_mock_request rq = mock.last();
+        CHECK(rq.seen);
+        CHECK(rq.session == "t-sum-llm-partial");
+        CHECK(rq.cut == 7);
+        CHECK(rq.wait == true);
+    }
+
+    // --- stage 2 llm: partial commit -> background drain completes the block ---
+    // After committing a PARTIAL block (llm mode), a detached drain thread
+    // fires wait:false refresh passes until the server answers partial:false,
+    // then refreshes the committed block to the complete Σ. The queue serves
+    // the partial block to the stage-2 wait:true fetch (request 1) and the
+    // complete block to the drain's first wait:false pass (request 2). A
+    // second rewrite (K_sum unchanged -> no new fetch) must prepend the
+    // refreshed complete block.
+    {
+        llm_mock_server mock;
+        CHECK(mock.start());
+        mock.push_response(R"({"block":"LLM_PARTIAL_MARKER","partial":true})");
+        mock.push_response(R"({"block":"LLM_COMPLETE_MARKER","partial":false})");
+        common_params p = make_sum_params("on");
+        p.sigma_sum_mode = "llm";
+        p.focus_memory_host = mock.url();
+        p.sigma_sum_drain = true;
+        p.sigma_sum_drain_delay_ms = 0;   // no inter-pass spacing (fast test)
+        common_json body = make_body(make_sum_scenario());
+        const sigma_strip_result res =
+            sigma_strip_maybe_rewrite(nullptr, p, make_req("t-sum-llm-drain"), body, true);
+        CHECK(res.eligible);
+        CHECK(res.target_unreachable);
+        CHECK(res.sum_applied);
+        CHECK(res.sum_partial);
+        CHECK(res.K_sum == 7);
+        CHECK(res.K == 8);
+        const std::string u2 = body.at("messages").at(1).at("content").get<std::string>();
+        CHECK(u2.rfind("LLM_PARTIAL_MARKER", 0) == 0);   // partial block applied
+        // request 1 = stage-2 wait:true fetch; request 2 = the drain's pass
+        CHECK(mock.wait_requests(2, 5000));
+        const llm_mock_request rq = mock.last();
+        CHECK(rq.session == "t-sum-llm-drain");
+        CHECK(rq.cut == 7);
+        CHECK(rq.wait == false);   // the drain's pass
+        // The drain refreshes the committed block under the lock after its
+        // pass returns. Poll fresh rewrites (no new fetch: K_sum unchanged)
+        // until the complete Σ is prepended.
+        bool refreshed = false;
+        for (int i = 0; i < 200 && !refreshed; ++i) {
+            common_json body2 = make_body(make_sum_scenario());
+            sigma_strip_maybe_rewrite(nullptr, p, make_req("t-sum-llm-drain"), body2, true);
+            const std::string u2b = body2.at("messages").at(1).at("content").get<std::string>();
+            refreshed = (u2b.rfind("LLM_COMPLETE_MARKER", 0) == 0);
+            if (!refreshed) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+        }
+        CHECK(refreshed);   // committed block refreshed to the complete Σ
     }
 
     // --- stage 2 llm: failures hold stage 2, 3 strikes -> rule fallback -----

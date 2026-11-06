@@ -733,6 +733,16 @@ struct common_params {
     // Cooldown in ms after a failed focus-memory /sigma/refresh before the
     // next attempt (stage 2 "llm" mode). 0 = retry on the next request.
     int32_t     sigma_sum_fetch_cooldown_ms = 5000;
+    // Option A (incidents/2026-11-06-sigma-partial-block-not-completed.md):
+    // after a PARTIAL Σ block is committed (llm mode), a background thread
+    // drains the remainder of the removed region (wait:false /sigma/refresh
+    // passes, one 30k-char chunk each) and refreshes the committed block to the
+    // complete Σ when the server answers partial:false. false = leave the
+    // partial block as-is (the next K_sum advance re-fetches a fuller block).
+    bool        sigma_sum_drain = true;
+    // Delay in ms between drain passes — spaces the 27B extraction calls so
+    // live chat can interleave on the shared (parallel=1) slot.
+    int32_t     sigma_sum_drain_delay_ms = 5000;
     // sparse FA gate (DA n_kv_max): the CUDA/Metal sparse (gather) path is used
     // only while the finite KV rows are at most this % of the cache; dense
     // below. Bridged to FOCUS_SPARSE_GATE_THRESHOLD in the server main (1-100).

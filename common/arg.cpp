@@ -1885,6 +1885,24 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_SIGMA_SUM_FETCH_COOLDOWN_MS").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
+        {"--sigma-sum-drain"},
+        {"--no-sigma-sum-drain"},
+        "sigma-strip stage 2: after a PARTIAL Σ block is committed (llm mode), a background thread drains the remainder of the removed region (wait:false /sigma/refresh passes) and refreshes the block to the complete Σ (default: enabled)",
+        [](common_params & params, bool value) {
+            params.sigma_sum_drain = value;
+        }
+    ).set_env("LLAMA_ARG_SIGMA_SUM_DRAIN").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        {"--sigma-sum-drain-delay-ms"}, "N",
+        "sigma-strip stage 2: delay in ms between background Σ drain passes — spaces the 27B extraction calls so live chat can interleave on the shared (parallel=1) slot (default: 5000)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("error: --sigma-sum-drain-delay-ms must be >= 0 (got " + std::to_string(value) + ")");
+            }
+            params.sigma_sum_drain_delay_ms = value;
+        }
+    ).set_env("LLAMA_ARG_SIGMA_SUM_DRAIN_DELAY_MS").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
         {"--sparse-gate-threshold"}, "PCT",
         "DA sparse FA gate: use the sparse (gather) path only while the finite KV rows are at most PCT% of the cache, dense below that (1-100, default: 50)",
         [](common_params & params, int value) {
