@@ -821,6 +821,84 @@ bool sigma_refresh_fetch(const std::string & host, const std::string & token,
     }
 }
 
+// Option A (incidents/2026-11-06-sigma-partial-block-not-completed.md) drain
+// caps: the background thread keeps firing wait:false /sigma/refresh passes
+// (one 30k-char chunk each) until the removed region is fully absorbed
+// (partial:false). A 2.6 MB region is ~87 passes; at 15-40 s per 27B
+// extraction plus the inter-pass delay that is ~30-65 min, so a 1 h wall /
+// 200-pass cap bounds the drain while still covering most regions. A cap hit
+// leaves the partial block in place; the next K_sum advance re-fetches a
+// fuller block.
+constexpr int     SIGMA_SUM_DRAIN_MAX_PASSES  = 200;
+constexpr int64_t SIGMA_SUM_DRAIN_MAX_WALL_MS = 3600 * 1000;  // 1 h
+
+// Option A: after a PARTIAL Σ block is committed (llm mode), the server's
+// hist_last_bytes is short of the removed region's end. This background
+// thread keeps firing wait:false /sigma/refresh passes (one 30k-char chunk
+// each; the server is single-flight per session, so this is safe alongside
+// live chat's own stage-2 fetch and the 5a async fire) until the server
+// answers partial:false (region fully absorbed). On completion the committed
+// block is refreshed to the complete Σ (lock + K_sum revalidation).
+// Superseded (a newer stage-2 commit moved K_sum, or a prefix reset) -> stop;
+// the newer fetch owns the region. A pass failure stops the drain (the next
+// stage-2 fetch retries). Runs OUTSIDE the sigma_strip mutex except for the
+// short revalidation/commit sections. The supersession check is
+// st.K_sum != cut (NOT sum_gen) — a 5a async fire bumps sum_gen but leaves
+// K_sum unchanged and must not kill the drain (it absorbs the same region;
+// the drain continues past it).
+void sigma_strip_drain(std::string session, size_t cut,
+        std::string host, std::string token, int timeout_ms, int64_t delay_ms) {
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int pass = 1; pass <= SIGMA_SUM_DRAIN_MAX_PASSES; ++pass) {
+        if (pass > 1) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+        }
+        if (std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t0).count() > SIGMA_SUM_DRAIN_MAX_WALL_MS) {
+            SRV_WRN("sigma-strip: session=%s Σ drain wall cap (%lld ms) at pass %d: block left partial\n",
+                    session.c_str(), (long long) SIGMA_SUM_DRAIN_MAX_WALL_MS, pass);
+            return;
+        }
+        // superseded? (a newer stage-2 commit moved K_sum, or a prefix reset)
+        {
+            std::lock_guard<std::mutex> lock(sigma_strip_mutex());
+            auto it = sigma_strip_sessions().find(session);
+            if (it == sigma_strip_sessions().end() || it->second.K_sum != cut) {
+                SRV_INF("sigma-strip: session=%s Σ drain superseded before pass %d: stopping\n",
+                        session.c_str(), pass);
+                return;
+            }
+        }
+        std::string block;
+        bool partial = true;
+        std::string err;
+        const bool fetched = sigma_refresh_fetch(host, token, session, cut,
+                /*wait*/ false, timeout_ms, block, partial, err);
+        if (!fetched) {
+            SRV_WRN("sigma-strip: session=%s Σ drain pass %d failed (%s): stopping (next stage-2 fetch retries)\n",
+                    session.c_str(), pass, err.c_str());
+            return;
+        }
+        if (partial) {
+            continue;  // more of the region remains — next pass
+        }
+        // region fully absorbed — refresh the committed block to the complete Σ
+        {
+            std::lock_guard<std::mutex> lock(sigma_strip_mutex());
+            auto it = sigma_strip_sessions().find(session);
+            if (it != sigma_strip_sessions().end() && it->second.K_sum == cut) {
+                it->second.sum_block = block;
+                it->second.sum_hash = kv_offload_hash16(block);
+                SRV_INF("sigma-strip: session=%s Σ drain complete: block refreshed to %zu chars after %d pass(es)\n",
+                        session.c_str(), block.size(), pass);
+            }
+        }
+        return;
+    }
+    SRV_WRN("sigma-strip: session=%s Σ drain pass cap (%d): block left partial\n",
+            session.c_str(), SIGMA_SUM_DRAIN_MAX_PASSES);
+}
+
 } // namespace
 
 //
@@ -1184,16 +1262,21 @@ sigma_strip_result sigma_strip_maybe_rewrite(
                 const bool fetched = sigma_refresh_fetch(params.focus_memory_host, params.focus_memory_token,
                             session, K_sum_cand, /*wait*/ true, params.sigma_sum_timeout_ms,
                             block, block_partial, err);
-                if (fetched && !block_partial) {
+                if (fetched) {
                     block_ok = true;
-                } else if (fetched) {
-                    // A partial block (JS-side claim skip, cut-mapping failure,
-                    // or the chunk cap) would freeze an incomplete Σ until the
-                    // next K_sum advance. Treat it as a failure instead: after
-                    // SIGMA_SUM_RULE_FALLBACK_FAILS strikes the complete,
-                    // deterministic rule block takes over.
-                    SRV_WRN("sigma-strip: session=%s /sigma/refresh returned a partial block: treated as failure, stage 1 only this request\n",
-                            session.c_str());
+                    if (block_partial) {
+                        // A partial block (JS-side claim skip, cut-mapping
+                        // failure, or the chunk cap) is a valid cumulative Σ of
+                        // what the server has absorbed so far — apply it. The
+                        // server's hist_last_bytes advances only to the consumed
+                        // bytes, so the next refresh (stage-1 async absorption or
+                        // a later stage-2 fetch) absorbs the remainder from the
+                        // transcript and the next committed block completes the
+                        // Σ. Applying a partial block beats holding stage 2 and
+                        // removing the region with no summary at all.
+                        SRV_INF("sigma-strip: session=%s /sigma/refresh returned a partial block: applying partial Σ, the server absorbs the remainder on subsequent refreshes\n",
+                                session.c_str());
+                    }
                 } else {
                     // fail_count_at < SIGMA_SUM_RULE_FALLBACK_FAILS here: a
                     // request at or above the threshold takes the
@@ -1343,6 +1426,22 @@ sigma_strip_result sigma_strip_maybe_rewrite(
                 body["messages"] = rewritten;
             }
             // (lock released here)
+        }
+
+        // Σ drain (option A, incidents/2026-11-06-sigma-partial-block-not-completed.md):
+        // the committed block is partial — the removed region is larger than one
+        // 30k-char pass, so the server absorbed only a prefix. A detached thread
+        // keeps firing wait:false refreshes (one 30k-char chunk each, spaced by
+        // sigma_sum_drain_delay_ms so live chat can interleave on the shared
+        // slot) until the server answers partial:false, then refreshes the
+        // committed block to the complete Σ. A newer commit moving K_sum (or a
+        // prefix reset) or a pass failure stops it — the next stage-2 fetch
+        // retries. Caps: 200 passes / 1 h.
+        if (res.sum_partial && params.sigma_sum_drain) {
+            std::thread(sigma_strip_drain, session, K_sum_cand,
+                    params.focus_memory_host, params.focus_memory_token,
+                    params.sigma_sum_timeout_ms,
+                    (int64_t) params.sigma_sum_drain_delay_ms).detach();
         }
 
         // 5a) stage-1 absorption (llm mode only): a stage-1 advance stubs
