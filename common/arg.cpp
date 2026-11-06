@@ -1845,6 +1845,39 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_SIGMA_STRIP_WINDOW_TOKENS").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
+        {"--sigma-strip-min-gain"}, "FRAC",
+        "sigma-strip: futility guard - do not advance K (or K_sum) when the expected token savings of the advance are below this fraction of the window (0 = off, 0-1, default: 0.05)",
+        [](common_params & params, const std::string & value) {
+            const double frac = std::stod(value);
+            if (frac < 0.0 || frac > 1.0) {
+                throw std::invalid_argument("error: --sigma-strip-min-gain must be in [0,1] (got " + value + ")");
+            }
+            params.sigma_strip_min_gain = frac;
+        }
+    ).set_env("LLAMA_ARG_SIGMA_STRIP_MIN_GAIN").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        {"--sigma-strip-rearm-delta"}, "FRAC",
+        "sigma-strip: futility guard - rearm deadband - do not advance K (or K_sum) while usage is still within this fraction of the window of the usage recorded after the last committed advance (0 = off, 0-1, default: 0.05)",
+        [](common_params & params, const std::string & value) {
+            const double frac = std::stod(value);
+            if (frac < 0.0 || frac > 1.0) {
+                throw std::invalid_argument("error: --sigma-strip-rearm-delta must be in [0,1] (got " + value + ")");
+            }
+            params.sigma_strip_rearm_delta = frac;
+        }
+    ).set_env("LLAMA_ARG_SIGMA_STRIP_REARM_DELTA").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        {"--sigma-strip-futility-bypass-usage"}, "FRAC",
+        "sigma-strip: futility guard hard-limit bypass - when the pre-advance usage reaches this fraction of the window, the min-gain and rearm gates are bypassed and the advance is allowed (a small-gain re-prefill is always cheaper than riding usage to 1.0 and the multi-minute native compact; 0 = no bypass, 0-1, default: 0.90)",
+        [](common_params & params, const std::string & value) {
+            const double frac = std::stod(value);
+            if (frac < 0.0 || frac > 1.0) {
+                throw std::invalid_argument("error: --sigma-strip-futility-bypass-usage must be in [0,1] (got " + value + ")");
+            }
+            params.sigma_strip_futility_bypass_usage = frac;
+        }
+    ).set_env("LLAMA_ARG_SIGMA_STRIP_FUTILITY_BYPASS_USAGE").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
         {"--sigma-sum"}, "MODE",
         "sigma-strip stage 2: whole-message removal of the older region replaced by a frozen summary block - off (default, stage 2 disabled) | rule (server generates the block from the removed messages, no focus-memory) | llm (fetch the block from focus-memory /sigma/refresh; rule fallback after repeated failures)",
         [](common_params & params, const std::string & value) {

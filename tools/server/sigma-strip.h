@@ -47,6 +47,7 @@ struct sigma_strip_result {
     bool        k_advanced         = false; // K advanced this request
     bool        target_unreachable = false; // cannot reach target even stripping everything (phase-0 data)
     bool        floor_limited      = false; // advance stopped at the token floor, before the cap
+    int         skip               = 0;     // futility guard skip: 0=none, 1=gain, 2=rearm
     size_t      K                  = 0;     // K after this request
     size_t      n_messages         = 0;
     size_t      n_stripped         = 0;     // tool results stubbed within [0, K)
@@ -67,6 +68,7 @@ struct sigma_strip_result {
     int64_t     sum_fetch_ms       = 0;     // Σ block generation/fetch time (rule: local gen)
     bool        sum_partial        = false; // block was partial (llm mode)
     int         sum_fail           = 0;     // consecutive stage-2 fetch failures (0 = healthy)
+    bool        bypass             = false; // futility hard-limit bypass fired (usage >= bypass usage)
     std::string session;
 };
 

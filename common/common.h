@@ -720,6 +720,23 @@ struct common_params {
     // Client context-window size in tokens (the usage denominator). 0 = no
     // denominator, the feature stays inactive even in shadow/on mode.
     int32_t     sigma_strip_window_tokens  = 0;
+    // Futility guard (plans/appendix.md spec #2): suppress an advance whose
+    // expected token savings are below this fraction of the window (0 = off,
+    // default: 0.05). Applies to both the stage-1 K advance and the stage-2
+    // K_sum advance.
+    double      sigma_strip_min_gain       = 0.05;
+    // Futility guard (plans/appendix.md spec #2): rearm deadband - suppress
+    // an advance while usage is still within this fraction of the window of
+    // the usage recorded after the last committed advance (0 = off, default:
+    // 0.05). Prevents the chain re-prefill when usage lingers near the
+    // threshold after a small advance.
+    double      sigma_strip_rearm_delta    = 0.05;
+    // Futility guard hard-limit bypass (plans/appendix-bug.md P0-3): when the
+    // pre-advance usage reaches this fraction of the window, the min-gain and
+    // rearm gates are bypassed (advance allowed) — a small-gain re-prefill
+    // (tens of seconds) is always better than letting usage ride to 1.0 and
+    // trigger the multi-minute native compact. 0 = no bypass (default: 0.90).
+    double      sigma_strip_futility_bypass_usage = 0.90;
     // Sigma-strip stage 2 (plans/sigma_strip_compaction.md): whole-message
     // removal of the older region [0,K_sum) replaced by a frozen Σ block.
     // "off" (default) = stage 2 disabled (stage 1 only); "rule" = the server
