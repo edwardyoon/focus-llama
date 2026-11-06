@@ -71,6 +71,11 @@ struct llm_mock_request {
     bool        seen = false;
     // the "llm" routing hint (empty = MAIN_LLM default, "summary" = drain fast path)
     std::string llm;
+    // P0-4/P0-5: the anchor + the budget (absent = the old client/server)
+    bool        has_anchor = false;
+    std::string anchor_text;
+    int64_t     anchor_ordinal = -1;
+    int64_t     max_tokens = 0;
 };
 
 class llm_mock_server {
@@ -215,6 +220,18 @@ private:
             }
             if (j.contains("llm") && j["llm"].is_string()) {
                 rq.llm = j["llm"].get<std::string>();
+            }
+            if (j.contains("anchor") && j["anchor"].is_object()) {
+                rq.has_anchor = true;
+                if (j["anchor"].contains("text") && j["anchor"]["text"].is_string()) {
+                    rq.anchor_text = j["anchor"]["text"].get<std::string>();
+                }
+                if (j["anchor"].contains("ordinal") && j["anchor"]["ordinal"].is_number()) {
+                    rq.anchor_ordinal = j["anchor"]["ordinal"].get<int64_t>();
+                }
+            }
+            if (j.contains("max_tokens") && j["max_tokens"].is_number()) {
+                rq.max_tokens = j["max_tokens"].get<int64_t>();
             }
             rq.seen = true;
         } catch (const std::exception &) {
@@ -1564,6 +1581,241 @@ int main() {
         CHECK(!res2.k_advanced);
         const std::string u2 = body2.at("messages").at(1).at("content").get<std::string>();
         CHECK(u2.rfind("P05_PARTIAL", 0) == 0);
+    }
+
+    // --- P0-4: the anchor fingerprint (unit test C1) -------------------------
+    // The byte contract with the JS anchorNorm: role must be user, injected
+    // blocks stripped, every whitespace byte dropped, the first 60 code
+    // points kept (UTF-8 boundary safe).
+    {
+        common_json user = common_json::object();
+        user["role"] = std::string("user");
+        user["content"] = std::string("hello world");
+        CHECK(sigma_strip_test_anchor(user) == "helloworld");
+        common_json tool = common_json::object();
+        tool["role"] = std::string("tool");
+        tool["content"] = std::string("hello world");
+        CHECK(sigma_strip_test_anchor(tool).empty());   // non-user: no anchor
+        common_json tagged = common_json::object();
+        tagged["role"] = std::string("user");
+        tagged["content"] = std::string("<system-reminder>noise</system-reminder>abc");
+        CHECK(sigma_strip_test_anchor(tagged) == "abc");   // the block is stripped
+        std::string ko;
+        for (int i = 0; i < 70; ++i) ko += "\xEC\xA0\x9C";   // 70 Korean cp, 3 bytes each
+        common_json longko = common_json::object();
+        longko["role"] = std::string("user");
+        longko["content"] = ko;
+        CHECK(sigma_strip_test_anchor(longko).size() == 180);   // 60 cp x 3 bytes
+    }
+
+    // --- P0-4/P1-2: the stage-2 fetch carries the anchor + the budget (C2) ---
+    // The base scenario's boundary K_sum=7 is the "SECOND_MARKER" user: the
+    // fingerprint is its 60 code points, the ordinal counts the user
+    // messages in [0,7) (one), the budget is p.sigma_sum_max_tokens.
+    {
+        llm_mock_server mock;
+        CHECK(mock.start());
+        mock.set_response(R"({"block":"C2_BLOCK","partial":false})");
+        common_params p = make_sum_params("on");
+        p.sigma_sum_mode = "llm";
+        p.focus_memory_host = mock.url();
+        p.sigma_strip_min_gain = 0.0;
+        p.sigma_strip_rearm_delta = 0.0;
+        common_json body = make_body(make_sum_scenario());
+        const sigma_strip_result res =
+            sigma_strip_maybe_rewrite(nullptr, p, make_req("t-anchor-c2"), body, true);
+        CHECK(res.sum_applied);
+        CHECK(res.K_sum == 7);
+        CHECK(mock.wait_requests(1, 2000));
+        const llm_mock_request rq = mock.last();
+        CHECK(rq.wait == true);
+        CHECK(rq.has_anchor);
+        CHECK(rq.anchor_text == "SECOND_MARKER" + std::string(47, 'q'));   // 13 + 47 = 60 cp
+        CHECK(rq.anchor_ordinal == 1);
+        CHECK(rq.max_tokens == 500);   // make_sum_params: sigma_sum_max_tokens = 500
+    }
+
+    // --- P0-4: the 5a async fire sends no anchor but the budget (C3) --------
+    // A stage-1 advance (no stage-2 fire): the background absorption POSTs
+    // wait:false with cut = st.K. The 5a region [K_sum, K) has no boundary
+    // fingerprint worth sending — the count path maps it.
+    {
+        llm_mock_server mock;
+        CHECK(mock.start());
+        common_params p = make_params("on", 10000);
+        p.sigma_strip_target = 0.55;
+        p.sigma_sum_mode = "llm";
+        p.focus_memory_host = mock.url();
+        common_json body = make_body(make_messages(5, 8000));
+        const sigma_strip_result res =
+            sigma_strip_maybe_rewrite(nullptr, p, make_req("t-anchor-c3"), body, true);
+        CHECK(res.eligible);
+        CHECK(res.k_advanced);
+        CHECK(!res.target_unreachable);
+        CHECK(!res.sum_applied);                       // stage 2 never fired
+        CHECK(mock.wait_requests(1, 2000));
+        const llm_mock_request rq = mock.last();
+        CHECK(rq.wait == false);
+        CHECK(!rq.has_anchor);                         // no anchor key at all
+        CHECK(rq.max_tokens == 1500);                  // the default budget fallback
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    // --- P0-5: the drain stops after 3 no-progress passes (C4) --------------
+    // The server's hist_last_bytes is stuck at 100 (e.g. the anchor fails on
+    // every pass and the count path is stuck): three partial passes without
+    // progress stop the drain — exactly 3 passes, no 4th, the flag is
+    // released (a stuck flag would reject every later drain).
+    {
+        llm_mock_server mock;
+        CHECK(mock.start());
+        mock.push_response(R"({"block":"C4_PARTIAL","partial":true,"hist_last_bytes":100})");
+        mock.push_response(R"({"block":"C4_P1","partial":true,"hist_last_bytes":100})");
+        mock.push_response(R"({"block":"C4_P2","partial":true,"hist_last_bytes":100})");
+        mock.push_response(R"({"block":"C4_P3","partial":true,"hist_last_bytes":100})");
+        mock.push_response(R"({"block":"C4_P4","partial":true,"hist_last_bytes":100})");   // must go unused
+        common_params p = make_sum_params("on");
+        p.sigma_sum_mode = "llm";
+        p.focus_memory_host = mock.url();
+        p.sigma_sum_drain = true;
+        p.sigma_sum_drain_delay_ms = 0;
+        p.sigma_strip_min_gain = 0.0;
+        p.sigma_strip_rearm_delta = 0.0;
+        common_json body = make_body(make_sum_scenario());
+        const sigma_strip_result res =
+            sigma_strip_maybe_rewrite(nullptr, p, make_req("t-stall-c4"), body, true);
+        CHECK(res.sum_partial);
+        CHECK(res.K_sum == 7);
+        // stage-2 + exactly 3 drain passes
+        CHECK(mock.wait_requests(4, 5000));
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        int drain_passes = 0;
+        for (const auto & r : mock.all()) {
+            if (r.wait == false) ++drain_passes;
+        }
+        CHECK(drain_passes == 3);
+        CHECK(!sigma_strip_test_drain_running("t-stall-c4"));   // the flag is released
+    }
+
+    // --- P0-5: advancing hist_last_bytes resets the stall counter (C5) -----
+    // 100 -> 200 -> 300 between passes: the stall counter never reaches 3
+    // and the drain completes normally.
+    {
+        llm_mock_server mock;
+        CHECK(mock.start());
+        mock.push_response(R"({"block":"C5_PARTIAL","partial":true,"hist_last_bytes":100})");
+        mock.push_response(R"({"block":"C5_P1","partial":true,"hist_last_bytes":200})");
+        mock.push_response(R"({"block":"C5_P2","partial":true,"hist_last_bytes":300})");
+        mock.push_response(R"({"block":"C5_DONE","partial":false,"hist_last_bytes":400})");
+        common_params p = make_sum_params("on");
+        p.sigma_sum_mode = "llm";
+        p.focus_memory_host = mock.url();
+        p.sigma_sum_drain = true;
+        p.sigma_sum_drain_delay_ms = 0;
+        p.sigma_strip_min_gain = 0.0;
+        p.sigma_strip_rearm_delta = 0.0;
+        common_json body = make_body(make_sum_scenario());
+        const sigma_strip_result res =
+            sigma_strip_maybe_rewrite(nullptr, p, make_req("t-prog-c5"), body, true);
+        CHECK(res.sum_partial);
+        CHECK(mock.wait_requests(4, 5000));
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        int drain_passes = 0;
+        for (const auto & r : mock.all()) {
+            if (r.wait == false) ++drain_passes;
+        }
+        CHECK(drain_passes == 3);   // no stall stop: the drain completed
+        CHECK(!sigma_strip_test_drain_running("t-prog-c5"));
+    }
+
+    // --- P0-5: an old server (no progress fields) must not stall-stop (C6) --
+    // Six partial passes without hist_last_bytes, then complete: the stall
+    // detector stays off (missing = -1) and the drain finishes normally.
+    {
+        llm_mock_server mock;
+        CHECK(mock.start());
+        mock.push_response(R"({"block":"C6_PARTIAL","partial":true})");
+        for (int i = 1; i <= 5; ++i) {
+            mock.push_response(std::string(R"X({"block":"C6_P)X") + std::to_string(i)
+                    + R"X(","partial":true})X");
+        }
+        mock.push_response(R"({"block":"C6_DONE","partial":false})");
+        common_params p = make_sum_params("on");
+        p.sigma_sum_mode = "llm";
+        p.focus_memory_host = mock.url();
+        p.sigma_sum_drain = true;
+        p.sigma_sum_drain_delay_ms = 0;
+        p.sigma_strip_min_gain = 0.0;
+        p.sigma_strip_rearm_delta = 0.0;
+        common_json body = make_body(make_sum_scenario());
+        const sigma_strip_result res =
+            sigma_strip_maybe_rewrite(nullptr, p, make_req("t-old-c6"), body, true);
+        CHECK(res.sum_partial);
+        // stage-2 + 6 drain passes
+        CHECK(mock.wait_requests(7, 8000));
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        int drain_passes = 0;
+        for (const auto & r : mock.all()) {
+            if (r.wait == false) ++drain_passes;
+        }
+        CHECK(drain_passes == 6);
+        CHECK(!sigma_strip_test_drain_running("t-old-c6"));
+    }
+
+    // --- P0-4: the drain re-reads cut AND anchor when K_sum moves (C7) -----
+    // The chain-advance scenario: pass 1 is cut 7 (ordinal 1, the
+    // "SECOND_MARKER" user), pass 2 is cut 12 (ordinal 3, the 100-r user).
+    // The anchor must move with the boundary.
+    {
+        llm_mock_server mock;
+        CHECK(mock.start());
+        mock.push_response(R"({"block":"C7_D1","partial":true})");
+        mock.push_response(R"({"block":"C7_D2","partial":true})");
+        mock.push_response(R"({"block":"C7_D3","partial":true})");
+        mock.push_response(R"({"block":"C7_D4","partial":false})");
+        common_params p = make_sum_params("on");
+        p.sigma_sum_mode = "llm";
+        p.focus_memory_host = mock.url();
+        p.sigma_sum_drain = true;
+        p.sigma_sum_drain_delay_ms = 100;
+        p.sigma_strip_min_gain = 0.0;
+        p.sigma_strip_rearm_delta = 0.0;
+        common_json b1 = make_body(make_sum_scenario());
+        const sigma_strip_result res1 =
+            sigma_strip_maybe_rewrite(nullptr, p, make_req("t-anchor-c7"), b1, true);
+        CHECK(res1.sum_partial);
+        CHECK(res1.K_sum == 7);
+        CHECK(mock.wait_requests(2, 5000));
+        common_json b2 = make_body(make_sum_scenario_extended());
+        const sigma_strip_result res2 =
+            sigma_strip_maybe_rewrite(nullptr, p, make_req("t-anchor-c7"), b2, true);
+        CHECK(res2.sum_partial);
+        CHECK(res2.K_sum == 12);
+        CHECK(mock.wait_requests(4, 5000));
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        // all() returns a copy — take values, not addresses (the temporary
+        // dies at the end of the loop).
+        bool have_p1 = false;
+        bool have_p2 = false;
+        llm_mock_request p1;
+        llm_mock_request p2;
+        for (const auto & r : mock.all()) {
+            if (r.wait == false) {
+                if (r.cut == 7) {
+                    p1 = r;
+                    have_p1 = true;
+                } else if (r.cut == 12) {
+                    p2 = r;
+                    have_p2 = true;
+                }
+            }
+        }
+        CHECK(have_p1);
+        CHECK(have_p2);
+        CHECK(p1.anchor_ordinal == 1);
+        CHECK(p1.anchor_text == "SECOND_MARKER" + std::string(47, 'q'));
+        CHECK(p2.anchor_ordinal == 3);
+        CHECK(p2.anchor_text == std::string(60, 'r'));
     }
 
     // --- stage 2 llm: failures hold stage 2, 3 strikes -> rule fallback -----

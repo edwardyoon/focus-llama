@@ -335,6 +335,12 @@ struct sigma_strip_session_state {
     // block was drained for; it applies only while K_sum has not moved.
     std::string pending_block;
     size_t      pending_cut = 0;
+    // P0-4/P0-5: stamped at the [C] commit — the drain thread has no
+    // messages, so it reads the anchor (and the progress baseline) from
+    // here each pass.
+    std::string sum_anchor_text;          // fingerprint of messages[K_sum] ("" = none)
+    int64_t     sum_anchor_ordinal = -1;  // which user message (count in [0,K_sum))
+    int64_t     sum_hist_last = -1;       // server's last hist_last_bytes (-1 = unknown)
     // P1-2: stamped from maybe_rewrite ([A], same place as window) so the
     // drain thread can validate the completed Σ block against the budget
     // OUTSIDE the session lock (at drain completion). The [C] commit no
@@ -522,6 +528,61 @@ std::string strip_injected_blocks(const std::string & s) {
     }
     const size_t e = out.find_last_not_of(" \t\r\n");
     return out.substr(b, e - b + 1);
+}
+
+// P0-4: the anchor = the user message fingerprint. It must follow the same
+// byte rules as the JS anchorNorm (spec §1 fingerprint rules) — the JS side
+// matches this fingerprint against the transcript's user lines, so the
+// normalization is part of the contract: strip injected blocks, drop every
+// whitespace byte, keep the first 60 code points (UTF-8 boundary safe).
+std::string sigma_anchor_text(const common_json & msg) {
+    if (!msg.is_object() || json_string_or(msg, "role") != "user") {
+        return "";
+    }
+    std::string t = strip_injected_blocks(message_text(msg));
+    std::string out;
+    out.reserve(t.size());
+    for (unsigned char c : t) {
+        if (c > ' ') {
+            out += (char) c;
+        }
+    }
+    size_t cp = 0;
+    while (cp < 60 && !out.empty()) {
+        size_t pos = 0;
+        while (pos < out.size() && cp < 60) {
+            const unsigned char c = (unsigned char) out[pos];
+            size_t len = 1;
+            if (c >= 0xF0) len = 4;
+            else if (c >= 0xE0) len = 3;
+            else if (c >= 0xC0) len = 2;
+            if (pos + len > out.size()) {
+                break;
+            }
+            pos += len;
+            ++cp;
+        }
+        if (pos < out.size()) {
+            out = out.substr(0, pos);
+        }
+        if (cp >= 60) {
+            break;
+        }
+    }
+    return out;
+}
+
+// P0-4: which user message the anchor is — the count of user messages in
+// [0, cut). The JS side matches it against the ordinal of the user line in
+// the transcript index (1-based).
+int64_t sigma_user_ordinal(const common_json & messages, size_t cut) {
+    int64_t ord = 0;
+    for (size_t i = 0; i < cut && i < messages.size(); ++i) {
+        if (messages.at(i).is_object() && json_string_or(messages.at(i), "role") == "user") {
+            ++ord;
+        }
+    }
+    return ord;
 }
 
 // Best-effort ok/error for a shell command: scan the first 200 chars of the
@@ -828,7 +889,15 @@ constexpr int SIGMA_SUM_RULE_FALLBACK_FAILS = 3;
 bool sigma_refresh_fetch(const std::string & host, const std::string & token,
         const std::string & session, size_t cut, bool wait, int timeout_ms,
         const std::string & llm,
-        std::string & out_block, bool & out_partial, std::string & err) {
+        const std::string & anchor_text, int64_t anchor_ordinal, int64_t max_tokens,
+        std::string & out_block, bool & out_partial,
+        int64_t & out_hist_last, int64_t & out_to_bytes, std::string & out_map,
+        std::string & err) {
+    // P0-5: the progress outputs are initialized so the failure paths leave
+    // them at the "unknown" values (the drain's stall check ignores -1).
+    out_hist_last = -1;
+    out_to_bytes = -1;
+    out_map.clear();
     if (host.empty() || session.empty()) {
         err = "no host/session";
         return false;
@@ -851,6 +920,19 @@ bool sigma_refresh_fetch(const std::string & host, const std::string & token,
         body["wait"] = wait;
         if (!llm.empty()) {
             body["llm"] = llm;
+        }
+        // P0-4: the anchor (the fingerprint of the boundary's user message) —
+        // the server maps cut via the transcript index; an empty text sends
+        // no anchor key at all (the count path). P1-2: the Σ budget, so the
+        // server can render within it.
+        if (!anchor_text.empty()) {
+            common_json a;
+            a["text"] = anchor_text;
+            a["ordinal"] = anchor_ordinal;
+            body["anchor"] = a;
+        }
+        if (max_tokens > 0) {
+            body["max_tokens"] = max_tokens;
         }
         auto res = cli.Post(path, body.dump(), "application/json");
         if (!res) {
@@ -876,6 +958,14 @@ bool sigma_refresh_fetch(const std::string & host, const std::string & token,
         } else {
             out_partial = true;
         }
+        // P0-5: the progress fields — missing = -1/"" (an old server without
+        // them; the drain's stall check only fires when the server gives a
+        // value).
+        out_hist_last = (j.contains("hist_last_bytes") && j["hist_last_bytes"].is_number())
+                ? j["hist_last_bytes"].get<int64_t>() : -1;
+        out_to_bytes = (j.contains("to_bytes") && j["to_bytes"].is_number())
+                ? j["to_bytes"].get<int64_t>() : -1;
+        out_map = (j.contains("map") && j["map"].is_string()) ? j["map"].get<std::string>() : "";
         if (out_block.empty()) {
             if (wait) {
                 err = "empty block";
@@ -904,6 +994,10 @@ bool sigma_refresh_fetch(const std::string & host, const std::string & token,
 // fuller block.
 constexpr int     SIGMA_SUM_DRAIN_MAX_PASSES  = 200;
 constexpr int64_t SIGMA_SUM_DRAIN_MAX_WALL_MS = 3600 * 1000;  // 1 h
+// P0-5: the server's hist_last_bytes not advancing for this many
+// consecutive passes = the passes are spinning (e.g. the anchor fails on
+// every pass and the count path is stuck): stop.
+constexpr int SIGMA_SUM_DRAIN_STALL_PASSES = 3;
 
 // Option A: after a PARTIAL Σ block is committed (llm mode), the server's
 // hist_last_bytes is short of the removed region's end. This background
@@ -959,7 +1053,8 @@ static void sigma_validate_block(const struct llama_vocab * vocab, std::string &
 }
 
 void sigma_strip_drain(std::string session, size_t cut,
-        std::string host, std::string token, int timeout_ms, int64_t delay_ms) {
+        std::string host, std::string token, int timeout_ms, int64_t delay_ms,
+        int64_t max_tokens) {
     // P0-2 residual: drain_running is released atomically with the stop
     // decision, in the same lock (no RAII guard). The spawn site rejects a
     // new drain while the flag is held; if the thread stopped without
@@ -970,6 +1065,15 @@ void sigma_strip_drain(std::string session, size_t cut,
     const auto t0 = std::chrono::steady_clock::now();
     const struct llama_vocab * block_vocab = nullptr;   // P1-2: stamped by [A]
     double block_sum_budget = 0.0;
+    // P0-5: the no-progress detector — the server's hist_last_bytes must
+    // advance between passes. -2 = not yet initialized (the first lock sets
+    // it from sum_hist_last, the value at the last commit).
+    int64_t prev_hist = -2;
+    int stall = 0;
+    // P0-4: the anchor, re-read from the session state each pass (a K_sum
+    // advance mid-drain moves the boundary's user message with it).
+    std::string anchor_text;
+    int64_t anchor_ord = -1;
     for (int pass = 1; pass <= SIGMA_SUM_DRAIN_MAX_PASSES; ++pass) {
         if (pass > 1) {
             std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
@@ -1008,13 +1112,24 @@ void sigma_strip_drain(std::string session, size_t cut,
             cut = it->second.K_sum;                 // pick up the latest cut
             block_vocab = it->second.block_vocab;   // P1-2: lock-free validate
             block_sum_budget = (double) it->second.block_sum_budget;
+            // P0-4: the anchor moves with the boundary; P0-5: the progress
+            // baseline is the value at the last commit (the first pass
+            // compares against it, not against nothing).
+            anchor_text = it->second.sum_anchor_text;
+            anchor_ord  = it->second.sum_anchor_ordinal;
+            if (prev_hist == -2) prev_hist = it->second.sum_hist_last;
         }
         const auto pass_start = std::chrono::steady_clock::now();
         std::string block;
         bool partial = true;
         std::string err;
+        int64_t hist_last = -1;
+        int64_t to_bytes = -1;
+        std::string map;
         const bool fetched = sigma_refresh_fetch(host, token, session, cut,
-                /*wait*/ false, timeout_ms, /*llm*/ "summary", block, partial, err);
+                /*wait*/ false, timeout_ms, /*llm*/ "summary",
+                anchor_text, anchor_ord, max_tokens,
+                block, partial, hist_last, to_bytes, map, err);
         const int64_t pass_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - pass_start).count();
         if (!fetched) {
@@ -1030,8 +1145,28 @@ void sigma_strip_drain(std::string session, size_t cut,
         const int64_t elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - t0).count();
         if (partial) {
-            SRV_INF("sigma-strip: session=%s Σ drain pass %d partial pass_ms=%lld elapsed_ms=%lld\n",
-                    session.c_str(), pass, (long long) pass_ms, (long long) elapsed_ms);
+            SRV_INF("sigma-strip: session=%s Σ drain pass %d partial pass_ms=%lld elapsed_ms=%lld hist_last=%lld to=%lld map=%s\n",
+                    session.c_str(), pass, (long long) pass_ms, (long long) elapsed_ms,
+                    (long long) hist_last, (long long) to_bytes, map.c_str());
+            // P0-5: the server's hist_last_bytes must advance between
+            // passes. Three consecutive passes without progress mean the
+            // passes are spinning (e.g. the anchor fails on every pass and
+            // the count path is stuck) — stop, leaving the partial block in
+            // place; the next K_sum advance re-fetches a fuller block.
+            if (hist_last >= 0) {
+                if (prev_hist >= 0 && hist_last <= prev_hist) ++stall; else stall = 0;
+                prev_hist = hist_last;
+                if (stall >= SIGMA_SUM_DRAIN_STALL_PASSES) {
+                    SRV_WRN("sigma-strip: session=%s Σ drain no-progress: hist_last=%lld unchanged for %d passes (to=%lld map=%s): stopping, block left partial\n",
+                            session.c_str(), (long long) hist_last, stall, (long long) to_bytes, map.c_str());
+                    // P0-2 residual: the stop decision and the flag release
+                    // share this lock (every exit path does).
+                    std::lock_guard<std::mutex> lock(sigma_strip_mutex());
+                    auto it = sigma_strip_sessions().find(session);
+                    if (it != sigma_strip_sessions().end()) it->second.drain_running = false;
+                    return;
+                }
+            }
             continue;  // more of the region remains — next pass
         }
         // P1-2: validate the complete block against the Σ budget OUTSIDE the
@@ -1197,6 +1332,13 @@ sigma_strip_result sigma_strip_maybe_rewrite(
         bool do_fetch = false;
         bool rule_fallback = false;  // threshold reached in [A]: rule block, no llm fetch
         size_t K_sum_cand = 0;
+        // P0-4/P0-5: the stage-2 fetch's anchor + the response's progress
+        // fields (set in [A]/[B], stamped into the session state in [C]).
+        std::string anchor_text_at;
+        int64_t     anchor_ord_at = -1;
+        int64_t     block_hist_last = -1;
+        int64_t     block_to_bytes = -1;
+        std::string block_map;
         uint64_t gen_at = 0;
         std::string fp_at;
         int fail_count_at = 0;   // consecutive failures when the fetch was set (llm fallback)
@@ -1259,6 +1401,10 @@ sigma_strip_result sigma_strip_maybe_rewrite(
                 st.pending_block.clear();
                 st.pending_cut = 0;
                 st.sum_partial = false;
+                // P0-4: the anchor and the progress baseline are void too.
+                st.sum_anchor_text.clear();
+                st.sum_anchor_ordinal = -1;
+                st.sum_hist_last = -1;
                 // futility guard: the rearm anchor is void with the prefix.
                 st.last_adv_usage_after = 0.0;
                 st.last_skip = 0;
@@ -1492,6 +1638,14 @@ sigma_strip_result sigma_strip_maybe_rewrite(
                         fp_at = prefix_fingerprint(messages, st.K);
                         fail_count_at = st.sum_fetch_fail_count;
                         rule_fallback = (fail_count_at >= SIGMA_SUM_RULE_FALLBACK_FAILS);
+                        // P0-4: the anchor for the [B] fetch — the fingerprint
+                        // of the new boundary's user message. The drain later
+                        // reads it from the session state (it has no messages).
+                        if (K_sum_cand < n) {
+                            anchor_text_at = sigma_anchor_text(messages.at(K_sum_cand));
+                            anchor_ord_at  = anchor_text_at.empty() ? -1
+                                    : sigma_user_ordinal(messages, K_sum_cand);
+                        }
                         if (bypass) {
                             res.bypass = true;
                         }
@@ -1534,7 +1688,9 @@ sigma_strip_result sigma_strip_maybe_rewrite(
                 std::string err;
                 const bool fetched = sigma_refresh_fetch(params.focus_memory_host, params.focus_memory_token,
                             session, K_sum_cand, /*wait*/ true, params.sigma_sum_timeout_ms,
-                            /*llm*/ "", block, block_partial, err);
+                            /*llm*/ "", anchor_text_at, anchor_ord_at, sum_budget,
+                            block, block_partial, block_hist_last, block_to_bytes,
+                            block_map, err);
                 if (fetched) {
                     block_ok = true;
                     if (block_partial) {
@@ -1624,6 +1780,11 @@ sigma_strip_result sigma_strip_maybe_rewrite(
                     st.sum_partial = block_partial;
                     st.pending_block.clear();
                     st.pending_cut = 0;
+                    // P0-4/P0-5: the drain's anchor + progress baseline (a
+                    // rule block has no server state — hist_last stays -1).
+                    st.sum_anchor_text    = anchor_text_at;
+                    st.sum_anchor_ordinal = anchor_ord_at;
+                    st.sum_hist_last      = block_hist_last;
                 }
             }
             // P0-1: apply the pending complete Σ at an advance — this request
@@ -1780,7 +1941,8 @@ sigma_strip_result sigma_strip_maybe_rewrite(
                 std::thread(sigma_strip_drain, session, K_sum_cand,
                         params.focus_memory_host, params.focus_memory_token,
                         drain_timeout,
-                        (int64_t) params.sigma_sum_drain_delay_ms).detach();
+                        (int64_t) params.sigma_sum_drain_delay_ms,
+                        (int64_t) sum_budget).detach();
             }
         }
 
@@ -1811,16 +1973,26 @@ sigma_strip_result sigma_strip_maybe_rewrite(
                 const std::string host = params.focus_memory_host;
                 const std::string token = params.focus_memory_token;
                 const int timeout_ms = params.sigma_sum_timeout_ms;
-                std::thread([host, token, session, cut, timeout_ms, gen]() {
+                const int64_t max_tokens = sum_budget;
+                std::thread([host, token, session, cut, timeout_ms, max_tokens, gen]() {
                     std::string block;
                     bool partial = false;
                     std::string err;
+                    int64_t hist_last = -1;
+                    int64_t to_bytes = -1;
+                    std::string map;
                     // P1-1: the fast summary model (like the drain) — the
                     // background absorption must not contend for the main 27B
                     // slot. The stage-2 wait:true fetch (request path) keeps
                     // the default model on purpose (extraction quality).
+                    // P0-4: no anchor here (the 5a region [K_sum, K) has no
+                    // boundary fingerprint worth sending) — the count path
+                    // maps it. P1-2: the budget, so the server can render
+                    // within it.
                     if (!sigma_refresh_fetch(host, token, session, cut, /*wait*/ false,
-                                timeout_ms, /*llm*/ "summary", block, partial, err)) {
+                                timeout_ms, /*llm*/ "summary",
+                                /*anchor_text*/ "", /*anchor_ordinal*/ -1, max_tokens,
+                                block, partial, hist_last, to_bytes, map, err)) {
                         SRV_WRN("sigma-strip: session=%s async /sigma/refresh (wait:false) failed: %s\n",
                                 session.c_str(), err.c_str());
                     }
@@ -1939,4 +2111,19 @@ void sigma_strip_note_response(
 // g_test_fetch_fault above.
 void sigma_strip_test_set_fetch_fault(bool on) {
     g_test_fetch_fault.store(on, std::memory_order_relaxed);
+}
+
+// Test-only (tests/test-sigma-strip.cpp, C1): the P0-4 anchor fingerprint of
+// one message, exposed for the unit test (sigma_anchor_text is file-local).
+std::string sigma_strip_test_anchor(const common_json & msg) {
+    return sigma_anchor_text(msg);
+}
+
+// Test-only (tests/test-sigma-strip.cpp, C4): the per-session drain flag —
+// the no-progress stop must release it (a stuck flag would reject every
+// later drain for the session).
+bool sigma_strip_test_drain_running(const std::string & session) {
+    std::lock_guard<std::mutex> lock(sigma_strip_mutex());
+    auto it = sigma_strip_sessions().find(session);
+    return it != sigma_strip_sessions().end() && it->second.drain_running;
 }
