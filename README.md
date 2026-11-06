@@ -361,8 +361,8 @@ qwen-code ── full history (original) ──▶ focus-llama
                                                 │      "[read_file result stripped — path=..., N tokens. Re-read if needed]"
                                                 │
                                                 ├─ 3. insert a frozen Σ snapshot at K
-                                                │      (merged from focus-memory's periodic skill.state
-                                                │      extractions, when enabled)
+                                                │      (fetched from focus-memory's per-session Σ
+                                                │      lineage, when enabled)
                                                 │
                                                 └─ 4. run the model on the shorter prompt
                                            │
