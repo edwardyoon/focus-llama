@@ -335,6 +335,13 @@ struct sigma_strip_session_state {
     // block was drained for; it applies only while K_sum has not moved.
     std::string pending_block;
     size_t      pending_cut = 0;
+    // P1-2: stamped from maybe_rewrite ([A], same place as window) so the
+    // drain thread can validate the completed Σ block against the budget
+    // OUTSIDE the session lock (at drain completion). The [C] commit no
+    // longer tokenizes under the lock — the block is already within budget
+    // by the time it becomes pending.
+    const struct llama_vocab * block_vocab = nullptr;
+    int64_t     block_sum_budget = 0;
 };
 
 std::mutex & sigma_strip_mutex() {
@@ -928,38 +935,41 @@ static void sigma_validate_block(const struct llama_vocab * vocab, std::string &
     if (cap_tokens <= 0) {
         return;
     }
-    const int64_t n_tokens = estimate_tokens(vocab, block);
+    int64_t n_tokens = estimate_tokens(vocab, block);
     if (n_tokens <= cap_tokens) {
         return;
     }
-    // byte estimate: tokens = bytes / 4, so a char-clamp to cap_tokens x 4
-    // keeps the estimate at or below the cap (the real tokenizer may differ,
-    // but shorter text only lowers the count — the clamp direction is safe).
-    block = clamp_chars(block, (size_t) (cap_tokens * 4));
-    static std::atomic<bool> warned(false);
-    if (!warned.exchange(true)) {
-        SRV_WRN("sigma-strip: session=%s Σ block over budget (%lld tokens > %lld cap): clamped to the token cap\n",
-                session.c_str(), (long long) n_tokens, (long long) cap_tokens);
+    // P1-2: the byte estimate (tokens ~= bytes/4) is language-dependent —
+    // Korean and code pack more bytes per token, so a single clamp to
+    // cap_tokens*4 can still land over the cap. Re-estimate and trim ~10%
+    // per iteration (max 8) until the real tokenizer count is at or below
+    // the cap. If it is still over after 8 trims, warn once and keep the
+    // best-effort block (never drop the summary entirely).
+    for (int i = 0; i < 8 && n_tokens > cap_tokens; ++i) {
+        block = clamp_chars(block, (size_t) (block.size() * 0.90));
+        n_tokens = estimate_tokens(vocab, block);
+    }
+    if (n_tokens > cap_tokens) {
+        static std::atomic<bool> warned(false);
+        if (!warned.exchange(true)) {
+            SRV_WRN("sigma-strip: session=%s Σ block still over budget after 8 trims (%lld tokens > %lld cap): kept best-effort\n",
+                    session.c_str(), (long long) n_tokens, (long long) cap_tokens);
+        }
     }
 }
 
 void sigma_strip_drain(std::string session, size_t cut,
         std::string host, std::string token, int timeout_ms, int64_t delay_ms) {
-    // The spawn site set drain_running=true under the lock before spawning us;
-    // release it on every exit path (RAII) so a later partial commit can spawn
-    // a fresh drain. Covers the wall-cap, stop, pass-fail and complete
-    // returns alike.
-    struct drain_flag_release {
-        std::string session;
-        ~drain_flag_release() {
-            std::lock_guard<std::mutex> lock(sigma_strip_mutex());
-            auto it = sigma_strip_sessions().find(session);
-            if (it != sigma_strip_sessions().end()) {
-                it->second.drain_running = false;
-            }
-        }
-    } release{session};
+    // P0-2 residual: drain_running is released atomically with the stop
+    // decision, in the same lock (no RAII guard). The spawn site rejects a
+    // new drain while the flag is held; if the thread stopped without
+    // clearing the flag in the same lock as its decision, a concurrent
+    // partial commit would be wrongly rejected and the newer region
+    // stranded until the next advance. Every exit path clears the flag in
+    // the lock that makes the stop decision (or keeps it when continuing).
     const auto t0 = std::chrono::steady_clock::now();
+    const struct llama_vocab * block_vocab = nullptr;   // P1-2: stamped by [A]
+    double block_sum_budget = 0.0;
     for (int pass = 1; pass <= SIGMA_SUM_DRAIN_MAX_PASSES; ++pass) {
         if (pass > 1) {
             std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
@@ -968,6 +978,11 @@ void sigma_strip_drain(std::string session, size_t cut,
                 std::chrono::steady_clock::now() - t0).count() > SIGMA_SUM_DRAIN_MAX_WALL_MS) {
             SRV_WRN("sigma-strip: session=%s Σ drain wall cap (%lld ms) at pass %d: block left partial\n",
                     session.c_str(), (long long) SIGMA_SUM_DRAIN_MAX_WALL_MS, pass);
+            {
+                std::lock_guard<std::mutex> lock(sigma_strip_mutex());
+                auto it = sigma_strip_sessions().find(session);
+                if (it != sigma_strip_sessions().end()) it->second.drain_running = false;
+            }
             return;
         }
         // P0-2: re-query cut + sum_partial under the lock each pass instead of
@@ -975,18 +990,24 @@ void sigma_strip_drain(std::string session, size_t cut,
         // its own spawn was rejected (drain_running is still true), so this
         // running thread picks up the new cut on its next pass. Only a
         // vanished session, a prefix reset (K_sum == 0) or a non-partial state
-        // stops it.
+        // stops it. The stop decision and the flag release share this lock.
         {
             std::lock_guard<std::mutex> lock(sigma_strip_mutex());
             auto it = sigma_strip_sessions().find(session);
-            if (it == sigma_strip_sessions().end()
-                    || it->second.K_sum == 0
-                    || !it->second.sum_partial) {
-                SRV_INF("sigma-strip: session=%s Σ drain stopped before pass %d (reset/complete/vanished): stopping\n",
+            if (it == sigma_strip_sessions().end()) {
+                SRV_INF("sigma-strip: session=%s Σ drain stopped before pass %d (vanished): stopping\n",
                         session.c_str(), pass);
+                return;  // no session state left to release
+            }
+            if (it->second.K_sum == 0 || !it->second.sum_partial) {
+                SRV_INF("sigma-strip: session=%s Σ drain stopped before pass %d (reset/complete): stopping\n",
+                        session.c_str(), pass);
+                it->second.drain_running = false;  // atomic with the decision
                 return;
             }
-            cut = it->second.K_sum;  // pick up the latest cut
+            cut = it->second.K_sum;                 // pick up the latest cut
+            block_vocab = it->second.block_vocab;   // P1-2: lock-free validate
+            block_sum_budget = (double) it->second.block_sum_budget;
         }
         const auto pass_start = std::chrono::steady_clock::now();
         std::string block;
@@ -999,6 +1020,11 @@ void sigma_strip_drain(std::string session, size_t cut,
         if (!fetched) {
             SRV_WRN("sigma-strip: session=%s Σ drain pass %d failed (pass_ms=%lld, %s): stopping (next stage-2 fetch retries)\n",
                     session.c_str(), pass, (long long) pass_ms, err.c_str());
+            {
+                std::lock_guard<std::mutex> lock(sigma_strip_mutex());
+                auto it = sigma_strip_sessions().find(session);
+                if (it != sigma_strip_sessions().end()) it->second.drain_running = false;
+            }
             return;
         }
         const int64_t elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1008,12 +1034,21 @@ void sigma_strip_drain(std::string session, size_t cut,
                     session.c_str(), pass, (long long) pass_ms, (long long) elapsed_ms);
             continue;  // more of the region remains — next pass
         }
-        // P0-1: region fully absorbed — hold the complete Σ PENDING (do not
-        // swap sum_block: it is prepended to the front of the prefix, so an
-        // out-of-band swap would invalidate the whole KV from there — an
-        // un-planned re-prefill). The next K/K_sum advance applies it,
-        // piggy-backing on a request that re-prefills anyway. Only while
-        // K_sum has not moved.
+        // P1-2: validate the complete block against the Σ budget OUTSIDE the
+        // session lock (at drain completion). The [C] commit path no longer
+        // tokenizes under the lock — the block is already within budget by the
+        // time it becomes pending.
+        sigma_validate_block(block_vocab, block, block_sum_budget, session);
+        // P0-1 + P0-2 residual: region fully absorbed. Hold the complete Σ
+        // PENDING (do not swap sum_block: it is prepended to the front of the
+        // prefix, so an out-of-band swap would invalidate the whole KV from
+        // there — an un-planned re-prefill). The next K/K_sum advance applies
+        // it, piggy-backing on a request that re-prefills anyway.
+        // P0-2 residual: if K_sum moved while this pass was in flight (a newer
+        // partial commit; its spawn was rejected because we hold the flag), do
+        // NOT stop — the next pass re-queries the new cut and keeps draining.
+        // Only while K_sum == cut do we commit the pending block and clear the
+        // flag, atomically in this same lock.
         {
             std::lock_guard<std::mutex> lock(sigma_strip_mutex());
             auto it = sigma_strip_sessions().find(session);
@@ -1022,14 +1057,23 @@ void sigma_strip_drain(std::string session, size_t cut,
                 it->second.pending_block = std::move(block);
                 it->second.pending_cut = cut;
                 it->second.sum_partial = false;
+                it->second.drain_running = false;  // atomic with the stop decision
                 SRV_INF("sigma-strip: session=%s Σ drain complete: %zu-char block pending after %d pass(es) pass_ms=%lld elapsed_ms=%lld pending=1\n",
                         session.c_str(), n_chars, pass, (long long) pass_ms, (long long) elapsed_ms);
+                return;
             }
+            // K_sum moved — a newer region was committed while this pass ran.
+            // Keep the flag; the next pass re-queries the new cut.
         }
-        return;
+        // fall through to the next pass (K_sum != cut)
     }
     SRV_WRN("sigma-strip: session=%s Σ drain pass cap (%d): block left partial\n",
             session.c_str(), SIGMA_SUM_DRAIN_MAX_PASSES);
+    {
+        std::lock_guard<std::mutex> lock(sigma_strip_mutex());
+        auto it = sigma_strip_sessions().find(session);
+        if (it != sigma_strip_sessions().end()) it->second.drain_running = false;
+    }
 }
 
 } // namespace
@@ -1170,6 +1214,8 @@ sigma_strip_result sigma_strip_maybe_rewrite(
             std::lock_guard<std::mutex> lock(sigma_strip_mutex());
             sigma_strip_session_state & st = sigma_strip_sessions()[session];
             st.window = params.sigma_strip_window_tokens;
+            st.block_vocab = vocab;               // P1-2: drain validates outside the lock
+            st.block_sum_budget = sum_budget;
 
             // 2) prefix fingerprint check (reset on client compact / /clear / resume)
             if (st.K > 0) {
@@ -1588,9 +1634,8 @@ sigma_strip_result sigma_strip_maybe_rewrite(
             // while the cut the block was drained for has not moved.
             if ((res.k_advanced || sum_advanced) && !st.pending_block.empty()
                     && st.pending_cut == st.K_sum) {
-                // P1-2: the drain's block passes the same budget check before
-                // it is committed.
-                sigma_validate_block(vocab, st.pending_block, sum_budget, session);
+                // P1-2: the block was already validated against the budget at
+                // drain completion (outside this lock) — no tokenization here.
                 const size_t n_chars = st.pending_block.size();
                 st.sum_block = std::move(st.pending_block);
                 st.sum_hash = kv_offload_hash16(st.sum_block);
