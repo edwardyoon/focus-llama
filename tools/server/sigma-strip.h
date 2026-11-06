@@ -122,8 +122,17 @@ std::string sigma_strip_config_check(const common_params & params);
 //   test_anchor: the P0-4 fingerprint of one message (unit test C1).
 //   test_drain_running: the per-session drain flag (unit test C4 — the
 //   no-progress stop must release it).
+//   test_evict_idle: the idle-eviction scan with a deterministic clock.
+//   test_touch: stamp a session's last_request_ms directly.
+//   test_set_drain_running: force the per-session drain flag (eviction must
+//   skip flagged sessions).
+//   test_session_exists: whether the session map holds an entry.
 #ifdef SIGMA_STRIP_TESTS
 void sigma_strip_test_set_fetch_fault(bool on);
 std::string sigma_strip_test_anchor(const common_json & msg);
 bool sigma_strip_test_drain_running(const std::string & session);
+size_t sigma_strip_test_evict_idle(int64_t now_ms);
+void sigma_strip_test_touch(const std::string & session, int64_t last_request_ms);
+void sigma_strip_test_set_drain_running(const std::string & session, bool on);
+bool sigma_strip_test_session_exists(const std::string & session);
 #endif
