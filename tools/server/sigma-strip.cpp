@@ -306,6 +306,11 @@ struct sigma_strip_session_state {
     bool        sum_inflight = false;      // a refresh is in flight (llm mode)
     int         sum_fetch_fail_count = 0;  // consecutive refresh failures
     int64_t     sum_last_fail_ms = 0;      // steady-clock ms of last fetch failure (cooldown)
+    // Option A: a background Σ drain thread is running for this session. Set
+    // true under the lock at the spawn site (only when false) and released by
+    // the drain thread's RAII guard on every exit path — a second partial
+    // commit while a drain is in flight must not spawn a competing drain.
+    bool        drain_running = false;
 };
 
 std::mutex & sigma_strip_mutex() {
@@ -764,15 +769,19 @@ std::string make_rule_block(const common_json & messages, size_t K_sum,
 constexpr int SIGMA_SUM_RULE_FALLBACK_FAILS = 3;
 
 // llm mode: fetch the rendered Σ block from focus-memory (plan §5.2 B1-B4).
-// POST {host}/sigma/refresh with {"session", "cut", "wait"}; the server
-// extracts the removed region's history into Σ (single-flight per session;
-// wait:true blocks until this cut is absorbed), then answers
-// {"block", "partial"}. Fail-open: false on any error (connection, timeout,
-// non-2xx, malformed body, empty block) — the caller decides between holding
-// stage 2 and the rule-block fallback. Runs OUTSIDE the sigma_strip mutex
-// (the A/B/C split): a slow fetch must not stall every session's decision.
+// POST {host}/sigma/refresh with {"session", "cut", "wait", "llm"?}; the
+// server extracts the removed region's history into Σ (single-flight per
+// session; wait:true blocks until this cut is absorbed), then answers
+// {"block", "partial"}. llm="summary" routes the extraction to the
+// lightweight SUMMARY_LLM cascade (the background drain's fast path); empty
+// keeps the current MAIN_LLM (27B thinking) extraction. Fail-open: false on
+// any error (connection, timeout, non-2xx, malformed body, empty block) — the
+// caller decides between holding stage 2 and the rule-block fallback. Runs
+// OUTSIDE the sigma_strip mutex (the A/B/C split): a slow fetch must not stall
+// every session's decision.
 bool sigma_refresh_fetch(const std::string & host, const std::string & token,
         const std::string & session, size_t cut, bool wait, int timeout_ms,
+        const std::string & llm,
         std::string & out_block, bool & out_partial, std::string & err) {
     if (host.empty() || session.empty()) {
         err = "no host/session";
@@ -794,6 +803,9 @@ bool sigma_refresh_fetch(const std::string & host, const std::string & token,
         body["session"] = session;
         body["cut"] = (uint64_t) cut;
         body["wait"] = wait;
+        if (!llm.empty()) {
+            body["llm"] = llm;
+        }
         auto res = cli.Post(path, body.dump(), "application/json");
         if (!res) {
             err = "no response (connection failed or timeout)";
@@ -848,6 +860,20 @@ constexpr int64_t SIGMA_SUM_DRAIN_MAX_WALL_MS = 3600 * 1000;  // 1 h
 // the drain continues past it).
 void sigma_strip_drain(std::string session, size_t cut,
         std::string host, std::string token, int timeout_ms, int64_t delay_ms) {
+    // The spawn site set drain_running=true under the lock before spawning us;
+    // release it on every exit path (RAII) so a later partial commit can spawn
+    // a fresh drain. Covers the wall-cap, supersede, pass-fail and complete
+    // returns alike.
+    struct drain_flag_release {
+        std::string session;
+        ~drain_flag_release() {
+            std::lock_guard<std::mutex> lock(sigma_strip_mutex());
+            auto it = sigma_strip_sessions().find(session);
+            if (it != sigma_strip_sessions().end()) {
+                it->second.drain_running = false;
+            }
+        }
+    } release{session};
     const auto t0 = std::chrono::steady_clock::now();
     for (int pass = 1; pass <= SIGMA_SUM_DRAIN_MAX_PASSES; ++pass) {
         if (pass > 1) {
@@ -873,13 +899,17 @@ void sigma_strip_drain(std::string session, size_t cut,
         bool partial = true;
         std::string err;
         const bool fetched = sigma_refresh_fetch(host, token, session, cut,
-                /*wait*/ false, timeout_ms, block, partial, err);
+                /*wait*/ false, timeout_ms, /*llm*/ "summary", block, partial, err);
         if (!fetched) {
             SRV_WRN("sigma-strip: session=%s Σ drain pass %d failed (%s): stopping (next stage-2 fetch retries)\n",
                     session.c_str(), pass, err.c_str());
             return;
         }
+        const int64_t elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t0).count();
         if (partial) {
+            SRV_INF("sigma-strip: session=%s Σ drain pass %d partial elapsed_ms=%lld\n",
+                    session.c_str(), pass, (long long) elapsed_ms);
             continue;  // more of the region remains — next pass
         }
         // region fully absorbed — refresh the committed block to the complete Σ
@@ -889,8 +919,8 @@ void sigma_strip_drain(std::string session, size_t cut,
             if (it != sigma_strip_sessions().end() && it->second.K_sum == cut) {
                 it->second.sum_block = block;
                 it->second.sum_hash = kv_offload_hash16(block);
-                SRV_INF("sigma-strip: session=%s Σ drain complete: block refreshed to %zu chars after %d pass(es)\n",
-                        session.c_str(), block.size(), pass);
+                SRV_INF("sigma-strip: session=%s Σ drain complete: block refreshed to %zu chars after %d pass(es) elapsed_ms=%lld\n",
+                        session.c_str(), block.size(), pass, (long long) elapsed_ms);
             }
         }
         return;
@@ -1261,7 +1291,7 @@ sigma_strip_result sigma_strip_maybe_rewrite(
                 std::string err;
                 const bool fetched = sigma_refresh_fetch(params.focus_memory_host, params.focus_memory_token,
                             session, K_sum_cand, /*wait*/ true, params.sigma_sum_timeout_ms,
-                            block, block_partial, err);
+                            /*llm*/ "", block, block_partial, err);
                 if (fetched) {
                     block_ok = true;
                     if (block_partial) {
@@ -1438,10 +1468,30 @@ sigma_strip_result sigma_strip_maybe_rewrite(
         // prefix reset) or a pass failure stops it — the next stage-2 fetch
         // retries. Caps: 200 passes / 1 h.
         if (res.sum_partial && params.sigma_sum_drain) {
-            std::thread(sigma_strip_drain, session, K_sum_cand,
-                    params.focus_memory_host, params.focus_memory_token,
-                    params.sigma_sum_timeout_ms,
-                    (int64_t) params.sigma_sum_drain_delay_ms).detach();
+            // Guard against a competing drain: only spawn when no drain is
+            // already in flight for this session (set under the lock, released
+            // by the drain thread's RAII guard on exit). A second partial
+            // commit while the first drain runs would otherwise spawn a
+            // duplicate thread racing the same region.
+            bool spawn = false;
+            {
+                std::lock_guard<std::mutex> lock(sigma_strip_mutex());
+                auto it = sigma_strip_sessions().find(session);
+                if (it != sigma_strip_sessions().end() && !it->second.drain_running) {
+                    it->second.drain_running = true;
+                    spawn = true;
+                }
+            }
+            if (spawn) {
+                // Drain-only timeout (the fast SUMMARY_LLM path); 0 = fall back
+                // to the general stage-2 timeout.
+                const int drain_timeout = params.sigma_sum_drain_timeout_ms > 0
+                        ? params.sigma_sum_drain_timeout_ms : params.sigma_sum_timeout_ms;
+                std::thread(sigma_strip_drain, session, K_sum_cand,
+                        params.focus_memory_host, params.focus_memory_token,
+                        drain_timeout,
+                        (int64_t) params.sigma_sum_drain_delay_ms).detach();
+            }
         }
 
         // 5a) stage-1 absorption (llm mode only): a stage-1 advance stubs
@@ -1476,7 +1526,7 @@ sigma_strip_result sigma_strip_maybe_rewrite(
                     bool partial = false;
                     std::string err;
                     if (!sigma_refresh_fetch(host, token, session, cut, /*wait*/ false,
-                                timeout_ms, block, partial, err)) {
+                                timeout_ms, /*llm*/ "", block, partial, err)) {
                         SRV_WRN("sigma-strip: session=%s async /sigma/refresh (wait:false) failed: %s\n",
                                 session.c_str(), err.c_str());
                     }
