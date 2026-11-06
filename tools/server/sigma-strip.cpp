@@ -295,6 +295,14 @@ struct sigma_strip_session_state {
     bool        window_warned_big = false; // reported > server window
     bool        resets_warned = false;     // repeated prefix resets
     int         n_resets = 0;
+    // idle eviction (sigma_strip_evict_idle): steady-clock ms of the last
+    // request that touched this session (stamped in [A] — every entry is
+    // stamped at creation). Entries idle for >= 24 h are erased — the
+    // client is stateless, so the session restarts from K=0 on its next
+    // request. drain_running entries are kept (see the eviction comment).
+    // INT64_MIN = no request yet (steady_clock is time-since-boot, so a
+    // bare 0 sentinel would misclassify stamps on a young host).
+    int64_t     last_request_ms = INT64_MIN;
     // stage 2 (Σ block, plans/sigma_strip_compaction.md): whole-message removal
     // boundary [0,K_sum) and the frozen snapshot. All indices are on the
     // ORIGINAL messages basis (invariant K >= K_sum). The block is frozen
@@ -358,6 +366,41 @@ std::mutex & sigma_strip_mutex() {
 std::map<std::string, sigma_strip_session_state> & sigma_strip_sessions() {
     static std::map<std::string, sigma_strip_session_state> m;
     return m;
+}
+
+//
+// idle eviction — the session map is keyed by session id and never shrank,
+// so a long-running server accumulates one entry per session for the
+// process lifetime (sum_block / pending_block are the bulk). The client is
+// stateless (re-sends the full history on every request), so an idle
+// session's state is disposable: an evicted session restarts from K=0 on
+// its next request and re-advances when the usage crosses the threshold
+// again. drain_running sessions are skipped — the background drain thread
+// owns the state until its RAII guard releases the flag under the same
+// lock, and a later pass picks the session up if it is still idle.
+//
+constexpr int64_t SIGMA_STRIP_IDLE_MS = 24 * 3600 * 1000;  // 24 h
+
+// Erase sessions whose last request is at least SIGMA_STRIP_IDLE_MS old
+// (drain_running ones are kept). now_ms: steady-clock ms (the tests pass a
+// deterministic clock). Returns the number erased.
+size_t sigma_strip_evict_idle(int64_t now_ms) {
+    std::lock_guard<std::mutex> lock(sigma_strip_mutex());
+    size_t erased = 0;
+    for (auto it = sigma_strip_sessions().begin(); it != sigma_strip_sessions().end();) {
+        if (!it->second.drain_running
+                && it->second.last_request_ms != INT64_MIN
+                && now_ms - it->second.last_request_ms >= SIGMA_STRIP_IDLE_MS) {
+            SRV_INF("sigma-strip: evicting idle session=%s (last request %lld ms ago, K=%zu K_sum=%zu)\n",
+                    it->first.c_str(), (long long) (now_ms - it->second.last_request_ms),
+                    it->second.K, it->second.K_sum);
+            it = sigma_strip_sessions().erase(it);
+            ++erased;
+        } else {
+            ++it;
+        }
+    }
+    return erased;
 }
 
 // Test-only fault injection (tests/test-sigma-strip.cpp): when set, the
@@ -1271,6 +1314,11 @@ sigma_strip_result sigma_strip_maybe_rewrite(
         bool apply) {
     sigma_strip_result res;
 
+    // steady-clock ms for this request: stamps last_request_ms ([A]) and
+    // runs the idle-eviction scan (one now keeps both consistent)
+    const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+
     // gates: mode + window + parseable messages
     if (params.sigma_strip_mode == "off" || params.sigma_strip_window_tokens <= 0) {
         return res;
@@ -1284,6 +1332,11 @@ sigma_strip_result sigma_strip_maybe_rewrite(
         return res; // no real session key: excluded from rewriting
     }
     res.session = session;
+
+    // idle eviction: the session map never shrank (one entry per session
+    // for the process lifetime) — drop the 24 h-idle states before [A]
+    // re-stamps this session's timestamp.
+    sigma_strip_evict_idle(now_ms);
 
     try {
         const common_json & messages = body.at("messages");
@@ -1355,6 +1408,7 @@ sigma_strip_result sigma_strip_maybe_rewrite(
         {
             std::lock_guard<std::mutex> lock(sigma_strip_mutex());
             sigma_strip_session_state & st = sigma_strip_sessions()[session];
+            st.last_request_ms = now_ms;  // idle-eviction stamp (24 h)
             st.window = params.sigma_strip_window_tokens;
             st.block_vocab = vocab;               // P1-2: drain validates outside the lock
             st.block_sum_budget = sum_budget;
@@ -2126,4 +2180,32 @@ bool sigma_strip_test_drain_running(const std::string & session) {
     std::lock_guard<std::mutex> lock(sigma_strip_mutex());
     auto it = sigma_strip_sessions().find(session);
     return it != sigma_strip_sessions().end() && it->second.drain_running;
+}
+
+// Test-only (tests/test-sigma-strip.cpp): idle-eviction hooks — a
+// deterministic clock for the scan plus direct state access (production
+// stamps steady_clock::now() in [A], which the tests cannot control).
+size_t sigma_strip_test_evict_idle(int64_t now_ms) {
+    return sigma_strip_evict_idle(now_ms);
+}
+
+void sigma_strip_test_touch(const std::string & session, int64_t last_request_ms) {
+    std::lock_guard<std::mutex> lock(sigma_strip_mutex());
+    auto it = sigma_strip_sessions().find(session);
+    if (it != sigma_strip_sessions().end()) {
+        it->second.last_request_ms = last_request_ms;
+    }
+}
+
+void sigma_strip_test_set_drain_running(const std::string & session, bool on) {
+    std::lock_guard<std::mutex> lock(sigma_strip_mutex());
+    auto it = sigma_strip_sessions().find(session);
+    if (it != sigma_strip_sessions().end()) {
+        it->second.drain_running = on;
+    }
+}
+
+bool sigma_strip_test_session_exists(const std::string & session) {
+    std::lock_guard<std::mutex> lock(sigma_strip_mutex());
+    return sigma_strip_sessions().count(session) != 0;
 }

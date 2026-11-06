@@ -2123,6 +2123,51 @@ int main() {
         CHECK(r2.est_offset == 3000);   // not 3000 + savings (clamped to window/2)
     }
 
+    // --- idle eviction: 24 h-idle sessions are erased, fresh ones kept ----
+    // The session map never shrank otherwise (one entry per session for the
+    // process lifetime). An evicted session restarts from K=0 on its next
+    // request (the client is stateless — it re-sends the full history).
+    // The scan clock (N) is deterministic: the "old" session is stamped
+    // 25 h before it and the "fresh" one 1 h before, so the outcome does
+    // not depend on the machine's uptime (steady_clock is time-since-boot).
+    {
+        const int64_t N = 1000 + 25 * 3600 * 1000;  // deterministic scan clock
+        common_json body = make_body(make_messages(5, 2000));
+        sigma_strip_maybe_rewrite(nullptr, make_params("shadow", 3000), make_req("t-evict-old"), body, true);
+        body = make_body(make_messages(5, 2000));
+        sigma_strip_maybe_rewrite(nullptr, make_params("shadow", 3000), make_req("t-evict-fresh"), body, true);
+        CHECK(sigma_strip_test_session_exists("t-evict-old"));
+        CHECK(sigma_strip_test_session_exists("t-evict-fresh"));
+        sigma_strip_test_touch("t-evict-old", 1000);
+        sigma_strip_test_touch("t-evict-fresh", N - 3600 * 1000);
+        sigma_strip_test_evict_idle(N);
+        CHECK(!sigma_strip_test_session_exists("t-evict-old"));
+        CHECK(sigma_strip_test_session_exists("t-evict-fresh"));
+        // the evicted session restarts from K=0: the full advance fires again
+        body = make_body(make_messages(5, 2000));
+        const sigma_strip_result res =
+            sigma_strip_maybe_rewrite(nullptr, make_params("shadow", 3000), make_req("t-evict-old"), body, true);
+        CHECK(res.k_advanced);
+        CHECK(res.K > 0);
+    }
+
+    // --- idle eviction: drain_running sessions are skipped ----------------
+    // The background drain thread owns the state until its RAII guard
+    // releases the flag — the eviction must not erase under it, and a later
+    // pass picks the session up once the flag is released.
+    {
+        const int64_t N = 1000 + 25 * 3600 * 1000;  // same deterministic scan clock
+        common_json body = make_body(make_messages(5, 2000));
+        sigma_strip_maybe_rewrite(nullptr, make_params("shadow", 3000), make_req("t-evict-drain"), body, true);
+        sigma_strip_test_touch("t-evict-drain", 1000);
+        sigma_strip_test_set_drain_running("t-evict-drain", true);
+        sigma_strip_test_evict_idle(N);
+        CHECK(sigma_strip_test_session_exists("t-evict-drain"));  // skipped: the drain owns the state
+        sigma_strip_test_set_drain_running("t-evict-drain", false);
+        sigma_strip_test_evict_idle(N);
+        CHECK(!sigma_strip_test_session_exists("t-evict-drain"));  // picked up once released
+    }
+
     if (n_failed) {
         std::printf("test-sigma-strip: %d check(s) FAILED\n", n_failed);
         return 1;
