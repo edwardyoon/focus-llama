@@ -129,6 +129,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_OPENAI_MOE,       "gpt-oss"          },
     { LLM_ARCH_LFM2,             "lfm2"             },
     { LLM_ARCH_LFM2MOE,          "lfm2moe"          },
+    { LLM_ARCH_LFM3,             "lfm3"             },
     { LLM_ARCH_DREAM,            "dream"            },
     { LLM_ARCH_SMALLTHINKER,     "smallthinker"     },
     { LLM_ARCH_LLADA,            "llada"            },
