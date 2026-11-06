@@ -116,10 +116,11 @@ public:
     }
     // Queue responses in order (drain test: the partial block for the
     // stage-2 wait:true fetch, then the complete block for the drain's
-    // wait:false pass). Falls back to response_ once the queue is empty.
-    void push_response(std::string r) {
+    // wait:false pass). status mirrors the real server (200 for wait:true,
+    // 202 for wait:false). Falls back to response_ once the queue is empty.
+    void push_response(std::string r, int status = 200) {
         std::lock_guard<std::mutex> lock(m_);
-        response_queue_.push_back(std::move(r));
+        response_queue_.push_back({status, std::move(r)});
     }
     bool wait_requests(size_t n, int timeout_ms) {
         const auto deadline = std::chrono::steady_clock::now()
@@ -194,17 +195,20 @@ private:
             rq.session = "<parse error>";
         }
         std::string resp;
+        int resp_status = 200;
         {
             std::lock_guard<std::mutex> lock(m_);
             requests_.push_back(rq);
             if (!response_queue_.empty()) {
-                resp = std::move(response_queue_.front());
+                resp_status = response_queue_.front().status;
+                resp = std::move(response_queue_.front().body);
                 response_queue_.pop_front();
             } else {
                 resp = response_;
             }
         }
-        const std::string out = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+        const std::string status_line = (resp_status == 202) ? "202 Accepted" : "200 OK";
+        const std::string out = "HTTP/1.1 " + status_line + "\r\nContent-Type: application/json\r\n"
                 "Content-Length: " + std::to_string(resp.size()) + "\r\n"
                 "Connection: close\r\n\r\n" + resp;
         size_t off = 0;
@@ -219,8 +223,9 @@ private:
     uint16_t     port_      = 0;
     std::thread  accept_thr_;
     std::mutex   m_;
+    struct resp { int status; std::string body; };
     std::string  response_ = R"({"block":"","partial":false})";
-    std::deque<std::string> response_queue_;
+    std::deque<resp> response_queue_;
     std::vector<llm_mock_request> requests_;
 };
 
@@ -388,6 +393,46 @@ static common_json make_sum_scenario_extended() {
     add("assistant", "Third answer.");
     add("user", std::string(10, 'z'));
     add("assistant", "Done.");
+    return msgs;
+}
+
+// Futility-guard scenario: 600 tok system + 200 tok user + 12 tool rounds of
+// 800 tok each (the tool_calls assistants add a dozen or so tokens each).
+// Window 10000 / min_keep 7000: the first advance strips five rounds and
+// lands just below the floor, leaving rounds above the floor for the rearm
+// test's follow-up advances.
+static common_json make_guard_scenario() {
+    common_json msgs = common_json::array();
+    auto add = [&msgs](const std::string & role, const std::string & content,
+                       const std::string & tcid = "", const std::string & path = "") {
+        common_json m = common_json::object();
+        m["role"] = role;
+        m["content"] = content;
+        if (!tcid.empty() && role == "assistant") {
+            common_json fn = common_json::object();
+            fn["name"] = std::string("read_file");
+            fn["arguments"] = std::string("{\"path\":\"") + path + "\"}";
+            common_json call = common_json::object();
+            call["id"] = tcid;
+            call["type"] = std::string("function");
+            call["function"] = fn;
+            common_json tcs = common_json::array();
+            tcs.push_back(call);
+            m["tool_calls"] = tcs;
+        }
+        if (!tcid.empty() && role == "tool") {
+            m["tool_call_id"] = tcid;
+            m["name"] = std::string("read_file");
+        }
+        msgs.push_back(m);
+    };
+    add("system", std::string(2400, 'a'));
+    add("user", std::string(800, 'b'));
+    for (int i = 0; i < 12; ++i) {
+        const std::string id = "call_" + std::to_string(i);
+        add("assistant", "", id, "/tmp/f" + std::to_string(i) + ".txt");
+        add("tool", std::string(3200, 'x'), id, "");
+    }
     return msgs;
 }
 
@@ -827,6 +872,10 @@ int main() {
     {
         common_params p = make_params("shadow", 10000);
         p.sigma_strip_target = 0.65;
+        // the rollback leaves a zero-gain advance — disable the futility guard
+        // to test the safety boundary in isolation
+        p.sigma_strip_min_gain = 0.0;
+        p.sigma_strip_rearm_delta = 0.0;
         common_json msgs = common_json::array();
         auto add_asst_calls = [&msgs](const std::vector<std::string> & ids) {
             common_json tcs = common_json::array();
@@ -1186,14 +1235,16 @@ int main() {
         CHECK(rq.wait == true);
     }
 
-    // --- stage 2 llm: partial commit -> background drain completes the block ---
-    // After committing a PARTIAL block (llm mode), a detached drain thread
-    // fires wait:false refresh passes until the server answers partial:false,
-    // then refreshes the committed block to the complete Σ. The queue serves
-    // the partial block to the stage-2 wait:true fetch (request 1) and the
-    // complete block to the drain's first wait:false pass (request 2). A
-    // second rewrite (K_sum unchanged -> no new fetch) must prepend the
-    // refreshed complete block.
+    // --- stage 2 llm: drain complete -> pending, applied only at advance (P0-1) ---
+    // Request 1 commits a PARTIAL block (llm mode). The background drain absorbs
+    // the remainder and must hold the complete block PENDING — not swap
+    // sum_block out-of-band (it is prepended to the front of the prefix: an
+    // out-of-band swap would invalidate the whole KV from there, an un-planned
+    // re-prefill). A non-advance resend keeps the partial block and the same
+    // rewrite_hash. The next K/K_sum advance applies the pending complete
+    // block: a new tool round lifts K_cap to 13 (no new user boundary ->
+    // K_sum_cand stays 7, no new fetch), and the lowered threshold gives the
+    // gate reported headroom after the removal.
     {
         llm_mock_server mock;
         CHECK(mock.start());
@@ -1204,6 +1255,9 @@ int main() {
         p.focus_memory_host = mock.url();
         p.sigma_sum_drain = true;
         p.sigma_sum_drain_delay_ms = 0;   // no inter-pass spacing (fast test)
+        p.sigma_strip_threshold = 0.50;   // gate headroom after the removal
+        p.sigma_strip_min_gain = 0.0;     // isolate P0-1 (the advance gain is small)
+        p.sigma_strip_rearm_delta = 0.0;
         common_json body = make_body(make_sum_scenario());
         const sigma_strip_result res =
             sigma_strip_maybe_rewrite(nullptr, p, make_req("t-sum-llm-drain"), body, true);
@@ -1226,44 +1280,79 @@ int main() {
         CHECK(rq.cut == 7);
         CHECK(rq.wait == false);   // the drain's pass
         CHECK(rq.llm == "summary");
-        // The drain refreshes the committed block under the lock after its
-        // pass returns. Poll fresh rewrites (no new fetch: K_sum unchanged)
-        // until the complete Σ is prepended.
-        bool refreshed = false;
-        for (int i = 0; i < 200 && !refreshed; ++i) {
-            common_json body2 = make_body(make_sum_scenario());
+        // let the drain thread store the pending block (it returns right after)
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        // non-advance resend: the complete Σ is PENDING — the partial block
+        // stays and the rewrite is byte-identical to request 1's (same hash).
+        common_json body2 = make_body(make_sum_scenario());
+        const sigma_strip_result res2 =
             sigma_strip_maybe_rewrite(nullptr, p, make_req("t-sum-llm-drain"), body2, true);
-            const std::string u2b = body2.at("messages").at(1).at("content").get<std::string>();
-            refreshed = (u2b.rfind("LLM_COMPLETE_MARKER", 0) == 0);
-            if (!refreshed) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(10));
-            }
+        CHECK(!res2.k_advanced);
+        CHECK(res2.rewrite_hash == res.rewrite_hash);   // P0-1: pending not applied
+        const std::string u2b = body2.at("messages").at(1).at("content").get<std::string>();
+        CHECK(u2b.rfind("LLM_PARTIAL_MARKER", 0) == 0);
+        // advance request: a new tool round (K_cap 8 -> 13, no new user
+        // boundary -> K_sum_cand stays 7, no fetch)
+        sigma_strip_note_response("t-sum-llm-drain", res.tokens_after + 1500);
+        common_json msgs15 = make_sum_scenario();
+        {
+            common_json fn = common_json::object();
+            fn["name"] = std::string("read_file");
+            fn["arguments"] = std::string("{\"path\":\"/tmp/f.txt\"}");
+            common_json call = common_json::object();
+            call["id"] = std::string("call_5");
+            call["type"] = std::string("function");
+            call["function"] = fn;
+            common_json tcs = common_json::array();
+            tcs.push_back(call);
+            common_json asst = common_json::object();
+            asst["role"] = std::string("assistant");
+            asst["content"] = std::string("");
+            asst["tool_calls"] = tcs;
+            msgs15.push_back(asst);
+            common_json tool = common_json::object();
+            tool["role"] = std::string("tool");
+            tool["tool_call_id"] = std::string("call_5");
+            tool["name"] = std::string("read_file");
+            tool["content"] = std::string(100, 'x');
+            msgs15.push_back(tool);
         }
-        CHECK(refreshed);   // committed block refreshed to the complete Σ
+        common_json body3 = make_body(msgs15);
+        const sigma_strip_result res3 =
+            sigma_strip_maybe_rewrite(nullptr, p, make_req("t-sum-llm-drain"), body3, true);
+        CHECK(res3.k_advanced);
+        CHECK(res3.K == 13);
+        CHECK(res3.K_sum == 7);
+        CHECK(res3.sum_applied);
+        CHECK(res3.rewrite_hash != res.rewrite_hash);  // the pending complete Σ applied
+        const std::string u2c = body3.at("messages").at(1).at("content").get<std::string>();
+        CHECK(u2c.rfind("LLM_COMPLETE_MARKER", 0) == 0);
     }
 
-    // --- stage 2 llm: drain guard (no double spawn) -------------------------
-    // Request 1 (base scenario) commits K_sum=7 partial -> drain A spawns and
-    // sets drain_running. Request 2 (extended scenario; same [0..7] prefix so
-    // no reset) advances K_sum to 12 and commits a second partial. Its
-    // drain-spawn attempt must be BLOCKED because drain A still holds the
-    // flag (it is in its inter-pass sleep, spaced by drain_delay). So no
-    // wait:false request with cut==12 (drain B) is ever fired.
+    // --- stage 2 llm: chain advance mid-drain — one thread picks the new cut (P0-2) ---
+    // Request 1 (base) commits K_sum=7 partial -> drain A spawns. Request 2
+    // (extended; same [0..7] prefix, no reset) advances K_sum to 12 and
+    // commits a second partial; its own spawn attempt is rejected
+    // (drain_running held). The running drain A must NOT stop on the K_sum
+    // move: it re-queries the cut on its next pass and absorbs the new region
+    // (cut 12) — one thread, no partial left behind.
     {
         llm_mock_server mock;
         CHECK(mock.start());
-        // queue: req1 stage-2 fetch (partial), drain A pass 1 (partial),
-        // req2 stage-2 fetch (partial). All partial, so the order of the two
-        // concurrent partials (drain A pass 1 vs req2 fetch) is irrelevant.
+        // queue: req1 stage-2 fetch (partial), drain A pass 1 cut 7 (partial),
+        // req2 stage-2 fetch (partial), drain A pass 2 cut 12 (complete).
         mock.push_response(R"({"block":"LLM_D1","partial":true})");
         mock.push_response(R"({"block":"LLM_D2","partial":true})");
         mock.push_response(R"({"block":"LLM_D3","partial":true})");
+        mock.push_response(R"({"block":"LLM_D4","partial":false})");
         common_params p = make_sum_params("on");
         p.sigma_sum_mode = "llm";
         p.focus_memory_host = mock.url();
         p.sigma_sum_drain = true;
         p.sigma_sum_drain_delay_ms = 100;   // space drain passes so the flag
                                             // is held across request 2's check
+        p.sigma_strip_min_gain = 0.0;
+        p.sigma_strip_rearm_delta = 0.0;
         common_json body = make_body(make_sum_scenario());
         const sigma_strip_result res =
             sigma_strip_maybe_rewrite(nullptr, p, make_req("t-sum-llm-drain-single"), body, true);
@@ -1278,14 +1367,101 @@ int main() {
             sigma_strip_maybe_rewrite(nullptr, p, make_req("t-sum-llm-drain-single"), body2, true);
         CHECK(res2.sum_partial);
         CHECK(res2.K_sum > 7);
-        // Let the drain threads settle (drain A's next supersession check sees
-        // K_sum moved and releases the flag; no drain B was ever spawned).
-        std::this_thread::sleep_for(std::chrono::milliseconds(300));
-        bool drain_b = false;
+        // drain A wakes, re-queries the cut (now 12) and absorbs the new region
+        CHECK(mock.wait_requests(4, 5000));
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        int drain_passes = 0, new_cut_passes = 0;
         for (const auto & r : mock.all()) {
-            if (r.wait == false && r.cut == res2.K_sum) drain_b = true;
+            if (r.wait == false) {
+                ++drain_passes;
+                if (r.cut == res2.K_sum) ++new_cut_passes;
+            }
         }
-        CHECK(!drain_b);   // the guard held — no competing drain for the 2nd commit
+        CHECK(drain_passes == 2);        // one thread: pass 1 (cut 7) + pass 2 (cut 12)
+        CHECK(new_cut_passes == 1);      // the running thread picked up the new cut
+    }
+
+    // --- P0-1 (reset): a prefix reset discards the pending Σ ----------------
+    // The drain completes (pending stored). A system change resets the session
+    // (K, K_sum, pending). The reset request itself re-fetches (K_sum 0 -> 7):
+    // it must commit the fresh mock block, not resurrect the discarded
+    // pending one.
+    {
+        llm_mock_server mock;
+        CHECK(mock.start());
+        mock.push_response(R"({"block":"P01R_PARTIAL","partial":true})");
+        mock.push_response(R"({"block":"P01R_COMPLETE","partial":false})");
+        mock.push_response(R"({"block":"P01R_POSTRESET","partial":false})");
+        common_params p = make_sum_params("on");
+        p.sigma_sum_mode = "llm";
+        p.focus_memory_host = mock.url();
+        p.sigma_sum_drain = true;
+        p.sigma_sum_drain_delay_ms = 0;
+        p.sigma_strip_min_gain = 0.0;
+        p.sigma_strip_rearm_delta = 0.0;
+        common_json body = make_body(make_sum_scenario());
+        const sigma_strip_result res =
+            sigma_strip_maybe_rewrite(nullptr, p, make_req("t-p01r"), body, true);
+        CHECK(res.sum_partial);
+        CHECK(res.K_sum == 7);
+        CHECK(mock.wait_requests(2, 5000));
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));  // drain stores pending
+        // client compact: the system message (inside the fingerprinted
+        // prefix) changes, everything else identical
+        common_json msgs2 = make_sum_scenario();
+        msgs2.at(0)["content"] = std::string(2400, 'c');
+        common_json body2 = make_body(msgs2);
+        const sigma_strip_result res2 =
+            sigma_strip_maybe_rewrite(nullptr, p, make_req("t-p01r"), body2, true);
+        CHECK(res2.prefix_reset);
+        CHECK(res2.sum_applied);
+        CHECK(res2.K_sum == 7);
+        const std::string u2 = body2.at("messages").at(1).at("content").get<std::string>();
+        CHECK(u2.rfind("P01R_POSTRESET", 0) == 0);
+        CHECK(u2.find("P01R_COMPLETE") == std::string::npos);  // pending discarded
+    }
+
+    // --- P0-5: wait:false without explicit partial:false = in progress ------
+    // The real server answers the drain's wait:false passes with 202. A
+    // response that omits the boolean partial field must read as "in
+    // progress" (not complete), and an empty block on the wait:false path is
+    // "not rendered yet", not a failure — the drain keeps passing instead of
+    // saving an unfinished block as the Σ.
+    {
+        llm_mock_server mock;
+        CHECK(mock.start());
+        mock.push_response(R"({"block":"P05_PARTIAL","partial":true})", 200);
+        mock.push_response(R"({"block":"P05_P1","partial":true})", 202);
+        // wait:false, 202, empty block, no partial field -> in progress
+        mock.push_response(R"({"block":""})", 202);
+        mock.push_response(R"({"block":"P05_DONE","partial":false})", 202);
+        common_params p = make_sum_params("on");
+        p.sigma_sum_mode = "llm";
+        p.focus_memory_host = mock.url();
+        p.sigma_sum_drain = true;
+        p.sigma_sum_drain_delay_ms = 0;
+        p.sigma_strip_min_gain = 0.0;
+        p.sigma_strip_rearm_delta = 0.0;
+        common_json body = make_body(make_sum_scenario());
+        const sigma_strip_result res =
+            sigma_strip_maybe_rewrite(nullptr, p, make_req("t-p05"), body, true);
+        CHECK(res.sum_partial);
+        CHECK(res.K_sum == 7);
+        // drain: pass 1 (202, partial:true) -> pass 2 (202, empty, no partial
+        // field -> in progress, not a failure) -> pass 3 (complete)
+        CHECK(mock.wait_requests(4, 5000));
+        int drain_passes = 0;
+        for (const auto & r : mock.all()) if (r.wait == false) ++drain_passes;
+        CHECK(drain_passes == 3);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        // the drain completed on pass 3 -> the complete block is PENDING
+        // (applied at the next advance, P0-1): the partial block stays
+        common_json body2 = make_body(make_sum_scenario());
+        const sigma_strip_result res2 =
+            sigma_strip_maybe_rewrite(nullptr, p, make_req("t-p05"), body2, true);
+        CHECK(!res2.k_advanced);
+        const std::string u2 = body2.at("messages").at(1).at("content").get<std::string>();
+        CHECK(u2.rfind("P05_PARTIAL", 0) == 0);
     }
 
     // --- stage 2 llm: failures hold stage 2, 3 strikes -> rule fallback -----
@@ -1304,6 +1480,10 @@ int main() {
         // cooldown (now the default) so the 3 strikes land back to back. The
         // cooldown itself has its own test below.
         p.sigma_sum_fetch_cooldown_ms = 0;
+        // and the futility guard (its rearm deadband would hold the back-to-
+        // back retries — a flat-usage scenario the guard exists to suppress)
+        p.sigma_strip_min_gain = 0.0;
+        p.sigma_strip_rearm_delta = 0.0;
         for (int i = 1; i <= 3; ++i) {
             common_json body = make_body(make_sum_scenario());
             const sigma_strip_result r =
@@ -1343,6 +1523,10 @@ int main() {
         p.sigma_sum_mode = "llm";
         p.focus_memory_host = mock.url();
         CHECK(p.sigma_sum_fetch_cooldown_ms == 5000);   // the new default
+        // isolate the cooldown mechanism: disable the futility guard (its
+        // rearm deadband would hold the retry before the cooldown is reached)
+        p.sigma_strip_min_gain = 0.0;
+        p.sigma_strip_rearm_delta = 0.0;
         common_json b1 = make_body(make_sum_scenario());
         const sigma_strip_result r1 =
             sigma_strip_maybe_rewrite(nullptr, p, make_req("t-sum-cooldown"), b1, true);
@@ -1422,6 +1606,167 @@ int main() {
         CHECK(rq.session == "t-sum-fault");
         CHECK(rq.cut == 7);
         CHECK(rq.wait == true);
+    }
+
+    // --- futility guard: min-gain skip (guard on) vs advance (guard off) ---
+    // The advance's expected gain (raw - floor) is far below min_gain 0.99 x
+    // window: skip=1, K stays 0, body untouched (fail-open). The same request
+    // with the gain gate disabled advances to the floor.
+    {
+        common_params p = make_params("shadow", 10000);
+        p.sigma_strip_min_keep_tokens = 7000;
+        p.sigma_strip_keep_recent = 1;
+        p.sigma_strip_min_gain = 0.99;
+        p.sigma_strip_futility_bypass_usage = 0.0;   // isolate the gain gate
+        common_json body = make_body(make_guard_scenario());
+        const sigma_strip_result res =
+            sigma_strip_maybe_rewrite(nullptr, p, make_req("t-gain"), body, true);
+        CHECK(res.eligible);
+        CHECK(res.skip == 1);
+        CHECK(!res.k_advanced);
+        CHECK(res.K == 0);
+        CHECK(body.at("messages").size() == 26);
+
+        common_params p2 = make_params("shadow", 10000);
+        p2.sigma_strip_min_keep_tokens = 7000;
+        p2.sigma_strip_keep_recent = 1;
+        p2.sigma_strip_min_gain = 0.0;
+        common_json body2 = make_body(make_guard_scenario());
+        const sigma_strip_result res2 =
+            sigma_strip_maybe_rewrite(nullptr, p2, make_req("t-gain2"), body2, true);
+        CHECK(res2.k_advanced);
+        CHECK(res2.skip == 0);
+        CHECK(res2.tokens_after <= 7000);
+    }
+
+    // --- futility guard: rearm deadband, growth re-advances ---------------
+    // r1 advances to the floor (anchor = usage_after). r2 re-crosses the
+    // threshold (reported +400 over the original estimate -> est offset 400;
+    // shadow: last_est is tokens_before, P0-4) but stays inside the rearm
+    // deadband (usage_before < anchor + 0.05): skip=2, K held. A larger
+    // reported growth (offset 560) leaves the deadband and the advance lands.
+    // (560, not 500: at the exact boundary the double rounding of
+    // anchor + 0.05 can still read as larger, and the skip side is the
+    // fail-safe one.)
+    {
+        common_params p = make_params("shadow", 10000);
+        p.sigma_strip_min_keep_tokens = 7000;
+        p.sigma_strip_keep_recent = 1;
+        common_json body = make_body(make_guard_scenario());
+        const sigma_strip_result r1 =
+            sigma_strip_maybe_rewrite(nullptr, p, make_req("t-rearm"), body, true);
+        CHECK(r1.k_advanced);
+        CHECK(r1.tokens_after >= 6600);   // precondition for the offsets below
+        CHECK(r1.tokens_after <= 7000);
+
+        sigma_strip_note_response("t-rearm", r1.tokens_before + 400);
+        common_json body2 = make_body(make_guard_scenario());
+        const sigma_strip_result r2 =
+            sigma_strip_maybe_rewrite(nullptr, p, make_req("t-rearm"), body2, true);
+        CHECK(r2.skip == 2);
+        CHECK(!r2.k_advanced);
+        CHECK(r2.K == r1.K);
+        CHECK(r2.tokens_after == r1.tokens_after);
+        CHECK(r2.usage_before >= 0.70);   // the gate fired; the deadband held
+        CHECK(r2.usage_before < r1.usage_after + 0.05);
+
+        sigma_strip_note_response("t-rearm", r2.tokens_before + 560);
+        common_json body3 = make_body(make_guard_scenario());
+        const sigma_strip_result r3 =
+            sigma_strip_maybe_rewrite(nullptr, p, make_req("t-rearm"), body3, true);
+        CHECK(r3.k_advanced);
+        CHECK(r3.skip == 0);
+        CHECK(r3.K == r1.K + 2);          // one asst+tool round past the floor
+        CHECK(r3.tokens_after < r2.tokens_after);
+    }
+
+    // --- futility guard: a prefix reset voids the rearm anchor ------------
+    // After a rearm skip, a changed prefix (client compact) resets K and the
+    // anchor: the next request advances again despite the flat usage.
+    {
+        common_params p = make_params("shadow", 10000);
+        p.sigma_strip_min_keep_tokens = 7000;
+        p.sigma_strip_keep_recent = 1;
+        common_json body = make_body(make_guard_scenario());
+        const sigma_strip_result r1 =
+            sigma_strip_maybe_rewrite(nullptr, p, make_req("t-rearm-reset"), body, true);
+        CHECK(r1.k_advanced);
+        CHECK(r1.tokens_after >= 6600);
+
+        sigma_strip_note_response("t-rearm-reset", r1.tokens_before + 400);
+        common_json body2 = make_body(make_guard_scenario());
+        const sigma_strip_result r2 =
+            sigma_strip_maybe_rewrite(nullptr, p, make_req("t-rearm-reset"), body2, true);
+        CHECK(r2.skip == 2);
+        CHECK(!r2.k_advanced);
+
+        // client compact: the system message (inside the fingerprinted
+        // prefix) changes, everything else identical
+        common_json msgs3 = make_guard_scenario();
+        msgs3.at(0)["content"] = std::string(2400, 'c');
+        common_json body3 = make_body(msgs3);
+        const sigma_strip_result r3 =
+            sigma_strip_maybe_rewrite(nullptr, p, make_req("t-rearm-reset"), body3, true);
+        CHECK(r3.prefix_reset);
+        CHECK(r3.k_advanced);
+        CHECK(r3.K == r1.K);
+        CHECK(r3.tokens_after == r1.tokens_after);
+    }
+
+    // --- P0-3: futility guard hard-limit bypass ------------------------------
+    // min-gain would skip a ~3.8k gain (far below 0.99 x window). Below the
+    // bypass usage (0.90) the skip stands; once the reported usage reaches
+    // the hard limit the bypass voids the guard — a small re-prefill beats
+    // riding usage to 1.0 and the multi-minute native compact.
+    {
+        common_params p = make_params("shadow", 14000);
+        p.sigma_strip_min_keep_tokens = 7000;
+        p.sigma_strip_keep_recent = 1;
+        p.sigma_strip_min_gain = 0.99;
+        common_json b1 = make_body(make_guard_scenario());
+        const sigma_strip_result r1 =
+            sigma_strip_maybe_rewrite(nullptr, p, make_req("t-p03"), b1, true);
+        CHECK(r1.usage_before >= 0.70);
+        CHECK(r1.usage_before < 0.90);
+        CHECK(r1.skip == 1);
+        CHECK(!r1.k_advanced);
+        CHECK(r1.K == 0);
+        CHECK(!r1.bypass);
+        // the reported usage pushed over the hard limit (same session:
+        // note_response only calibrates sessions that went through the gate)
+        sigma_strip_note_response("t-p03", r1.tokens_before + 2500);
+        common_json b2 = make_body(make_guard_scenario());
+        const sigma_strip_result r2 =
+            sigma_strip_maybe_rewrite(nullptr, p, make_req("t-p03"), b2, true);
+        CHECK(r2.usage_before >= 0.90);
+        CHECK(r2.k_advanced);
+        CHECK(r2.skip == 0);
+        CHECK(r2.bypass);
+        CHECK(r2.tokens_after <= 7000);
+    }
+
+    // --- P0-4: shadow last_est is the original (tokens_before) --------------
+    // Shadow mode never rewrites the body, so the reported prompt count is
+    // original-based: the offset must not absorb the strip savings (the old
+    // code anchored on tokens_after and over-counted by the full savings).
+    {
+        common_params p = make_params("shadow", 10000);
+        p.sigma_strip_min_keep_tokens = 7000;
+        p.sigma_strip_keep_recent = 1;
+        p.sigma_strip_min_gain = 0.0;
+        p.sigma_strip_rearm_delta = 0.0;
+        p.sigma_strip_futility_bypass_usage = 0.0;
+        common_json b1 = make_body(make_guard_scenario());
+        const sigma_strip_result r1 =
+            sigma_strip_maybe_rewrite(nullptr, p, make_req("t-p04"), b1, true);
+        CHECK(r1.k_advanced);
+        CHECK(r1.K > 0);
+        CHECK(r1.tokens_after < r1.tokens_before);
+        sigma_strip_note_response("t-p04", r1.tokens_before + 3000);
+        common_json b2 = make_body(make_guard_scenario());
+        const sigma_strip_result r2 =
+            sigma_strip_maybe_rewrite(nullptr, p, make_req("t-p04"), b2, true);
+        CHECK(r2.est_offset == 3000);   // not 3000 + savings (clamped to window/2)
     }
 
     if (n_failed) {

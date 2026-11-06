@@ -311,6 +311,30 @@ struct sigma_strip_session_state {
     // the drain thread's RAII guard on every exit path — a second partial
     // commit while a drain is in flight must not spawn a competing drain.
     bool        drain_running = false;
+    // futility guard (plans/appendix.md spec #2): usage_after of the last
+    // committed advance (0 = none yet) — the rearm deadband suppresses a new
+    // advance while usage is still within rearm_delta of it. last_skip
+    // tracks the current skip episode for the WRN (first) / INF (repeats)
+    // log ladder; an advance or a prefix reset ends the episode.
+    double      last_adv_usage_after = 0.0;
+    int         last_skip = 0; // 0=none, 1=gain, 2=rearm
+    // Option A (P0-2): the committed Σ block is partial — the removed region
+    // is larger than one absorb pass. Set under the lock at the [C] commit
+    // (res.sum_partial) and cleared by the drain thread on completion. The
+    // drain loop re-queries it each pass (with K_sum) instead of a fixed cut,
+    // so a K_sum advance mid-drain does not strand the newer region: the
+    // running thread picks up the new cut on its next pass even when its own
+    // spawn was rejected (drain_running already true).
+    bool        sum_partial = false;
+    // Option A (P0-1): the drain's complete Σ block, held pending until the
+    // next K/K_sum advance applies it. The block is prepended to the first
+    // surviving user message (front of the prefix), so swapping sum_block at
+    // an arbitrary moment would invalidate the whole KV from there — an
+    // un-planned re-prefill. Applying the pending block at an advance piggy-
+    // backs on a request that re-prefills anyway. pending_cut is the K_sum the
+    // block was drained for; it applies only while K_sum has not moved.
+    std::string pending_block;
+    size_t      pending_cut = 0;
 };
 
 std::mutex & sigma_strip_mutex() {
@@ -523,6 +547,29 @@ std::string shell_status(const common_json & messages, const std::string & tool_
     return "ok";
 }
 
+// Marginal reduction of advancing K_sum from K_sum_committed to b: the
+// tokens removed over [K_sum_committed, b) (system messages are kept),
+// where an already-stubbed message contributes only the stub residue
+// (orig - savings). Shared by compute_k_sum's best-effort 10% gate and
+// the stage-2 futility guard (plans/appendix.md spec #2).
+int64_t k_sum_marginal_reduction(const common_json & messages,
+        const std::vector<int64_t> & orig,
+        const std::vector<std::string> & stubs,
+        const std::vector<int64_t> & savings,
+        size_t K, size_t n,
+        size_t K_sum_committed, size_t b) {
+    int64_t reduction = 0;
+    for (size_t i = K_sum_committed; i < b && i < n; ++i) {
+        if (messages.at(i).is_object()
+                && json_string_or(messages.at(i), "role") == "system") {
+            continue; // system is kept, not removed
+        }
+        reduction += (i < K && !stubs[i].empty())
+            ? (orig[i] - savings[i]) : orig[i];
+    }
+    return reduction;
+}
+
 // The smallest user-message boundary b (1 <= b <= min(K_cap, n-1)) such that
 // removing the whole messages [0,b) (system kept) and stubbing the surviving
 // [b,K) drops the non-block prompt to the estimate-space floor
@@ -592,16 +639,8 @@ size_t compute_k_sum(const common_json & messages,
     // lingers above the threshold), the marginal gate is what stops the chain
     // of re-advances that would otherwise fire on every new user boundary.
     if (result == 0 && last_user > 0 && window > 0) {
-        int64_t reduction = 0;
-        for (size_t i = K_sum_committed; i < last_user && i < n; ++i) {
-            if (messages.at(i).is_object()
-                    && json_string_or(messages.at(i), "role") == "system") {
-                continue; // system is kept, not removed
-            }
-            reduction += (i < K && !stubs[i].empty())
-                ? (orig[i] - savings[i]) : orig[i];
-        }
-        if (reduction >= (int64_t) (0.10 * window)) {
+        if (k_sum_marginal_reduction(messages, orig, stubs, savings, K, n,
+                K_sum_committed, last_user) >= (int64_t) (0.10 * window)) {
             result = last_user;
         }
     }
@@ -821,10 +860,25 @@ bool sigma_refresh_fetch(const std::string & host, const std::string & token,
             return false;
         }
         out_block = j["block"].get<std::string>();
-        out_partial = j.contains("partial") && j["partial"].is_boolean() && j["partial"].get<bool>();
+        // P0-5: conservative partial default — only an explicit boolean
+        // partial:false counts as "complete". A missing or non-boolean field
+        // means "in progress": a 202 that omits partial must not be read as
+        // done, or the drain would save an unfinished block as the Σ.
+        if (j.contains("partial") && j["partial"].is_boolean()) {
+            out_partial = j["partial"].get<bool>();
+        } else {
+            out_partial = true;
+        }
         if (out_block.empty()) {
-            err = "empty block";
-            return false;
+            if (wait) {
+                err = "empty block";
+                return false;
+            }
+            // P0-5: on the wait:false (drain) path an empty block means the
+            // server has not rendered one yet — "in progress", not a failure
+            // (the drain continues; it must not stop at pass 1).
+            out_partial = true;
+            return true;
         }
         return true;
     } catch (const std::exception & e) {
@@ -849,20 +903,51 @@ constexpr int64_t SIGMA_SUM_DRAIN_MAX_WALL_MS = 3600 * 1000;  // 1 h
 // thread keeps firing wait:false /sigma/refresh passes (one 30k-char chunk
 // each; the server is single-flight per session, so this is safe alongside
 // live chat's own stage-2 fetch and the 5a async fire) until the server
-// answers partial:false (region fully absorbed). On completion the committed
-// block is refreshed to the complete Σ (lock + K_sum revalidation).
-// Superseded (a newer stage-2 commit moved K_sum, or a prefix reset) -> stop;
-// the newer fetch owns the region. A pass failure stops the drain (the next
-// stage-2 fetch retries). Runs OUTSIDE the sigma_strip mutex except for the
-// short revalidation/commit sections. The supersession check is
-// st.K_sum != cut (NOT sum_gen) — a 5a async fire bumps sum_gen but leaves
-// K_sum unchanged and must not kill the drain (it absorbs the same region;
-// the drain continues past it).
+// answers partial:false (region fully absorbed).
+// P0-1: on completion the complete Σ is held PENDING (pending_block/pending_
+// cut), not swapped into sum_block — the block is prepended to the front of
+// the prefix, so an out-of-band swap would invalidate the whole KV from
+// there (an un-planned re-prefill). The next K/K_sum advance applies it.
+// P0-2: the cut is re-queried under the lock each pass (a K_sum advance
+// mid-drain is picked up on the next pass; its own spawn was rejected because
+// drain_running is still true). A vanished session, a prefix reset (K_sum ==
+// 0) or a non-partial committed state stops the drain. A pass failure stops
+// it (the next stage-2 fetch retries). Runs OUTSIDE the sigma_strip mutex
+// except for the short revalidation/commit sections.
+
+// P1-2: enforce the Σ budget on a fetched block. An over-budget block breaks
+// compute_k_sum's floor assumption (usage_after > target -> advance chain).
+// Clamp to the token cap (char-clamped, UTF-8 boundary) and warn once.
+// A budget <= 0 disables the check.
+static void sigma_validate_block(const struct llama_vocab * vocab, std::string & block,
+        double sum_budget, const std::string & session) {
+    if (block.empty() || sum_budget <= 0.0) {
+        return;
+    }
+    const int64_t cap_tokens = (int64_t) (sum_budget * 1.2);
+    if (cap_tokens <= 0) {
+        return;
+    }
+    const int64_t n_tokens = estimate_tokens(vocab, block);
+    if (n_tokens <= cap_tokens) {
+        return;
+    }
+    // byte estimate: tokens = bytes / 4, so a char-clamp to cap_tokens x 4
+    // keeps the estimate at or below the cap (the real tokenizer may differ,
+    // but shorter text only lowers the count — the clamp direction is safe).
+    block = clamp_chars(block, (size_t) (cap_tokens * 4));
+    static std::atomic<bool> warned(false);
+    if (!warned.exchange(true)) {
+        SRV_WRN("sigma-strip: session=%s Σ block over budget (%lld tokens > %lld cap): clamped to the token cap\n",
+                session.c_str(), (long long) n_tokens, (long long) cap_tokens);
+    }
+}
+
 void sigma_strip_drain(std::string session, size_t cut,
         std::string host, std::string token, int timeout_ms, int64_t delay_ms) {
     // The spawn site set drain_running=true under the lock before spawning us;
     // release it on every exit path (RAII) so a later partial commit can spawn
-    // a fresh drain. Covers the wall-cap, supersede, pass-fail and complete
+    // a fresh drain. Covers the wall-cap, stop, pass-fail and complete
     // returns alike.
     struct drain_flag_release {
         std::string session;
@@ -885,42 +970,60 @@ void sigma_strip_drain(std::string session, size_t cut,
                     session.c_str(), (long long) SIGMA_SUM_DRAIN_MAX_WALL_MS, pass);
             return;
         }
-        // superseded? (a newer stage-2 commit moved K_sum, or a prefix reset)
+        // P0-2: re-query cut + sum_partial under the lock each pass instead of
+        // a fixed cut. A K_sum advance mid-drain does NOT stop the thread —
+        // its own spawn was rejected (drain_running is still true), so this
+        // running thread picks up the new cut on its next pass. Only a
+        // vanished session, a prefix reset (K_sum == 0) or a non-partial state
+        // stops it.
         {
             std::lock_guard<std::mutex> lock(sigma_strip_mutex());
             auto it = sigma_strip_sessions().find(session);
-            if (it == sigma_strip_sessions().end() || it->second.K_sum != cut) {
-                SRV_INF("sigma-strip: session=%s Σ drain superseded before pass %d: stopping\n",
+            if (it == sigma_strip_sessions().end()
+                    || it->second.K_sum == 0
+                    || !it->second.sum_partial) {
+                SRV_INF("sigma-strip: session=%s Σ drain stopped before pass %d (reset/complete/vanished): stopping\n",
                         session.c_str(), pass);
                 return;
             }
+            cut = it->second.K_sum;  // pick up the latest cut
         }
+        const auto pass_start = std::chrono::steady_clock::now();
         std::string block;
         bool partial = true;
         std::string err;
         const bool fetched = sigma_refresh_fetch(host, token, session, cut,
                 /*wait*/ false, timeout_ms, /*llm*/ "summary", block, partial, err);
+        const int64_t pass_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - pass_start).count();
         if (!fetched) {
-            SRV_WRN("sigma-strip: session=%s Σ drain pass %d failed (%s): stopping (next stage-2 fetch retries)\n",
-                    session.c_str(), pass, err.c_str());
+            SRV_WRN("sigma-strip: session=%s Σ drain pass %d failed (pass_ms=%lld, %s): stopping (next stage-2 fetch retries)\n",
+                    session.c_str(), pass, (long long) pass_ms, err.c_str());
             return;
         }
         const int64_t elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - t0).count();
         if (partial) {
-            SRV_INF("sigma-strip: session=%s Σ drain pass %d partial elapsed_ms=%lld\n",
-                    session.c_str(), pass, (long long) elapsed_ms);
+            SRV_INF("sigma-strip: session=%s Σ drain pass %d partial pass_ms=%lld elapsed_ms=%lld\n",
+                    session.c_str(), pass, (long long) pass_ms, (long long) elapsed_ms);
             continue;  // more of the region remains — next pass
         }
-        // region fully absorbed — refresh the committed block to the complete Σ
+        // P0-1: region fully absorbed — hold the complete Σ PENDING (do not
+        // swap sum_block: it is prepended to the front of the prefix, so an
+        // out-of-band swap would invalidate the whole KV from there — an
+        // un-planned re-prefill). The next K/K_sum advance applies it,
+        // piggy-backing on a request that re-prefills anyway. Only while
+        // K_sum has not moved.
         {
             std::lock_guard<std::mutex> lock(sigma_strip_mutex());
             auto it = sigma_strip_sessions().find(session);
             if (it != sigma_strip_sessions().end() && it->second.K_sum == cut) {
-                it->second.sum_block = block;
-                it->second.sum_hash = kv_offload_hash16(block);
-                SRV_INF("sigma-strip: session=%s Σ drain complete: block refreshed to %zu chars after %d pass(es) elapsed_ms=%lld\n",
-                        session.c_str(), block.size(), pass, (long long) elapsed_ms);
+                const size_t n_chars = block.size();
+                it->second.pending_block = std::move(block);
+                it->second.pending_cut = cut;
+                it->second.sum_partial = false;
+                SRV_INF("sigma-strip: session=%s Σ drain complete: %zu-char block pending after %d pass(es) pass_ms=%lld elapsed_ms=%lld pending=1\n",
+                        session.c_str(), n_chars, pass, (long long) pass_ms, (long long) elapsed_ms);
             }
         }
         return;
@@ -966,6 +1069,14 @@ std::string sigma_strip_config_check(const common_params & params) {
         SRV_WRN("sigma-strip: thin margin (threshold - floor = %.0f tokens < 10%% of window): "
                 "post-advance usage lingers near the threshold -> repeated advances (chain re-prefill) "
                 "until native compact; lower the floors or raise the threshold", margin);
+    }
+    // P0-3: a bypass usage at/below the trigger threshold fires for every
+    // gated request — the futility guard is void, not just in the high-usage
+    // region. Set it above the threshold or 0 to disable.
+    if (params.sigma_strip_futility_bypass_usage > 0.0
+            && params.sigma_strip_futility_bypass_usage <= params.sigma_strip_threshold) {
+        SRV_WRN("sigma-strip: --sigma-strip-futility-bypass-usage %.2f <= --sigma-strip-threshold %.2f: the hard-limit bypass voids the futility guard for every gated request; set it above the threshold or 0 to disable",
+                params.sigma_strip_futility_bypass_usage, params.sigma_strip_threshold);
     }
     return "";
 }
@@ -1048,6 +1159,8 @@ sigma_strip_result sigma_strip_maybe_rewrite(
         size_t K_cap = n;
         size_t K_stage1 = 0;
         int64_t off = 0;
+        bool skip_first = false;   // futility guard: first skip of the current episode
+        bool sum_advanced = false; // stage 2 committed a K_sum advance this request
         // Releases sum_inflight on any scope exit (including the outer
         // catch's fail-open return) when this request still owns it.
         inflight_guard guard{session};
@@ -1078,7 +1191,16 @@ sigma_strip_result sigma_strip_maybe_rewrite(
                 // the template/tool state may have changed with it, so the est
                 // calibration is void until a fresh request re-anchors it.
                 st.est_offset = 0;
-                st.n_resets++;
+                // P1-3: a reset whose last reported usage was at/above the
+                // threshold is a normal native compact (the design expects
+                // occasional 1.0 compacts) — do not count it toward the
+                // "client window smaller" warning. Only below-threshold
+                // resets (client compact / /clear) are counted.
+                const bool normal_compact = (st.last_reported > 0 && st.window > 0
+                        && (double) st.last_reported / (double) st.window >= params.sigma_strip_threshold);
+                if (!normal_compact) {
+                    st.n_resets++;
+                }
                 // stage 2: the prefix the Σ block was built from is gone — drop
                 // the committed boundary/snapshot too (plan §5.4).
                 st.K_sum = 0;
@@ -1087,6 +1209,13 @@ sigma_strip_result sigma_strip_maybe_rewrite(
                 st.sum_gen++;
                 st.sum_inflight = false;
                 st.sum_fetch_fail_count = 0;
+                // P0-1: the pending drain block is void with the prefix.
+                st.pending_block.clear();
+                st.pending_cut = 0;
+                st.sum_partial = false;
+                // futility guard: the rearm anchor is void with the prefix.
+                st.last_adv_usage_after = 0.0;
+                st.last_skip = 0;
                 // E3: repeated resets mean the client's own compaction is firing
                 // below the server threshold — its window is likely smaller than
                 // the configured server window. Warn once per session.
@@ -1190,10 +1319,42 @@ sigma_strip_result sigma_strip_maybe_rewrite(
                         }
                     }
                 }
+                // Futility guard (plans/appendix.md spec #2): suppress a
+                // small-gain advance, or one inside the rearm deadband after
+                // the previous advance — otherwise usage lingering near the
+                // threshold chains re-prefills. A skip does not move K: the
+                // request passes through on the committed state (fail-open).
                 if (K2 > st.K) {
-                    st.K = K2;
-                    st.prefix_fp = prefix_fingerprint(messages, st.K);
-                    res.k_advanced = true;
+                    const double gain = resident - stripped;
+                    // P0-3: hard-limit bypass — a small-gain re-prefill (tens
+                    // of seconds) is always cheaper than riding usage to 1.0
+                    // and the multi-minute native compact, so at/above the
+                    // bypass usage both gates are void.
+                    const bool bypass = (params.sigma_strip_futility_bypass_usage > 0.0
+                            && res.usage_before >= params.sigma_strip_futility_bypass_usage);
+                    int skip = 0;
+                    if (!bypass) {
+                        if (params.sigma_strip_min_gain > 0.0
+                                && gain < params.sigma_strip_min_gain * window) {
+                            skip = 1;
+                        } else if (params.sigma_strip_rearm_delta > 0.0
+                                && st.last_adv_usage_after > 0.0
+                                && res.usage_before < st.last_adv_usage_after + params.sigma_strip_rearm_delta) {
+                            skip = 2;
+                        }
+                    }
+                    if (skip) {
+                        res.skip = skip;
+                        skip_first = (st.last_skip != skip);
+                        st.last_skip = skip;
+                    } else {
+                        st.K = K2;
+                        st.prefix_fp = prefix_fingerprint(messages, st.K);
+                        res.k_advanced = true;
+                        if (bypass) {
+                            res.bypass = true;
+                        }
+                    }
                 }
                 // floor_limited: the token floor (above the target) stopped the
                 // advance before the cap. With min_keep = 0 the floor equals the
@@ -1205,6 +1366,10 @@ sigma_strip_result sigma_strip_maybe_rewrite(
                 if (stripped + (double) off > target_tokens) {
                     res.target_unreachable = true;
                 }
+            } else {
+                // P1-4: below the threshold the skip episode is over — a later
+                // skip of the same reason must re-warn (last_skip != skip).
+                st.last_skip = 0;
             }
             K_stage1 = st.K;
             res.K = st.K;
@@ -1223,13 +1388,42 @@ sigma_strip_result sigma_strip_maybe_rewrite(
                         window, st.K_sum);
                 if (K_sum_cand > st.K_sum && !st.sum_inflight) {
                     bool fire = true;
+                    // Futility guard (plans/appendix.md spec #2), stage 2: the
+                    // MARGINAL reduction this advance adds over the committed
+                    // boundary must clear min_gain x window, and the rearm
+                    // deadband applies as in stage 1. A skip leaves the
+                    // cooldown/failure state untouched (no fetch, no count).
+                    // P0-3: the hard-limit bypass applies as in stage 1.
+                    const bool bypass = (params.sigma_strip_futility_bypass_usage > 0.0
+                            && res.usage_before >= params.sigma_strip_futility_bypass_usage);
+                    int skip = 0;
+                    if (!bypass) {
+                        if (params.sigma_strip_min_gain > 0.0
+                                && k_sum_marginal_reduction(messages, orig, stubs,
+                                    savings, st.K, n, st.K_sum, K_sum_cand)
+                                    < (int64_t) (params.sigma_strip_min_gain * window)) {
+                            skip = 1;
+                        } else if (params.sigma_strip_rearm_delta > 0.0
+                                && st.last_adv_usage_after > 0.0
+                                && res.usage_before < st.last_adv_usage_after + params.sigma_strip_rearm_delta) {
+                            skip = 2;
+                        }
+                    }
+                    if (skip) {
+                        fire = false;
+                        if (res.skip == 0) {   // a stage-1 skip reason wins if both skip
+                            res.skip = skip;
+                            skip_first = (st.last_skip != skip);
+                            st.last_skip = skip;
+                        }
+                    }
                     // Cooldown: after a failed llm fetch, skip the next
                     // attempt(s) for sigma_sum_fetch_cooldown_ms so a down
                     // focus-memory does not cost up to sigma_sum_timeout_ms
                     // on every request. Only in the 1..(N-1) failure range —
                     // at N consecutive failures the rule fallback (no HTTP)
                     // takes over.
-                    if (params.sigma_sum_mode == "llm"
+                    if (fire && params.sigma_sum_mode == "llm"
                             && !params.focus_memory_host.empty()
                             && st.sum_fetch_fail_count > 0
                             && st.sum_fetch_fail_count < SIGMA_SUM_RULE_FALLBACK_FAILS
@@ -1252,6 +1446,9 @@ sigma_strip_result sigma_strip_maybe_rewrite(
                         fp_at = prefix_fingerprint(messages, st.K);
                         fail_count_at = st.sum_fetch_fail_count;
                         rule_fallback = (fail_count_at >= SIGMA_SUM_RULE_FALLBACK_FAILS);
+                        if (bypass) {
+                            res.bypass = true;
+                        }
                     }
                 }
             }
@@ -1318,6 +1515,12 @@ sigma_strip_result sigma_strip_maybe_rewrite(
                 block = make_rule_block(messages, K_sum_cand, vocab, sum_budget);
                 block_ok = !block.empty();
             }
+            if (block_ok) {
+                // P1-2: enforce the Σ budget on the produced block — an over-
+                // budget LLM block would break compute_k_sum's floor
+                // assumption (usage_after above the target -> advance chain).
+                sigma_validate_block(vocab, block, sum_budget, session);
+            }
             fetch_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now() - t0).count();
         }
@@ -1359,6 +1562,7 @@ sigma_strip_result sigma_strip_maybe_rewrite(
                 }
                 // C2: commit K_sum + K=max(K,K_sum) + snapshot atomically.
                 if (do_fetch) {
+                    sum_advanced = (K_sum_cand > st.K_sum);
                     st.K_sum = K_sum_cand;
                     if (st.K < st.K_sum) {
                         st.K = st.K_sum;
@@ -1366,7 +1570,35 @@ sigma_strip_result sigma_strip_maybe_rewrite(
                     }
                     st.sum_block = block;
                     st.sum_hash = kv_offload_hash16(block);
+                    // P0-2: stamp the committed block's partial state — a
+                    // partial commit sets it (and spawns the drain), a full
+                    // commit clears it (a running drain stops on its next
+                    // pass). A fresh fetch commit also supersedes any pending
+                    // drain block — the fetched block is newer and wins.
+                    st.sum_partial = block_partial;
+                    st.pending_block.clear();
+                    st.pending_cut = 0;
                 }
+            }
+            // P0-1: apply the pending complete Σ at an advance — this request
+            // re-prefills anyway (K or K_sum moved), so swapping the block
+            // here costs no extra KV invalidation (the block is prepended to
+            // the front of the prefix; an out-of-band swap at drain
+            // completion would invalidate the whole KV from there). Only
+            // while the cut the block was drained for has not moved.
+            if ((res.k_advanced || sum_advanced) && !st.pending_block.empty()
+                    && st.pending_cut == st.K_sum) {
+                // P1-2: the drain's block passes the same budget check before
+                // it is committed.
+                sigma_validate_block(vocab, st.pending_block, sum_budget, session);
+                const size_t n_chars = st.pending_block.size();
+                st.sum_block = std::move(st.pending_block);
+                st.sum_hash = kv_offload_hash16(st.sum_block);
+                st.pending_block.clear();
+                st.pending_cut = 0;
+                st.sum_partial = false;
+                SRV_INF("sigma-strip: session=%s pending Σ block applied at advance (chars=%zu)\n",
+                        session.c_str(), n_chars);
             }
             res.sum_applied = (st.K_sum > 0 && !st.sum_block.empty());
             res.K_sum = st.K_sum;
@@ -1442,17 +1674,30 @@ sigma_strip_result sigma_strip_maybe_rewrite(
             res.tokens_after = tokens_after;
             res.n_stripped = n_stripped;
             res.usage_after = ((double) tokens_after + (double) off) / window;
+            // futility guard: a committed advance records the post-advance
+            // usage (the rearm anchor) and ends the skip episode.
+            if (res.k_advanced || sum_advanced) {
+                st.last_adv_usage_after = res.usage_after;
+                st.last_skip = 0;
+                res.skip = 0;
+            }
             res.eligible = true;
 
-            // E1/E2: decision snapshot for the next response's observation line
-            st.last_est = tokens_after;
+            // E1/E2: decision snapshot for the next response's observation
+            // line. P0-4: last_est must match what the server actually sent —
+            // in shadow mode (or apply=false) the body is untouched, so the
+            // reported tokens refer to the ORIGINAL prompt; anchoring on
+            // tokens_after would mix the strip savings into reported - last_est
+            // (offset inflated up to the window/2 clamp).
+            const bool applied = (params.sigma_strip_mode == "on" && apply && have_rewrite);
+            st.last_est = applied ? tokens_after : tokens_before;
             st.last_K = st.K;
             st.last_stripped = n_stripped;
             st.last_advanced = res.k_advanced;
             st.last_floor_limited = res.floor_limited;
 
             // 5) apply in "on" mode
-            if (params.sigma_strip_mode == "on" && apply && have_rewrite) {
+            if (applied) {
                 body["messages"] = rewritten;
             }
             // (lock released here)
@@ -1525,8 +1770,12 @@ sigma_strip_result sigma_strip_maybe_rewrite(
                     std::string block;
                     bool partial = false;
                     std::string err;
+                    // P1-1: the fast summary model (like the drain) — the
+                    // background absorption must not contend for the main 27B
+                    // slot. The stage-2 wait:true fetch (request path) keeps
+                    // the default model on purpose (extraction quality).
                     if (!sigma_refresh_fetch(host, token, session, cut, /*wait*/ false,
-                                timeout_ms, /*llm*/ "", block, partial, err)) {
+                                timeout_ms, /*llm*/ "summary", block, partial, err)) {
                         SRV_WRN("sigma-strip: session=%s async /sigma/refresh (wait:false) failed: %s\n",
                                 session.c_str(), err.c_str());
                     }
@@ -1563,16 +1812,33 @@ sigma_strip_result sigma_strip_maybe_rewrite(
                     (long long) target_tokens, (int) c.stage2_can_reach);
         }
 
-        // 6) shadow / on log line (with the stage-2 Σ fields)
-        SRV_INF("sigma-strip: session=%s mode=%s K=%zu/%zu K_sum=%zu reset=%d advanced=%d stripped=%zu tokens %lld->%lld usage %.3f->%.3f off=%lld rewrite=%s sum=%d block=%s fetch_ms=%lld partial=%d fail=%d%s%s",
-                session.c_str(), params.sigma_strip_mode.c_str(), res.K, n, res.K_sum,
-                (int) res.prefix_reset, (int) res.k_advanced, res.n_stripped,
-                (long long) res.tokens_before, (long long) res.tokens_after,
-                res.usage_before, res.usage_after, (long long) res.est_offset,
-                res.rewrite_hash.c_str(), (int) res.sum_applied, res.sum_hash.c_str(),
-                (long long) res.sum_fetch_ms, (int) res.sum_partial, res.sum_fail,
-                res.target_unreachable ? " target-unreachable" : "",
-                res.floor_limited ? " floor-limited" : "");
+        // 6) shadow / on log line (with the stage-2 Σ fields). Futility guard:
+        // the first skip of an episode is warned, repeats are plain info (a
+        // skip superseded by a committed advance cleared res.skip in [C] and
+        // logs without the skip field).
+        const char * skip_field = res.skip == 1 ? " skip=gain" : (res.skip == 2 ? " skip=rearm" : "");
+        const char * bypass_field = res.bypass ? " bypass=1" : "";
+        if (res.skip != 0 && skip_first) {
+            SRV_WRN("sigma-strip: session=%s mode=%s K=%zu/%zu K_sum=%zu reset=%d advanced=%d stripped=%zu tokens %lld->%lld usage %.3f->%.3f off=%lld rewrite=%s sum=%d block=%s fetch_ms=%lld partial=%d fail=%d%s%s%s%s",
+                    session.c_str(), params.sigma_strip_mode.c_str(), res.K, n, res.K_sum,
+                    (int) res.prefix_reset, (int) res.k_advanced, res.n_stripped,
+                    (long long) res.tokens_before, (long long) res.tokens_after,
+                    res.usage_before, res.usage_after, (long long) res.est_offset,
+                    res.rewrite_hash.c_str(), (int) res.sum_applied, res.sum_hash.c_str(),
+                    (long long) res.sum_fetch_ms, (int) res.sum_partial, res.sum_fail,
+                    res.target_unreachable ? " target-unreachable" : "",
+                    res.floor_limited ? " floor-limited" : "", skip_field, bypass_field);
+        } else {
+            SRV_INF("sigma-strip: session=%s mode=%s K=%zu/%zu K_sum=%zu reset=%d advanced=%d stripped=%zu tokens %lld->%lld usage %.3f->%.3f off=%lld rewrite=%s sum=%d block=%s fetch_ms=%lld partial=%d fail=%d%s%s%s%s",
+                    session.c_str(), params.sigma_strip_mode.c_str(), res.K, n, res.K_sum,
+                    (int) res.prefix_reset, (int) res.k_advanced, res.n_stripped,
+                    (long long) res.tokens_before, (long long) res.tokens_after,
+                    res.usage_before, res.usage_after, (long long) res.est_offset,
+                    res.rewrite_hash.c_str(), (int) res.sum_applied, res.sum_hash.c_str(),
+                    (long long) res.sum_fetch_ms, (int) res.sum_partial, res.sum_fail,
+                    res.target_unreachable ? " target-unreachable" : "",
+                    res.floor_limited ? " floor-limited" : "", skip_field, bypass_field);
+        }
         return res;
     } catch (const std::exception & e) {
         SRV_WRN("sigma-strip: fail-open (%s), request untouched", e.what());
