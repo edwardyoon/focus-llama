@@ -17,6 +17,7 @@
 #include <unistd.h>
 
 #include <chrono>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -67,6 +68,8 @@ struct llm_mock_request {
     uint64_t    cut  = 0;
     bool        wait = true;
     bool        seen = false;
+    // the "llm" routing hint (empty = MAIN_LLM default, "summary" = drain fast path)
+    std::string llm;
 };
 
 class llm_mock_server {
@@ -138,6 +141,10 @@ public:
         std::lock_guard<std::mutex> lock(m_);
         return requests_.size();
     }
+    std::vector<llm_mock_request> all() {
+        std::lock_guard<std::mutex> lock(m_);
+        return requests_;
+    }
 private:
     void accept_loop() {
         for (;;) {
@@ -178,6 +185,9 @@ private:
             }
             if (j.contains("wait") && j["wait"].is_boolean()) {
                 rq.wait = j["wait"].get<bool>();
+            }
+            if (j.contains("llm") && j["llm"].is_string()) {
+                rq.llm = j["llm"].get<std::string>();
             }
             rq.seen = true;
         } catch (const std::exception &) {
@@ -326,7 +336,70 @@ static common_json make_sum_scenario() {
     return msgs;
 }
 
+// Stage-2 extended scenario: [0..7] is IDENTICAL to make_sum_scenario (so a
+// second request on the same session passes the prefix-fingerprint check and
+// does not reset), then extra rounds so K_cap moves to 13 and the user
+// boundary at 12 yields K_sum_cand = 12 > 7. Used by t-sum-llm-drain-single to
+// force a second partial commit (and drain-spawn attempt) while the first
+// drain from the base scenario still holds the drain_running flag.
+static common_json make_sum_scenario_extended() {
+    common_json msgs = common_json::array();
+    auto add = [&msgs](const std::string & role, const std::string & content,
+                       const std::string & tcid = "", const std::string & path = "") {
+        common_json m = common_json::object();
+        m["role"] = role;
+        m["content"] = content;
+        if (!tcid.empty() && role == "assistant") {
+            common_json fn = common_json::object();
+            fn["name"] = std::string("read_file");
+            fn["arguments"] = std::string("{\"path\":\"") + path + "\"}";
+            common_json call = common_json::object();
+            call["id"] = tcid;
+            call["type"] = std::string("function");
+            call["function"] = fn;
+            common_json tcs = common_json::array();
+            tcs.push_back(call);
+            m["tool_calls"] = tcs;
+        }
+        if (!tcid.empty() && role == "tool") {
+            m["tool_call_id"] = tcid;
+            m["name"] = std::string("read_file");
+        }
+        msgs.push_back(m);
+    };
+    // [0..7] identical to make_sum_scenario (prefix fingerprint match)
+    add("system", "You are a coding agent.");
+    add("user", std::string(20000, 'a'));
+    add("assistant", "", "call_0", "/tmp/a.txt");
+    add("tool", std::string(8000, 'x'), "call_0", "");
+    add("assistant", "", "call_1", "/tmp/b.txt");
+    add("tool", std::string(8000, 'x'), "call_1", "");
+    add("assistant", "First answer.");
+    add("user", "SECOND_MARKER " + std::string(88, 'q'));
+    // [8..] extended: a large user message (in the marginal [7,12)) plus a
+    // protected tool round so K_cap = 13 and K_sum_cand lands at 12.
+    add("user", std::string(2000, 'w'));
+    add("assistant", "", "call_3", "/tmp/d.txt");
+    add("tool", std::string(8000, 'x'), "call_3", "");
+    add("assistant", "Second answer.");
+    add("user", std::string(100, 'r'));
+    add("assistant", "", "call_4", "/tmp/e.txt");
+    add("tool", std::string(2000, 'x'), "call_4", "");
+    add("assistant", "Third answer.");
+    add("user", std::string(10, 'z'));
+    add("assistant", "Done.");
+    return msgs;
+}
+
 int main() {
+#ifndef _WIN32
+    // The mock LLM server below writes responses with raw ::send; when the
+    // httplib client closes a connection early, that write would raise SIGPIPE
+    // and kill the whole test. Ignore it, exactly as the production server does
+    // (llama_server, tools/server/server.cpp). handle_one already breaks out of
+    // its send loop on EPIPE, so this only prevents the process from dying.
+    signal(SIGPIPE, SIG_IGN);
+#endif
     // --- mode off: no-op, body untouched ----------------------------------
     {
         common_json body = make_body(make_messages(5, 2000));
@@ -1142,12 +1215,17 @@ int main() {
         CHECK(res.K == 8);
         const std::string u2 = body.at("messages").at(1).at("content").get<std::string>();
         CHECK(u2.rfind("LLM_PARTIAL_MARKER", 0) == 0);   // partial block applied
-        // request 1 = stage-2 wait:true fetch; request 2 = the drain's pass
+        // request 1 = stage-2 wait:true fetch (default MAIN_LLM, no llm hint);
+        // request 2 = the drain's pass (routes to the lightweight SUMMARY_LLM).
         CHECK(mock.wait_requests(2, 5000));
-        const llm_mock_request rq = mock.last();
+        const std::vector<llm_mock_request> reqs = mock.all();
+        CHECK(reqs.size() >= 2);
+        CHECK(reqs[0].llm.empty());
+        const llm_mock_request rq = reqs[1];
         CHECK(rq.session == "t-sum-llm-drain");
         CHECK(rq.cut == 7);
         CHECK(rq.wait == false);   // the drain's pass
+        CHECK(rq.llm == "summary");
         // The drain refreshes the committed block under the lock after its
         // pass returns. Poll fresh rewrites (no new fetch: K_sum unchanged)
         // until the complete Σ is prepended.
@@ -1162,6 +1240,52 @@ int main() {
             }
         }
         CHECK(refreshed);   // committed block refreshed to the complete Σ
+    }
+
+    // --- stage 2 llm: drain guard (no double spawn) -------------------------
+    // Request 1 (base scenario) commits K_sum=7 partial -> drain A spawns and
+    // sets drain_running. Request 2 (extended scenario; same [0..7] prefix so
+    // no reset) advances K_sum to 12 and commits a second partial. Its
+    // drain-spawn attempt must be BLOCKED because drain A still holds the
+    // flag (it is in its inter-pass sleep, spaced by drain_delay). So no
+    // wait:false request with cut==12 (drain B) is ever fired.
+    {
+        llm_mock_server mock;
+        CHECK(mock.start());
+        // queue: req1 stage-2 fetch (partial), drain A pass 1 (partial),
+        // req2 stage-2 fetch (partial). All partial, so the order of the two
+        // concurrent partials (drain A pass 1 vs req2 fetch) is irrelevant.
+        mock.push_response(R"({"block":"LLM_D1","partial":true})");
+        mock.push_response(R"({"block":"LLM_D2","partial":true})");
+        mock.push_response(R"({"block":"LLM_D3","partial":true})");
+        common_params p = make_sum_params("on");
+        p.sigma_sum_mode = "llm";
+        p.focus_memory_host = mock.url();
+        p.sigma_sum_drain = true;
+        p.sigma_sum_drain_delay_ms = 100;   // space drain passes so the flag
+                                            // is held across request 2's check
+        common_json body = make_body(make_sum_scenario());
+        const sigma_strip_result res =
+            sigma_strip_maybe_rewrite(nullptr, p, make_req("t-sum-llm-drain-single"), body, true);
+        CHECK(res.sum_partial);
+        CHECK(res.K_sum == 7);
+        // request 1 fetch + drain A pass 1 (the drain is now in its pass-2 sleep)
+        CHECK(mock.wait_requests(2, 5000));
+        // Request 2: extended scenario -> K_sum advances to 12, second partial
+        // commit, drain-spawn attempt (must be blocked by the held flag).
+        common_json body2 = make_body(make_sum_scenario_extended());
+        const sigma_strip_result res2 =
+            sigma_strip_maybe_rewrite(nullptr, p, make_req("t-sum-llm-drain-single"), body2, true);
+        CHECK(res2.sum_partial);
+        CHECK(res2.K_sum > 7);
+        // Let the drain threads settle (drain A's next supersession check sees
+        // K_sum moved and releases the flag; no drain B was ever spawned).
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        bool drain_b = false;
+        for (const auto & r : mock.all()) {
+            if (r.wait == false && r.cut == res2.K_sum) drain_b = true;
+        }
+        CHECK(!drain_b);   // the guard held — no competing drain for the 2nd commit
     }
 
     // --- stage 2 llm: failures hold stage 2, 3 strikes -> rule fallback -----

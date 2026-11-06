@@ -1903,6 +1903,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_SIGMA_SUM_DRAIN_DELAY_MS").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
+        {"--sigma-sum-drain-timeout-ms"}, "N",
+        "sigma-strip stage 2: drain-only focus-memory /sigma/refresh timeout in ms (background Σ drain's fast path; 0 = fall back to --sigma-sum-timeout-ms, default: 120000)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("error: --sigma-sum-drain-timeout-ms must be >= 0 (got " + std::to_string(value) + ")");
+            }
+            params.sigma_sum_drain_timeout_ms = value;
+        }
+    ).set_env("LLAMA_ARG_SIGMA_SUM_DRAIN_TIMEOUT_MS").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
         {"--sparse-gate-threshold"}, "PCT",
         "DA sparse FA gate: use the sparse (gather) path only while the finite KV rows are at most PCT% of the cache, dense below that (1-100, default: 50)",
         [](common_params & params, int value) {

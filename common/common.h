@@ -743,6 +743,11 @@ struct common_params {
     // Delay in ms between drain passes — spaces the 27B extraction calls so
     // live chat can interleave on the shared (parallel=1) slot.
     int32_t     sigma_sum_drain_delay_ms = 5000;
+    // Drain-only /sigma/refresh timeout in ms (the background drain's fast
+    // path, which routes to the lightweight SUMMARY_LLM). 0 = fall back to
+    // sigma_sum_timeout_ms. Kept separate from the general stage-2 timeout so
+    // the slow 27B wait:true fetch and the fast drain pass can be tuned apart.
+    int32_t     sigma_sum_drain_timeout_ms = 120000;
     // sparse FA gate (DA n_kv_max): the CUDA/Metal sparse (gather) path is used
     // only while the finite KV rows are at most this % of the cache; dense
     // below. Bridged to FOCUS_SPARSE_GATE_THRESHOLD in the server main (1-100).
