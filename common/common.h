@@ -1179,6 +1179,24 @@ void common_batch_add(
 // last token always have output_logits set to true
 llama_batch_ext_ptr common_batch_ext_get_one(struct llama_context * ctx, const llama_tokens & tokens);
 
+// RAII wrapper around llama_batch_ext for building a batch token by token
+class common_batch {
+    llama_batch_ext_ptr batch;
+public:
+    common_batch(struct llama_context * ctx)
+        : batch(llama_batch_ext_init(ctx)) {}
+
+    void add(llama_token id, llama_pos pos, llama_seq_id seq_id, bool logits) {
+        const int32_t idx = llama_batch_ext_add_token(batch.get(), seq_id, id);
+        llama_batch_ext_set_pos(batch.get(), idx, &pos);
+        if (logits) {
+            llama_batch_ext_set_output_logits(batch.get(), idx, true);
+        }
+    }
+
+    llama_batch_ext * get() { return batch.get(); }
+};
+
 // decodes a single batch of tokens for a prompt and manages session tokens
 //
 // Note: We save state before the last token so that we can replay it to ensure

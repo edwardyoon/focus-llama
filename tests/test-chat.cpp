@@ -7680,7 +7680,7 @@ static void test_deepseek_v4_1_message_fields() {
         inputs.messages = common_chat_msgs_parse_oaicompat(json::parse(messages_json));
         inputs.add_generation_prompt = add_generation_prompt;
         inputs.enable_thinking = false;
-        return common_chat_templates_apply(tmpls.get(), inputs).prompt.str();
+        return common_chat_templates_apply(tmpls.get(), inputs).prompt;
     };
 
     assert_equals(std::string("<｜User｜>q<｜action｜>"),
@@ -7703,7 +7703,7 @@ static void test_deepseek_v4_1_message_fields() {
         inputs.add_generation_prompt = true;
         inputs.chat_template_kwargs["reasoning_effort"] = json(effort).dump();
         assert_equals("<｜User｜>Hey there!" + expected + "<｜Assistant｜><think>",
-                      common_chat_templates_apply(tmpls.get(), inputs).prompt.str());
+                      common_chat_templates_apply(tmpls.get(), inputs).prompt);
     }
 }
 
