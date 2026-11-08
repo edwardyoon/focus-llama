@@ -655,6 +655,7 @@ struct common_params {
     bool    da_measure_only     = false; // run the DA tag state machine + logging but skip all KV removals (apply_da_rm/apply_da_b) - output stays vanilla, for measuring g (tag position) and emission rate without touching the KV
     int32_t da_tail_keep        = 8192;  // DA tail floor: the most recent N tokens before the removal boundary are always kept (union of the tag selection, the Sigma anchor and the tail); 0 = legacy behavior (no floor)
     int32_t da_b_min_remove     = 0;     // da_b: skip the B switch when fewer than N tokens would be removed (the switch cost outweighs a tiny removal); 0 = always switch (legacy)
+    std::string da_scaffold_file = "";   // da_auto: read the DA instruction text from this file (mtime hot-reload, {n_total} placeholder); empty = built-in instruction
 
     // kv-offload (auto-compact replacement): evict the oldest magic chunks to the
     // FocusMemory store once the prompt exceeds the threshold; get-on-focus re-

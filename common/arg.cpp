@@ -1729,6 +1729,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.da_b_min_remove = value;
         }
     ).set_env("LLAMA_ARG_DA_B_MIN_REMOVE").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        {"--da-scaffold-file"}, "PATH",
+        "da_auto: read the DA instruction text from this file instead of the built-in (mtime hot-reload: edits take effect on the next request; {n_total} is replaced with the total chunk count; a missing/unreadable file falls back to the built-in). Default: disabled (built-in instruction)",
+        [](common_params & params, const std::string & value) {
+            params.da_scaffold_file = value;
+        }
+    ).set_env("LLAMA_ARG_DA_SCAFFOLD_FILE").set_examples({ LLAMA_EXAMPLE_SERVER }));
     // NOTE: named --fm-offload (not --kv-offload): the standard llama.cpp
     // -kvo/--kv-offload flag (KV cache offloading) already owns that name and
     // the LLAMA_ARG_KV_OFFLOAD env var, so a --kv-offload here was silently

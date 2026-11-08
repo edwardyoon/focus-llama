@@ -72,8 +72,11 @@ bool da_scan_prompt(const llama_vocab * vocab, const std::string & text, const l
 
 // P4 auto-chunker: split a marker-less prompt into [Magic Chunk N] chunks and
 // append the DA instruction (+ optional Σ anchor). The default arguments live
-// here only; the definition in da-layout.cpp omits them.
+// here only; the definition in da-layout.cpp omits them. scaffold_file: when
+// non-empty, the instruction text is read from this file (mtime hot-reload,
+// {n_total} placeholder) instead of the built-in.
 da_auto_layout da_auto_chunk(const llama_vocab * vocab, const std::string & text, int32_t da_chunk_tokens,
         const std::vector<std::string> & offloaded_hints = {},
         const std::vector<da_evict_bound> & evict_bounds = {},
-        const std::string & sigma_anchor = {});
+        const std::string & sigma_anchor = {},
+        const std::string & scaffold_file = {});
