@@ -120,6 +120,8 @@ std::string sigma_strip_config_check(const common_params & params);
 //   HTTP request is sent, verifying the fail-open path releases the
 //   per-session inflight flag.
 //   test_anchor: the P0-4 fingerprint of one message (unit test C1).
+//   test_clamp: the stub/Σ byte clamp (clamp_chars is file-local) — the
+//   output must always be valid UTF-8.
 //   test_drain_running: the per-session drain flag (unit test C4 — the
 //   no-progress stop must release it).
 //   test_evict_idle: the idle-eviction scan with a deterministic clock.
@@ -130,6 +132,7 @@ std::string sigma_strip_config_check(const common_params & params);
 #ifdef SIGMA_STRIP_TESTS
 void sigma_strip_test_set_fetch_fault(bool on);
 std::string sigma_strip_test_anchor(const common_json & msg);
+std::string sigma_strip_test_clamp(const std::string & s, size_t max);
 bool sigma_strip_test_drain_running(const std::string & session);
 size_t sigma_strip_test_evict_idle(int64_t now_ms);
 void sigma_strip_test_touch(const std::string & session, int64_t last_request_ms);
