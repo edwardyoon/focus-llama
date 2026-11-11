@@ -778,6 +778,81 @@ int main() {
         CHECK(out.at(7).at("tool_call_id").get<std::string>() == "call_1");
     }
 
+    // --- UTF-8: the stub hint byte cut must not leave a dangling lead byte --
+    // A Korean path > 80 bytes cuts in the middle of a 3-byte sequence.
+    // Before the fix the dangling lead byte made rewritten.dump() throw
+    // (type_error.316) -> fail-open, with the committed K regenerating the
+    // same stub on every request (a permanently dead session).
+    {
+        std::string ko;
+        for (int i = 0; i < 30; ++i) ko += "\xEC\xA0\x9C";   // 30 cp, 90 bytes
+        common_json msgs = common_json::array();
+        auto add = [&msgs](const std::string & role, const std::string & content,
+                           const std::string & tcid = "", const std::string & tcargs = "") {
+            common_json m = common_json::object();
+            m["role"] = role;
+            m["content"] = content;
+            if (!tcid.empty()) {
+                common_json fn = common_json::object();
+                fn["name"] = std::string("read_file");
+                fn["arguments"] = tcargs;
+                common_json call = common_json::object();
+                call["id"] = tcid;
+                call["type"] = std::string("function");
+                call["function"] = fn;
+                common_json tcs = common_json::array();
+                tcs.push_back(call);
+                m["tool_calls"] = tcs;
+            }
+            if (!tcid.empty() && role == "tool") {
+                m["tool_call_id"] = tcid;
+                m["name"] = std::string("read_file");
+            }
+            msgs.push_back(m);
+        };
+        const std::string big(8000, 'x');
+        add("system", "You are a coding agent.");
+        add("user", "First request.");
+        add("assistant", "", "call_0", std::string("{\"path\":\"") + ko + "\"}");
+        add("tool", big, "call_0", "");
+        add("assistant", "First answer.");
+        add("user", "Second request.");
+        add("assistant", "", "call_1", "{\"path\":\"/tmp/b.txt\"}");
+        add("tool", big, "call_1", "");
+
+        common_json body = make_body(msgs);
+        const sigma_strip_result res =
+            sigma_strip_maybe_rewrite(nullptr, make_params("on", 3000), make_req("t-utf8-stub"), body, true);
+        CHECK(res.eligible);
+        CHECK(res.k_advanced);
+        CHECK(res.K == 6);
+        CHECK(res.n_stripped == 1);
+        CHECK(!res.rewrite_hash.empty());   // rewritten.dump() did not throw
+        // the rewritten body re-serializes cleanly (valid UTF-8 end to end)
+        bool dumped_ok = true;
+        try {
+            body.dump();
+        } catch (const std::exception &) {
+            dumped_ok = false;
+        }
+        CHECK(dumped_ok);
+        const std::string stub = body.at("messages").at(3).at("content").get<std::string>();
+        // 90-byte path cut at 80 = 26 cp + 2 bytes of the 27th -> the split
+        // sequence is backed off (26 cp kept, no dangling lead byte). The
+        // token count is an estimate detail, so check the path cut precisely
+        // and the rest structurally.
+        const std::string prefix = "[read_file result stripped — path=";
+        const std::string mid = "..., ";
+        CHECK(stub.rfind(prefix, 0) == 0);
+        const size_t ps = prefix.size();
+        const size_t pe = stub.find(mid, ps);
+        CHECK(pe != std::string::npos);
+        const std::string cutpart = stub.substr(ps, pe - ps);
+        CHECK(cutpart.size() == 26 * 3);   // 26 complete Korean cp, no split
+        CHECK(cutpart == ko.substr(0, 26 * 3));   // the first 26 cp, verbatim
+        CHECK(stub.find(" tokens. Re-read if needed]") != std::string::npos);
+    }
+
     // --- token floor: min_keep stops the advance before the cap ------------
     // 5 rounds (K_cap=10 with keep_recent=1). Target-only would strip all 5
     // results (K=10); min_keep=4500 stops it after 3 (tokens_after ~4100
@@ -1606,6 +1681,69 @@ int main() {
         longko["role"] = std::string("user");
         longko["content"] = ko;
         CHECK(sigma_strip_test_anchor(longko).size() == 180);   // 60 cp x 3 bytes
+    }
+
+    // --- UTF-8: clamp_chars never emits a dangling lead byte ---------------
+    // The clamp feeds the Σ block (rule-block requests/commands, the budget
+    // trim) — an invalid tail would make the rewritten JSON's dump() throw
+    // and fail-open the whole rewrite. A cut exactly on a boundary drops the
+    // last complete character (always valid, at most one character short).
+    {
+        auto valid_utf8 = [](const std::string & s) {
+            for (size_t i = 0; i < s.size();) {
+                const unsigned char c = (unsigned char) s[i];
+                size_t len = 1;
+                if (c >= 0xF0) len = 4;
+                else if (c >= 0xE0) len = 3;
+                else if (c >= 0xC0) len = 2;
+                else if (c >= 0x80) return false;    // stray continuation byte
+                if (i + len > s.size()) return false;  // truncated sequence
+                for (size_t k = 1; k < len; ++k) {
+                    if (((unsigned char) s[i + k] & 0xC0) != 0x80) return false;
+                }
+                i += len;
+            }
+            return true;
+        };
+        std::string ko30;
+        for (int i = 0; i < 30; ++i) ko30 += "\xEC\xA0\x9C";   // 90 bytes
+        // mid-sequence cut: 80 = 26 cp + 2 bytes of the 27th -> split dropped
+        {
+            const std::string r = sigma_strip_test_clamp(ko30, 80);
+            CHECK(valid_utf8(r));
+            CHECK(r.size() == 26 * 3 + 3);   // 26 cp + "…"
+            CHECK(r.compare(0, 26 * 3, ko30, 0, 26 * 3) == 0);
+        }
+        // exact boundary: 78 = 26 cp -> the complete char is dropped too
+        {
+            const std::string r = sigma_strip_test_clamp(ko30, 78);
+            CHECK(valid_utf8(r));
+            CHECK(r.size() == 25 * 3 + 3);   // 25 cp + "…"
+        }
+        // 2-byte sequence: 79 = 39 cp + 1 byte -> the lead is dropped
+        {
+            std::string u;
+            for (int i = 0; i < 40; ++i) u += "\xC3\xBC";   // 80 bytes
+            const std::string r = sigma_strip_test_clamp(u, 79);
+            CHECK(valid_utf8(r));
+            CHECK(r.size() == 39 * 2 + 3);   // 39 cp + "…"
+        }
+        // 4-byte sequence, exact boundary: 80 = 20 cp -> the complete char dropped
+        {
+            std::string em;
+            for (int i = 0; i < 25; ++i) em += "\xF0\x9F\x98\x80";   // 100 bytes
+            const std::string r = sigma_strip_test_clamp(em, 80);
+            CHECK(valid_utf8(r));
+            CHECK(r.size() == 19 * 4 + 3);   // 19 cp + "…"
+        }
+        // ASCII: the boundary byte is kept
+        {
+            const std::string r = sigma_strip_test_clamp(std::string(100, 'a'), 80);
+            CHECK(valid_utf8(r));
+            CHECK(r == std::string(80, 'a') + "…");
+        }
+        // no cut: short input passes through
+        CHECK(sigma_strip_test_clamp(std::string("abc"), 80) == "abc");
     }
 
     // --- P0-4/P1-2: the stage-2 fetch carries the anchor + the budget (C2) ---

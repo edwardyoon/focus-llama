@@ -226,7 +226,23 @@ std::string make_stub(const std::string & tool, const std::string & args_json, i
                 for (const char * key : { "path", "file_path", "filepath", "query", "pattern", "url" }) {
                     const std::string v = json_string_or(args, key);
                     if (!v.empty()) {
-                        hint = std::string(key) + "=" + (v.size() > 80 ? v.substr(0, 80) + "..." : v);
+                        std::string cut = v;
+                        if (cut.size() > 80) {
+                            cut = cut.substr(0, 80);
+                            // Same UTF-8 tail backoff as clamp_chars: a byte
+                            // cut in the middle of a sequence leaves a
+                            // dangling lead byte, which makes the rewritten
+                            // JSON's dump() throw (type_error.316) and
+                            // fail-open the whole rewrite.
+                            while (!cut.empty() && ((unsigned char) cut.back() & 0xC0) == 0x80) {
+                                cut.pop_back();
+                            }
+                            if (!cut.empty() && (unsigned char) cut.back() >= 0xC0) {
+                                cut.pop_back();
+                            }
+                            cut += "...";
+                        }
+                        hint = std::string(key) + "=" + cut;
                         break;
                     }
                 }
@@ -527,14 +543,22 @@ std::string normalize_tool_name(const std::string & name) {
     return n;
 }
 
-// Byte-clamp to `max` chars, backing off a split UTF-8 sequence, with an
-// ellipsis. Deterministic (same input -> same output).
+// Byte-clamp to `max` chars, with an ellipsis. The cut is backed off to a
+// valid UTF-8 boundary: the continuation bytes of a split sequence are
+// dropped, and with them the dangling lead byte (a cut exactly on a
+// character boundary drops the last complete character). The result is
+// always valid UTF-8, at most one character short — an invalid tail would
+// make the rewritten JSON's dump() throw (type_error.316) and fail-open the
+// whole rewrite. Deterministic (same input -> same output).
 std::string clamp_chars(const std::string & s, size_t max) {
     if (s.size() <= max) {
         return s;
     }
     std::string out = s.substr(0, max);
     while (!out.empty() && ((unsigned char) out.back() & 0xC0) == 0x80) {
+        out.pop_back();
+    }
+    if (!out.empty() && (unsigned char) out.back() >= 0xC0) {
         out.pop_back();
     }
     return out + "…";
@@ -582,7 +606,7 @@ std::string sigma_anchor_text(const common_json & msg) {
     if (!msg.is_object() || json_string_or(msg, "role") != "user") {
         return "";
     }
-    std::string t = strip_injected_blocks(message_text(msg));
+    const std::string t = strip_injected_blocks(message_text(msg));
     std::string out;
     out.reserve(t.size());
     for (unsigned char c : t) {
@@ -590,28 +614,30 @@ std::string sigma_anchor_text(const common_json & msg) {
             out += (char) c;
         }
     }
-    size_t cp = 0;
-    while (cp < 60 && !out.empty()) {
-        size_t pos = 0;
-        while (pos < out.size() && cp < 60) {
-            const unsigned char c = (unsigned char) out[pos];
-            size_t len = 1;
-            if (c >= 0xF0) len = 4;
-            else if (c >= 0xE0) len = 3;
-            else if (c >= 0xC0) len = 2;
-            if (pos + len > out.size()) {
-                break;
-            }
-            pos += len;
-            ++cp;
+    // Single pass: walk complete UTF-8 sequences, counting code points, and
+    // remember the byte position. cp/pos must NOT be re-scanned by an outer
+    // retry loop — accumulating cp across passes re-counts the string and
+    // truncates any input shorter than 60 cp to (60 mod N) code points
+    // (e.g. 59 cp -> 1 cp). One pass covers every length:
+    //   N < 60  -> pos reaches out.size(), the whole string is kept
+    //   N >= 60 -> cp hits 60 mid-string, cut at the sequence boundary
+    size_t cp  = 0;
+    size_t pos = 0;
+    while (pos < out.size() && cp < 60) {
+        const unsigned char c = (unsigned char) out[pos];
+        size_t len = 1;
+        if (c >= 0xF0) len = 4;
+        else if (c >= 0xE0) len = 3;
+        else if (c >= 0xC0) len = 2;
+        if (pos + len > out.size()) {
+            break; // incomplete trailing sequence: exclude it (defensive —
+                   // parsed JSON is valid UTF-8 and the byte filter above
+                   // only removes ASCII, so this cannot split a sequence)
         }
-        if (pos < out.size()) {
-            out = out.substr(0, pos);
-        }
-        if (cp >= 60) {
-            break;
-        }
+        pos += len;
+        ++cp;
     }
+    out.resize(pos); // pos <= out.size(): in-place shrink, no copy
     return out;
 }
 
@@ -2171,6 +2197,13 @@ void sigma_strip_test_set_fetch_fault(bool on) {
 // one message, exposed for the unit test (sigma_anchor_text is file-local).
 std::string sigma_strip_test_anchor(const common_json & msg) {
     return sigma_anchor_text(msg);
+}
+
+// Test-only (tests/test-sigma-strip.cpp): the stub/Σ byte clamp (clamp_chars
+// is file-local) — the output must always be valid UTF-8 (an invalid tail
+// makes the rewritten JSON's dump() throw and fail-open the rewrite).
+std::string sigma_strip_test_clamp(const std::string & s, size_t max) {
+    return clamp_chars(s, max);
 }
 
 // Test-only (tests/test-sigma-strip.cpp, C4): the per-session drain flag —
