@@ -642,8 +642,9 @@ std::string sigma_anchor_text(const common_json & msg) {
 }
 
 // P0-4: which user message the anchor is — the count of user messages in
-// [0, cut). The JS side matches it against the ordinal of the user line in
-// the transcript index (1-based).
+// [0, cut) = the anchor's 0-based ordinal. The JS side (findAnchorOffset,
+// hooks/lib/transcript-utils.js) compares it directly against the 0-based
+// index of the user line in the transcript index.
 int64_t sigma_user_ordinal(const common_json & messages, size_t cut) {
     int64_t ord = 0;
     for (size_t i = 0; i < cut && i < messages.size(); ++i) {
@@ -1143,6 +1144,12 @@ void sigma_strip_drain(std::string session, size_t cut,
     // advance mid-drain moves the boundary's user message with it).
     std::string anchor_text;
     int64_t anchor_ord = -1;
+    // sum_gen captured in each pass's lock: the completion commit is valid
+    // only while the generation is unchanged — a prefix reset (or a 5a async
+    // fire) mid-pass bumps gen, and the stale Σ this pass fetched for the
+    // pre-reset prefix must not commit (the same K_sum value can recur when
+    // an identical transcript re-advances after a reset).
+    uint64_t gen = 0;
     for (int pass = 1; pass <= SIGMA_SUM_DRAIN_MAX_PASSES; ++pass) {
         if (pass > 1) {
             std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
@@ -1179,6 +1186,7 @@ void sigma_strip_drain(std::string session, size_t cut,
                 return;
             }
             cut = it->second.K_sum;                 // pick up the latest cut
+            gen = it->second.sum_gen;               // provenance of this pass
             block_vocab = it->second.block_vocab;   // P1-2: lock-free validate
             block_sum_budget = (double) it->second.block_sum_budget;
             // P0-4: the anchor moves with the boundary; P0-5: the progress
@@ -1251,12 +1259,17 @@ void sigma_strip_drain(std::string session, size_t cut,
         // P0-2 residual: if K_sum moved while this pass was in flight (a newer
         // partial commit; its spawn was rejected because we hold the flag), do
         // NOT stop — the next pass re-queries the new cut and keeps draining.
-        // Only while K_sum == cut do we commit the pending block and clear the
-        // flag, atomically in this same lock.
+        // Only while K_sum == cut AND sum_gen == gen (no reset / 5a fire since
+        // the pass started) do we commit the pending block and clear the flag,
+        // atomically in this same lock — a gen change means this pass's Σ was
+        // fetched for a prefix that no longer exists (a reset re-advancing to
+        // the same cut would otherwise commit the stale block).
         {
             std::lock_guard<std::mutex> lock(sigma_strip_mutex());
             auto it = sigma_strip_sessions().find(session);
-            if (it != sigma_strip_sessions().end() && it->second.K_sum == cut) {
+            if (it != sigma_strip_sessions().end()
+                    && it->second.K_sum == cut
+                    && it->second.sum_gen == gen) {
                 const size_t n_chars = block.size();
                 it->second.pending_block = std::move(block);
                 it->second.pending_cut = cut;
@@ -1266,10 +1279,11 @@ void sigma_strip_drain(std::string session, size_t cut,
                         session.c_str(), n_chars, pass, (long long) pass_ms, (long long) elapsed_ms);
                 return;
             }
-            // K_sum moved — a newer region was committed while this pass ran.
-            // Keep the flag; the next pass re-queries the new cut.
+            // K_sum moved or gen changed (reset / 5a fire) — a newer region was
+            // committed while this pass ran. Keep the flag; the next pass
+            // re-queries the new cut/gen.
         }
-        // fall through to the next pass (K_sum != cut)
+        // fall through to the next pass (K_sum != cut or gen changed)
     }
     SRV_WRN("sigma-strip: session=%s Σ drain pass cap (%d): block left partial\n",
             session.c_str(), SIGMA_SUM_DRAIN_MAX_PASSES);
@@ -1426,6 +1440,11 @@ sigma_strip_result sigma_strip_maybe_rewrite(
         int64_t off = 0;
         bool skip_first = false;   // futility guard: first skip of the current episode
         bool sum_advanced = false; // stage 2 committed a K_sum advance this request
+        // 5b diagnostic, computed inside [C] before apply swaps body["messages"]
+        // (the `messages` reference is re-pointed by the swap, so the original
+        // indices are only valid until then).
+        sigma_classify classify_diag;
+        bool have_classify_diag = false;
         // Releases sum_inflight on any scope exit (including the outer
         // catch's fail-open return) when this request still owns it.
         inflight_guard guard{session};
@@ -1982,6 +2001,16 @@ sigma_strip_result sigma_strip_maybe_rewrite(
             st.last_advanced = res.k_advanced;
             st.last_floor_limited = res.floor_limited;
 
+            // 5b) classify the ORIGINAL distribution before apply swaps
+            // body["messages"] — the `messages` reference above is re-pointed
+            // by the swap, so the original indices are only valid until then.
+            // O(n) arithmetic on precomputed tokens, no tokenization — cheap
+            // under lock.
+            if (res.k_advanced) {
+                classify_diag = classify_post_stage1(messages, orig, stubs,
+                        savings, K_stage1, K_cap, n, off, target_tokens);
+                have_classify_diag = true;
+            }
             // 5) apply in "on" mode
             if (applied) {
                 body["messages"] = rewritten;
@@ -2090,12 +2119,12 @@ sigma_strip_result sigma_strip_maybe_rewrite(
             }
         }
 
-        // 5b) step-1 diagnostic (no lock): at an advance, classify the
+        // 5b) step-1 diagnostic (no lock): at an advance, log the
         // post-stage-1 message composition (deletable vs. irreducible tokens)
         // so the stage-2 decision is grounded in the real distribution.
-        if (res.k_advanced) {
-            const sigma_classify c = classify_post_stage1(messages, orig, stubs,
-                    savings, K_stage1, K_cap, n, off, target_tokens);
+        // Computed inside [C], before apply swaps body["messages"].
+        if (have_classify_diag) {
+            const sigma_classify & c = classify_diag;
             SRV_INF("sigma-strip-classify: session=%s K=%zu n=%zu deletable=%lld (stubs=%zu/%lld asst=%zu/%lld toolres=%zu/%lld user=%zu/%lld) system=%lld protected=%zu/%lld fixed=%lld floor=%lld target=%lld stage2_reach=%d",
                     session.c_str(), K_stage1, n,
                     (long long) c.tok_deletable,
