@@ -1863,7 +1863,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_SIGMA_STRIP_KEEP_RECENT").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
         {"--sigma-strip-window-tokens"}, "N",
-        "sigma-strip: the client context-window size in tokens (the usage denominator); 0 = the feature stays inactive even in shadow/on mode (default: 0)",
+        "sigma-strip: the client context-window size in tokens (the usage denominator); 0 (default) = the -c context window (the feature stays inactive when -c is also unset)",
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("error: --sigma-strip-window-tokens must be >= 0 (got " + std::to_string(value) + ")");

@@ -1296,6 +1296,19 @@ void sigma_strip_drain(std::string session, size_t cut,
 
 } // namespace
 
+// Effective client window: the explicit --sigma-strip-window-tokens, else
+// the -c context window (a node serves one client window; the two are set
+// equal by convention). 0 = both unset -> the feature stays inactive.
+static int32_t sigma_strip_window(const common_params & params) {
+    if (params.sigma_strip_window_tokens > 0) {
+        return params.sigma_strip_window_tokens;
+    }
+    if (params.n_ctx > 0) {
+        return params.n_ctx;
+    }
+    return 0;
+}
+
 //
 // startup configuration validation
 //
@@ -1312,10 +1325,11 @@ std::string sigma_strip_config_check(const common_params & params) {
                     params.focus_memory_host.c_str(), params.sigma_sum_timeout_ms, SIGMA_SUM_RULE_FALLBACK_FAILS);
         }
     }
-    if (params.sigma_strip_mode == "off" || params.sigma_strip_window_tokens <= 0) {
+    const int32_t window_tokens = sigma_strip_window(params);
+    if (params.sigma_strip_mode == "off" || window_tokens <= 0) {
         return "";
     }
-    const double window = (double) params.sigma_strip_window_tokens;
+    const double window = (double) window_tokens;
     const double floor = std::max(params.sigma_strip_target * window,
                                   (double) params.sigma_strip_min_keep_tokens);
     const double margin = params.sigma_strip_threshold * window - floor;
@@ -1360,7 +1374,7 @@ sigma_strip_result sigma_strip_maybe_rewrite(
             std::chrono::steady_clock::now().time_since_epoch()).count();
 
     // gates: mode + window + parseable messages
-    if (params.sigma_strip_mode == "off" || params.sigma_strip_window_tokens <= 0) {
+    if (params.sigma_strip_mode == "off" || sigma_strip_window(params) <= 0) {
         return res;
     }
     if (!body.is_object() || !body.contains("messages") || !body.at("messages").is_array()) {
@@ -1412,7 +1426,7 @@ sigma_strip_result sigma_strip_maybe_rewrite(
         }
         res.tokens_before = tokens_before;
 
-        const double window = (double) params.sigma_strip_window_tokens;
+        const double window = (double) sigma_strip_window(params);
         const double target_tokens = params.sigma_strip_target * window;
         const double floor_tokens = std::max(target_tokens, (double) params.sigma_strip_min_keep_tokens);
         // stage 2 (Σ block): on unless --sigma-sum off. The block budget is
@@ -1454,7 +1468,7 @@ sigma_strip_result sigma_strip_maybe_rewrite(
             std::lock_guard<std::mutex> lock(sigma_strip_mutex());
             sigma_strip_session_state & st = sigma_strip_sessions()[session];
             st.last_request_ms = now_ms;  // idle-eviction stamp (24 h)
-            st.window = params.sigma_strip_window_tokens;
+            st.window = sigma_strip_window(params);
             st.block_vocab = vocab;               // P1-2: drain validates outside the lock
             st.block_sum_budget = sum_budget;
 

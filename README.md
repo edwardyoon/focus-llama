@@ -375,8 +375,8 @@ The machinery:
 
 - **The gate** - the server tokenizes the request's `messages` and measures
   *usage* = estimated tokens / `--sigma-strip-window-tokens` (the client's
-  context-window size). Below `--sigma-strip-threshold` the request passes
-  through byte-identical.
+  context-window size; defaults to the `-c` window when unset). Below
+  `--sigma-strip-threshold` the request passes through byte-identical.
 - **The K boundary** - once usage reaches the threshold, the session's K
   advances **in one big jump** (never backwards) until the stripped prompt
   reaches `max(--sigma-strip-target × window, --sigma-strip-min-keep-tokens)`.
@@ -408,17 +408,19 @@ place).
 | Flag | Meaning |
 |---|---|
 | `--sigma-strip off\|shadow\|on` | `shadow` computes and logs only; `on` rewrites the request |
-| `--sigma-strip-window-tokens N` | Client context window (usage denominator); must match the client |
+| `--sigma-strip-window-tokens N` | Client context window (usage denominator); must match the client (default: the `-c` window) |
 | `--sigma-strip-threshold F` | Usage fraction that triggers an advance (default 0.70) |
 | `--sigma-strip-target F` | Usage fraction an advance aims for (default 0.35) |
 | `--sigma-strip-min-keep-tokens N` | Token floor (effective goal = max(target x window, N); 0 = off) |
 | `--sigma-strip-keep-recent N` | Number of recent tool rounds kept verbatim (default 1) |
 
 `--sigma-strip-window-tokens` must match the client's context window
-size. Mismatches are not auto-corrected: the server logs a warning when a
-response reports more tokens than the configured window (client window
-larger) or after repeated prefix resets (client compacts below the server
-threshold, i.e. client window smaller).
+size. When omitted it defaults to the `-c` context window (the node serves
+one client window, so the two are set equal); the feature stays inactive
+only when both are unset. Mismatches are not auto-corrected: the server
+logs a warning when a response reports more tokens than the configured
+window (client window larger) or after repeated prefix resets (client
+compacts below the server threshold, i.e. client window smaller).
 
 **How it pairs with DA and kv-offload.** Σ-strip shrinks the *wire prompt*;
 `--da-auto` keeps *attention* over what remains cheap (the model's
@@ -460,7 +462,6 @@ llama-server \
   --focus-memory-host http://<store-host>:3900 \
   --focus-memory-token <CONTEXT_API_TOKEN> \
   --sigma-strip on \
-  --sigma-strip-window-tokens 230000 \
   --sigma-strip-threshold 0.73 \
   --sigma-strip-target 0.17 \
   --sigma-strip-min-keep-tokens 30960 \
@@ -481,7 +482,7 @@ Backend A vs B below.)
 
 | Option | What it does | Why it is on |
 |--------|--------------|--------------|
-| `-c 230000` | Logical context window (tokens) | Matches the client window (`--sigma-strip-window-tokens`); the physical buffer stays capped by `--kv-cache-size` |
+| `-c 230000` | Logical context window (tokens) | The client window - and the sigma-strip window default; the physical buffer stays capped by `--kv-cache-size` |
 | `--metrics` | Exposes Prometheus metrics on the server port | Observability for a long-running service |
 | `--da-auto` | **Auto-chunking**: when a rendered prompt has no client layout markers and is at least `--da-min-ctx` tokens, the server splits it into magic chunks by message boundaries so the model's `<focus magic_chunks="N">` tags can restrict attention over the whole conversation | Production path for **physical** KV read reduction - re-chunks system + history + tool I/O, not just an injected index |
 | `--kv-unified` | Enables backend B (reversible two-stream KV) | Required by `--da-auto`: the A path (`seq_rm`) is irreversible, a wrong focus permanently deletes the answer chunk |
@@ -502,7 +503,6 @@ Backend A vs B below.)
 | `--focus-memory-host` | Base URL of the focus-memory KV store (`PUT`/`GET` `/v1/kv-offload/chunk`) | Empty = kv-offload disabled even with `--fm-offload` on (fail-open) |
 | `--focus-memory-token` | Bearer token for the store API (`CONTEXT_API_TOKEN`) | Empty = no auth header; set it to match the store |
 | `--sigma-strip on` | **Σ-strip**: server-side prompt reduction - once the session's usage crosses `--sigma-strip-threshold`, the K boundary advances and the old compactable tool results in `messages[0..K)` are stubbed in place; the response reports the reduced `usage.prompt_tokens`, so the client's heavy auto-compaction never fires (see *Σ-strip* above) | Long-session continuity without lossy compaction; DA then keeps attention cheap over the reduced prompt. `shadow` verifies the machinery against a live session before `on` |
-| `--sigma-strip-window-tokens 230000` | The client's context-window size in tokens - the usage denominator (0 = the feature stays inactive) | Set to `-c`: the node serves one client window, and the threshold/target fractions are fractions of it |
 | `--sigma-strip-threshold 0.73` | Usage fraction at which the K boundary advances (default 0.70); one big jump per crossing, not per turn | The crossing point of the session: 0.73 × 230000 ≈ 167.9k, far above the drain floor (≈39.1k), so one drain lands deep below the threshold and the next crossing is far away |
 | `--sigma-strip-target 0.17` | Post-strip usage target (default 0.35): K advances until the stripped prompt reaches `max(target × window, --sigma-strip-min-keep-tokens)` | A deep drain: 0.17 × 230000 ≈ 39.1k lands **below the kv-offload threshold (57344)**, so a stripped session needs no KV eviction and the DA buffer sees a short prompt |
 | `--sigma-strip-min-keep-tokens 30960` | Token floor: K never advances the stripped prompt below this (effective goal = `max(target × window, N)`; 0 = off, default 0) | Safety floor if the target is ever lowered; in this configuration the target (≈39.1k) is above it, so the target binds |

@@ -525,6 +525,22 @@ int main() {
         CHECK(body.dump() == before);
     }
 
+    // --- window 0 + -c set: defaults to the n_ctx window --------------------
+    {
+        common_json body = make_body(make_messages(5, 2000));
+        const std::string before = body.dump();
+        common_params p = make_params("shadow", 0);
+        p.n_ctx = 3000;
+        const sigma_strip_result res =
+            sigma_strip_maybe_rewrite(nullptr, p, make_req("t-window-ctx"), body, true);
+        CHECK(res.eligible);
+        CHECK(res.k_advanced);
+        CHECK(res.K > 0);
+        CHECK(res.n_stripped >= 1);
+        CHECK(res.tokens_after < res.tokens_before);
+        CHECK(body.dump() == before);  // shadow: compute + log only
+    }
+
     // --- no session key (kv-offload-default): excluded, body untouched ------
     {
         common_json body = make_body(make_messages(5, 2000));

@@ -718,8 +718,9 @@ struct common_params {
     // Protection floor: the last N assistant tool rounds (tool_calls + their
     // results) are kept verbatim - K never crosses their start.
     int32_t     sigma_strip_keep_recent      = 1;
-    // Client context-window size in tokens (the usage denominator). 0 = no
-    // denominator, the feature stays inactive even in shadow/on mode.
+    // Client context-window size in tokens (the usage denominator). 0
+    // (default) = the -c context window; the feature stays inactive when
+    // -c is also unset.
     int32_t     sigma_strip_window_tokens  = 0;
     // Futility guard (plans/appendix.md spec #2): suppress an advance whose
     // expected token savings are below this fraction of the window (0 = off,
