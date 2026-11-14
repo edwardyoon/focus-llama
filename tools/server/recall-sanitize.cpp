@@ -41,6 +41,7 @@ const std::unordered_set<std::string> & recall_tag_names(const llama_vocab * voc
         names = [vocab]() {
             std::unordered_set<std::string> s = {
                 "tool_call", "tool_response", "tools", "function", "parameter",  "functions",
+                "antml:function", "antml:invoke", "antml:parameter", "antml:function_calls",
                 "think", "thinking", "invoke",
                 "function_calls", "function_results", "tool_use", "tool_result",
                 "focus", "local", "global", "recap", "recall",
