@@ -103,8 +103,7 @@ int main(int argc, char ** argv) {
     params.cpuparams_batch.n_threads = params.speculative.draft.cpuparams_batch.n_threads;
     params.tensor_buft_overrides     = params.speculative.draft.tensor_buft_overrides;
 
-    // the MoE cache is only used by the target context
-    params.moe_cache_size = 0;
+    // moe_cache_size (upstream) dropped: the fork's common_params has no MoE cache support
 
     auto llama_init_dft = common_init_from_params(params);
 
