@@ -8,6 +8,24 @@
 #include <regex>             // std::regex, std::sregex_iterator
 #include <utility>           // std::move
 
+// Diagnostic helper (2026-11-15, evict-boundary log only): the first n bytes of
+// s starting at pos, sanitized for a single-line log. '\n'/'\r' become spaces,
+// other control chars (< 0x20) become '?'. Trailing UTF-8 continuation bytes
+// (0x80..0xBF) are dropped so a multi-byte sequence is never cut mid-character.
+// Empty if pos >= s.size().
+static std::string kv_dbg_head(const std::string & s, size_t pos, size_t n = 40) {
+    if (pos >= s.size()) return "";
+    std::string out = s.substr(pos, n);
+    while (!out.empty() && (unsigned char) out.back() >= 0x80 && (unsigned char) out.back() <= 0xBF) {
+        out.pop_back();
+    }
+    for (char & c : out) {
+        if (c == '\n' || c == '\r') c = ' ';
+        else if ((unsigned char) c < 0x20) c = '?';
+    }
+    return out;
+}
+
 // FNV-1a 64-bit of the segment text -> 16 hex chars (stable content key).
 std::string kv_offload_hash16(const std::string & s) {
     uint64_t h = 1469598103934665603ULL;
@@ -276,6 +294,24 @@ bool kv_offload_evict(
         remaining -= n_tok(text.substr(lo, hi - lo));
     }
     if (evict_idx.empty()) return false;
+
+    // Diagnostic (2026-11-15): where does the evict boundary land relative to
+    // the current user message — i.e. is the threshold symptom caused by the
+    // boundary cutting into the current turn? One line per request. The only
+    // new tokenize call is tail_tokens; every other value reuses what the
+    // eviction loop already computed.
+    {
+        const size_t last_evicted = evict_idx.back();
+        const std::string head_evicted = kv_dbg_head(text, msgs[last_evicted].role_end);
+        const int32_t tail_tokens = n_tok(text.substr(msg_range(last_evicted).second));
+        const std::string head_last_user = kv_dbg_head(text, msgs[last_user].role_end);
+        const int tool_resp = (text.compare(msgs[last_user].role_end, 15, "<tool_response>") == 0) ? 1 : 0;
+        SRV_INF("kv_offload: evict boundary - n_evict=%zu n_msgs=%zu first_user=%zu evict_start=%zu last_evicted=%zu(role=%s head='%s' tail_tokens=%d) last_user=%zu(head='%s' tool_resp=%d) gap_msgs=%zu remaining=%d threshold=%d retain=%d total=%d\n",
+                evict_idx.size(), msgs.size(), first_user, evict_start, last_evicted,
+                msgs[last_evicted].role.c_str(), head_evicted.c_str(), (int) tail_tokens,
+                last_user, head_last_user.c_str(), tool_resp,
+                last_user - last_evicted, remaining, threshold, retain, total_tokens);
+    }
 
     for (size_t i : evict_idx) {
         auto [lo, hi] = msg_range(i);
