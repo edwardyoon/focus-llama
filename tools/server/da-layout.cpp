@@ -712,11 +712,16 @@ da_auto_layout da_auto_chunk(const llama_vocab * vocab, const std::string & text
         return out;
     }
 
+    // The [Magic Chunk N] header line, shared by the insertion loop and the
+    // header_pos_mod computation at the end so the two can never drift apart.
+    auto chunk_header = [](int32_t num) -> std::string {
+        return "[Magic Chunk " + std::to_string(num) + "]\n";
+    };
     std::sort(ins.begin(), ins.end(), [](const auto & a, const auto & b) { return a.first > b.first; });
     std::string modified = text;
     size_t total_header_len = 0;
     for (auto & [pos, num] : ins) {
-        const std::string header = "[Magic Chunk " + std::to_string(num) + "]\n";
+        const std::string header = chunk_header(num);
         modified.insert(pos, header);  // descending order: pos is unshifted
         total_header_len += header.size();
     }
@@ -887,11 +892,23 @@ da_auto_layout da_auto_chunk(const llama_vocab * vocab, const std::string & text
     // all header insertions sit before the last user message, so its start
     // shifts by the total header length
     out.modified   = std::move(modified);
+    // header_pos keeps the original-text positions (before header insertion);
+    // header_pos_mod is the same set in the modified-text space (after all
+    // header insertions) - the space the caller's char->token mapping runs in.
     out.header_pos.resize(ins.size());
     for (size_t i = 0; i < ins.size(); i++) {
         // ins is descending; the i-th header (ascending chunk order) is at
-        // ins[ins.size() - 1 - i].first, which is its final position
+        // ins[ins.size() - 1 - i].first (its original-text position)
         out.header_pos[i] = ins[ins.size() - 1 - i].first;
+    }
+    out.header_pos_mod.resize(ins.size());
+    {
+        size_t acc = 0;
+        for (size_t i = 0; i < ins.size(); i++) {
+            const auto & e = ins[ins.size() - 1 - i];  // i-th header, ascending
+            out.header_pos_mod[i] = e.first + acc;     // shifted by all earlier headers
+            acc += chunk_header(e.second).size();
+        }
     }
     out.tail_pos = msgs[last_user].start + total_header_len;
     out.ok       = true;

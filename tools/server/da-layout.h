@@ -33,7 +33,8 @@
 struct da_auto_layout {
     bool ok = false;
     std::string modified;              // prompt with [Magic Chunk N] headers + DA instruction (+ Σ anchor) inserted
-    std::vector<size_t> header_pos;    // final char offset of each [Magic Chunk N] header (ascending chunk order)
+    std::vector<size_t> header_pos;    // original-text position (before header insertion) of each [Magic Chunk N] header (ascending chunk order)
+    std::vector<size_t> header_pos_mod;  // modified-text coordinates of each [Magic Chunk N] header (ascending chunk order)
     size_t tail_pos = 0;               // start of the last user message after header insertion
     std::pair<size_t, size_t> filler = { 0, 0 };  // char range of the DA instruction (removed in FOCUS mode)
     std::pair<size_t, size_t> sigma  = { 0, 0 };  // char range of the Σ anchor (kept in FOCUS mode)
