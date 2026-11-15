@@ -7327,7 +7327,9 @@ static bool kv_offload_refill(llama_context * ctx, server_slot & slot, const std
     for (size_t u = 0; u < units.size(); u++) {
         const auto & toks = units[u].toks;
         n_raw += (int32_t) toks.size();
-        const std::string detok = common_detokenize(ctx, toks);
+        // explicit special=true: sanitize needs the control tags rendered as
+        // text to replace them (do not rely on the declaration default)
+        const std::string detok = common_detokenize(ctx, toks, true);
         const std::string raw_text = sanitize_recalled_text(detok, recall_tag_names(vocab));
         unit_diag.push_back({ detok, raw_text });
         if (toks.empty()) continue;

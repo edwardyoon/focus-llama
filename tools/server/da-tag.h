@@ -71,9 +71,11 @@ da_tag_t scan_da_tag(const std::string & text, size_t from, da_mode_t mode);
 
 // True while the candidate fragment (a suffix of the generated text
 // starting at a tag-start '<') could still grow into a complete DA tag:
-// a proper prefix of a fixed tag, or the <focus magic_chunks="N"> head
-// plus a number list (digit runs, comma-separated) that is not closed
-// yet. A complete tag returns false (apply_da_tag() has consumed it).
+// a proper prefix of a fixed tag, or an in-progress <focus magic_chunks=...>
+// tag per the shared lenient grammar in da-tag.cpp (single quotes, extra
+// whitespace, no quotes - the consume side and the hold side share one
+// parser so they cannot diverge). A complete tag returns false
+// (apply_da_tag() has consumed it).
 bool da_tag_prefix(const std::string & s);
 
 // Number of trailing characters of `unsent` that process_token() must

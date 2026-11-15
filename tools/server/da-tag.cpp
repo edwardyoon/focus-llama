@@ -8,6 +8,93 @@ bool da_tag_start_allowed(const std::string & text, size_t lt, da_mode_t mode) {
     return (unsigned char) text[lt - 1] == '\n';
 }
 
+namespace {
+// The single <focus magic_chunks=...> grammar, shared by scan_da_tag() and
+// da_tag_prefix() so the consume side and the hold side can never diverge on
+// what counts as a focus tag (the 0602ad47c sync rule). The model is
+// instructed to emit the canonical <focus magic_chunks="N"> form, but it
+// occasionally imitates variants - single quotes, extra whitespace (even a
+// newline) in the head, no quotes at all. Every variant the scanner accepts
+// must be held by the prefix while it is being emitted, or the tag text
+// leaks to the client before the tag is consumed. Hence the lenient grammar:
+//   <focus W* magic_chunks W* = W* Q? N (, W* N)* Q? W* >
+//   W = any isspace char, Q = " or ' (a matching pair, optional),
+//   N = a run of digits (the tag may keep several chunks: "12,13").
+// A comma opens the next run, which may still be empty - the hold must not
+// release at the comma (09-25 19:29, task 5952).
+enum focus_parse_t { FOCUS_TAG_NONE, FOCUS_TAG_OPEN, FOCUS_TAG_DONE };
+
+focus_parse_t parse_focus_tag(const std::string & s, size_t from,
+                              std::vector<int32_t> & nums, size_t & end) {
+    static const char head[] = "<focus";
+    static const char attr[] = "magic_chunks";
+    const size_t n = s.size();
+    size_t i = from;
+    // <focus - a shorter suffix at end-of-string is a live prefix
+    if (n - i < 6) {
+        if (s.compare(i, n - i, head, n - i) != 0) return FOCUS_TAG_NONE;
+        return FOCUS_TAG_OPEN;
+    }
+    if (s.compare(i, 6, head) != 0) return FOCUS_TAG_NONE;
+    i += 6;
+    // a longer tag name (<focusx ...) is data, not a focus tag
+    if (i < n && (std::isalnum((unsigned char) s[i]) || s[i] == '_' || s[i] == '-' || s[i] == '.')) {
+        return FOCUS_TAG_NONE;
+    }
+    while (i < n && std::isspace((unsigned char) s[i])) i++;
+    // magic_chunks - a partial name at end-of-string is still open
+    if (n - i < 12) {
+        if (s.compare(i, n - i, attr, n - i) != 0) return FOCUS_TAG_NONE;
+        return FOCUS_TAG_OPEN;
+    }
+    if (s.compare(i, 12, attr) != 0) return FOCUS_TAG_NONE;
+    i += 12;
+    while (i < n && std::isspace((unsigned char) s[i])) i++;
+    if (i == n) return FOCUS_TAG_OPEN;
+    if (s[i] != '=') return FOCUS_TAG_NONE;
+    i++;
+    while (i < n && std::isspace((unsigned char) s[i])) i++;
+    if (i == n) return FOCUS_TAG_OPEN;
+    char quote = 0;
+    if (s[i] == '"' || s[i] == '\'') {
+        quote = s[i];
+        i++;
+    }
+    if (i == n) return FOCUS_TAG_OPEN;
+    bool closed  = false;
+    bool has_num = false;
+    while (i < n) {
+        unsigned char c = (unsigned char) s[i];
+        if (std::isdigit(c)) {
+            int32_t v = 0;
+            do {
+                v = v * 10 + (c - '0');
+                i++;
+                c = (i < n) ? (unsigned char) s[i] : 0;
+            } while (std::isdigit(c));
+            nums.push_back(v);
+            has_num = true;
+            continue;
+        }
+        if (c == ',' || std::isspace(c)) {
+            i++;
+            continue;
+        }
+        if (quote != 0 && !closed && c == (unsigned char) quote) {
+            closed = true;
+            i++;
+            continue;
+        }
+        if (c == '>' && has_num) {
+            end = i + 1;
+            return FOCUS_TAG_DONE;
+        }
+        return FOCUS_TAG_NONE;
+    }
+    return FOCUS_TAG_OPEN;
+}
+}  // namespace
+
 da_tag_t scan_da_tag(const std::string & text, size_t from, da_mode_t mode) {
     da_tag_t best;
     for (size_t lt = text.find('<', from); lt != std::string::npos; lt = text.find('<', lt + 1)) {
@@ -32,29 +119,12 @@ da_tag_t scan_da_tag(const std::string & text, size_t from, da_mode_t mode) {
             cand.type = 1;
             cand.end  = lt + 7;
         } else if (text.compare(lt, 6, "<focus") == 0) {
-            const size_t close = text.find('>', lt + 6);
-            if (close != std::string::npos) {
-                const std::string tag = text.substr(lt, close - lt + 1);
-                const size_t q0 = tag.find("magic_chunks");
-                if (q0 != std::string::npos) {
-                    // every number run after the attribute name - the
-                    // tag may keep several chunks (magic_chunks="1,3")
-                    for (size_t q = q0 + 14; q < tag.size(); q++) {
-                        if (std::isdigit((unsigned char) tag[q])) {
-                            int32_t v = 0;
-                            do {
-                                v = v * 10 + (tag[q] - '0');
-                                q++;
-                            } while (q < tag.size() && std::isdigit((unsigned char) tag[q]));
-                            q--;  // the loop increment steps past the run
-                            cand.keep_nums.push_back(v);
-                        }
-                    }
-                    if (!cand.keep_nums.empty()) {
-                        cand.type = 0;
-                        cand.end  = close + 1;
-                    }
-                }
+            std::vector<int32_t> nums;
+            size_t end = 0;
+            if (parse_focus_tag(text, lt, nums, end) == FOCUS_TAG_DONE) {
+                cand.type      = 0;
+                cand.end       = end;
+                cand.keep_nums = std::move(nums);
             }
         }
         if (cand.type >= 0 && (best.type < 0 || cand.end < best.end)) {
@@ -72,43 +142,9 @@ bool da_tag_prefix(const std::string & s) {
             return true;
         }
     }
-    static const char head[] = "<focus magic_chunks=";
-    const size_t hl = sizeof(head) - 1;
-    if (s.size() < hl && s.compare(0, s.size(), head, s.size()) == 0) {
-        return true;
-    }
-    if (s.size() >= hl && s.compare(0, hl, head) == 0) {
-        size_t i = hl;
-        if (i < s.size() && s[i] == '"') {
-            i++;
-        }
-        if (i == s.size()) {
-            return true;  // attribute name done, waiting for the number
-        }
-        // Number list: digit runs separated by commas, mirroring the
-        // grammar scan_da_tag() parses (magic_chunks="12,13" keeps
-        // several chunks). A comma opens the next run, which may still
-        // be empty; a closing quote is only valid once a run has
-        // arrived, and only the final '>' may follow it. 09-25 19:29
-        // (task 5952): the old single-run check released the hold at
-        // the comma, streaming the tag head to the client before the
-        // complete tag could be erased at the closing token.
-        bool in_list = false;  // a digit or comma has arrived
-        for (; i < s.size(); i++) {
-            const unsigned char c = (unsigned char) s[i];
-            if (std::isdigit(c) || c == ',') {
-                in_list = true;
-                continue;  // inside the (possibly multi-run) list
-            }
-            if (c == '"' && in_list) {
-                // closing quote - only the final '>' may follow
-                return i + 1 == s.size();
-            }
-            return false;  // a '>' (complete) or any other character
-        }
-        return true;  // number list open, the tag may still close
-    }
-    return false;
+    std::vector<int32_t> nums;
+    size_t end = 0;
+    return parse_focus_tag(s, 0, nums, end) == FOCUS_TAG_OPEN;
 }
 
 size_t da_tag_hold_len(const std::string & unsent, da_mode_t mode) {
