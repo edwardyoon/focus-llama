@@ -17,6 +17,7 @@
 using json = common_json;
 
 static void test_template(testing & t, const std::string & name, const std::string & tmpl, const json & vars, const std::string & expect);
+static void test_template_error(testing & t, const std::string & name, const std::string & tmpl, const std::string & expect);
 
 static void test_whitespace_control(testing & t);
 static void test_conditionals(testing & t);
@@ -2690,6 +2691,22 @@ static void test_string_parts(testing & t) {
         }
     });
 
+}
+
+static void test_template_error(testing & t, const std::string & name, const std::string & tmpl, const std::string & expect) {
+    t.test(name, [&tmpl, &expect](testing & t) {
+        std::string error;
+        try {
+            jinja::lexer lexer;
+            jinja::program ast = jinja::parse_from_tokens(lexer.tokenize(tmpl));
+            jinja::context ctx(tmpl);
+            jinja::runtime runtime(ctx);
+            runtime.gather_string_parts(runtime.execute(ast));
+        } catch (const std::exception & e) {
+            error = e.what();
+        }
+        t.assert_true("expected error: " + expect + ", got: " + error, error.find(expect) != std::string::npos);
+    });
 }
 
 static void test_template_cpp(testing & t, const std::string & name, const std::string & tmpl, const json & vars, const std::string & expect) {
