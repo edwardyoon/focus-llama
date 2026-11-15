@@ -102,7 +102,7 @@ struct server_slot;
 // recall, sample the closing token's row, keep the slot and its cache). Flipped
 // to false once the decode loop starts (the buffer is overwritten; a failure
 // then must abort the slot).
-static bool kv_offload_refill(llama_context * ctx, server_slot & slot, const llama_tokens & toks, int32_t * out_last_idx = nullptr,
+static bool kv_offload_refill(llama_context * ctx, server_slot & slot, const std::vector<std::vector<llama_token>> & units, int32_t * out_last_idx = nullptr,
                               const std::function<bool()> & on_retry_idle = nullptr, bool * out_safe_failopen = nullptr);
 
 static common_speculative_output_limits server_output_limits(const common_params & params) {
@@ -450,7 +450,20 @@ struct server_slot {
     // after the closing token is committed - and the next token is sampled
     // from the refill's last logits so the model continues after the
     // recalled content. Request-scoped (cleared in reset()).
-    std::vector<llama_token> da_pending_refill;
+    // One element per recalled unit (item 6): get-on-focus pushes one unit per
+    // offloaded chunk, the holed-chunk path one unit per evicted overlap.
+    // kv_offload_refill wraps EACH unit individually so the units stay
+    // separated in the KV (a flat concat fused them with no boundary).
+    std::vector<std::vector<llama_token>> da_pending_refill;
+    // item 6: per-request recall dedup (cleared in reset()). da_recalled_ranges
+    // = prompt token ranges [lo,hi) already recalled via the holed-chunk path;
+    // da_recalled_chunk_ids = offloaded chunk numbers already recalled via
+    // get-on-focus. The model can re-focus the same chunk across multiple
+    // <focus> tags in one request - without this the content lands in the KV
+    // twice. Checked AND recorded at queue time (apply_da_tag); a recall later
+    // dropped by the free-cell gate is not re-offered (rare, accepted).
+    std::vector<std::pair<int32_t, int32_t>> da_recalled_ranges;
+    std::vector<int32_t> da_recalled_chunk_ids;
     // batch index (within the refill's final sub-batch) of the last
     // refilled token's logits row; the next sample is taken from it
     // (-1 = none this step). Request-scoped.
@@ -701,6 +714,8 @@ struct server_slot {
         da_tag_scan_pos  = 0;
         da_skip_draft    = false;
         da_pending_refill.clear();
+        da_recalled_ranges.clear();
+        da_recalled_chunk_ids.clear();
         da_refill_out_idx = -1;
         da_trace_left     = 0;
         da_applied       = false;
@@ -987,7 +1002,7 @@ struct server_slot {
 
             SLT_INF(*this, "stop processing: n_tokens = %d, truncated = %d\n", prompt.n_tokens(), truncated);
 
-            da_trace("slot=%d task=%d L7 release stop=%d prompt=%d holes=%zu holes_active=%d da_seq=%d da_applied=%d mode=%d poisoned=%d pending_refill=%zu\n",
+            da_trace("slot=%d task=%d L7 release stop=%d prompt=%d holes=%zu holes_active=%d da_seq=%d da_applied=%d mode=%d poisoned=%d pending_refill_units=%zu\n",
                      (int) id, (int) (task ? task->id : -1), (int) stop, (int) prompt.n_tokens(),
                      kv_hole_ranges.size(), (int) kv_holes_active, (int) da_seq, (int) da_applied, (int) da_mode, (int) refill_poisoned,
                      da_pending_refill.size());
@@ -2895,19 +2910,28 @@ private:
             int64_t holes_cut = 0;
             for (const auto & r : slot.kv_hole_ranges) holes_cut += (int64_t) (r.second - r.first);
             const int32_t n_free = llama_memory_n_free_cells(llama_get_memory(ctx_tgt));
-            const bool ctx_full = (int64_t) slot.prompt.n_tokens() + (int64_t) slot.stats.n_gen + 1 >= slot.n_ctx;
+            // slot.prompt.n_tokens() already includes the generated tokens
+            // (handle_last_sampled_token pushes each decoded token into
+            // slot.prompt before the next decode), so n_gen must NOT be added
+            // again here - doing so halved the effective generation budget.
+            const bool ctx_full = (int64_t) slot.prompt.n_tokens() + 1 >= slot.n_ctx;
             const bool buf_full = params_base.kv_cache_size > 0 && n_free >= 0 && n_free < 2048;
             // Fallback estimate (n_free unavailable): the ledger-based resident
             // projection. In holes mode (Option B) the evicted text stays in the
             // prompt while its KV cells are cut (kv_hole_ranges ledger), so the
             // prompt length overstates the resident by the cut span (2026-10-07:
             // prompt 59358 / resident 46865, 12055 cells free).
+            // The main path (prompt.n_tokens()) already carries the generated
+            // tokens, but kv_hole_peak_resident is a PREFILL snapshot (set at the
+            // n_past check, before any decode) and has none - so n_gen is added
+            // only in that branch. Unconditionally dropping it would make est_full
+            // never fire there -> hard decode failure instead of a graceful stop.
             int64_t resident_base = (int64_t) slot.prompt.n_tokens() - holes_cut;
             if (holes_cut == 0 && slot.kv_holes_active && slot.kv_hole_peak_resident > 0) {
-                resident_base = slot.kv_hole_peak_resident;
+                resident_base = (int64_t) slot.kv_hole_peak_resident + (int64_t) slot.stats.n_gen;
             }
             const bool est_full = n_free < 0 &&
-                resident_base + (int64_t) slot.stats.n_gen + 1 >= ctx_limit;
+                resident_base + 1 >= ctx_limit;
             if (!params_base.ctx_shift && (ctx_full || buf_full || est_full)) {
                 slot.truncated      = true;
                 slot.stop           = STOP_TYPE_LIMIT;
@@ -3208,6 +3232,13 @@ private:
                 //SLT_INF(slot, "da_trace: final n_gen=%d stop=%d unbalanced=%d tail='%s'\n",
                 //        (int) slot.stats.n_gen, (int) slot.stop, (int) unbalanced, dbg_esc(g.substr(E > 300 ? E - 300 : 0), 320).c_str());
                 if (unbalanced) SLT_WRN_DBG(slot, "%s", "da_trace: DERAIL-SUSPECT (tool-call tags unbalanced)\n");
+                // T1-e: request-end stop state. A closing-only / truncated
+                // derail shows up here as a non-EOS stop with a large n_gen, or
+                // as n_free cells that should have been evicted but were not.
+                SRV_INF("kv_offload req-end: slot=%d task=%d stop=%d n_gen=%d n_free=%d unbalanced=%d (closing-only derail => stop!=EOS or n_gen huge with unbalanced=1)\n",
+                        (int) slot.id, (int) slot.task->id,
+                        (int) slot.stop, (int) slot.stats.n_gen,
+                        (int) llama_memory_n_free_cells(llama_get_memory(ctx_tgt)), (int) unbalanced);
             }
 
 #if 0  // disabled: re-logged the entire (17K+ char) generation on every DA request,
@@ -6827,30 +6858,30 @@ private:
             int32_t n_full   = (int32_t) slot.prompt.n_tokens();
             const bool    in_focus = slot.da_mode == DA_MODE_FOCUS;
             const bool    in_local = slot.da_mode == DA_MODE_LOCAL;
-            // Tool-call / parameter state at tag close, computed on the
-            // pre-erase generated_text (the tag is still in it here). When a
-            // tool-call or parameter is still open at tag close, a recall
-            // re-prefilled here would land INSIDE it (the opening tag is in
-            // the prompt, only the closing tail would be generated). The
-            // in-tool gate below (and the B2 gate in case 0) use these.
-            // Tag names are assembled from parts: literal tags do not
-            // survive editors / uploads.
-            const std::string tc_open  = std::string("<")  + "tool_call>";
-            const std::string tc_close = std::string("</") + "tool_call>";
-            const std::string pr_open  = std::string("<")  + "parameter=";
-            const std::string pr_close = std::string("</") + "parameter>";
-            const std::string & g_txt = slot.generated.text;
-            const int in_tool  = dbg_count(g_txt, tc_open,  tag.start) > dbg_count(g_txt, tc_close, tag.start) ? 1 : 0;
-            const int in_param = dbg_count(g_txt, pr_open,  tag.start) > dbg_count(g_txt, pr_close, tag.start) ? 1 : 0;
+            // item 4 (B2 gate): set in the L1 block below. When a tool-call or
+            // parameter is still open at tag close, a recall re-prefilled here
+            // would land INSIDE it (the opening tag is in the prompt, only the
+            // closing tail would be generated). case 0 drops the recall (no
+            // enqueue) when either is set.
+            int in_tool = 0, in_param = 0;
 
             // L1: tag-closed snapshot - the state the refill decision runs
             // on. B1 check: prompt_tokens == seq_pos_max + 1 means the
             // sampled closing token is not in the KV yet (it commits in the
             // next handle_last_sampled_token). in_tool = 1 means the tag
-            // fired mid tool call (B2). in_tool/in_param are computed above
-            // on the pre-erase generated_text (g_txt).
+            // fired mid tool call (B2).
             {
+                // tag names are assembled from parts: literal tags do not
+                // survive editors / uploads
+                const std::string tc_open  = std::string("<")  + "tool_call>";
+                const std::string tc_close = std::string("</") + "tool_call>";
+                const std::string pr_open  = std::string("<")  + "parameter=";
+                const std::string pr_close = std::string("</") + "parameter>";
+
+                const std::string & g = slot.generated.text;
                 const size_t b0 = tag.start > 240 ? tag.start - 240 : 0;
+                in_tool  = dbg_count(g, tc_open,  tag.start) > dbg_count(g, tc_close, tag.start) ? 1 : 0;
+                in_param = dbg_count(g, pr_open,  tag.start) > dbg_count(g, pr_close, tag.start) ? 1 : 0;
 
                 da_trace("slot=%d task=%d L1 tag closed type=%d nums=%zu n_gen=%d mode=%d seq=%d prompt_tokens=%d seq_pos_max=%d sampled=%d spec_draft=%zu in_tool=%d in_param=%d before='%s' tag='%s'\n",
                          (int) slot.id, (int) slot.task->id,
@@ -6859,8 +6890,8 @@ private:
                          (int) llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.kv_seq()),
                          (int) slot.sampled, slot.spec_draft.size(),
                          in_tool, in_param,
-                         dbg_esc(g_txt.substr(b0, tag.start - b0), 260).c_str(),
-                         dbg_esc(g_txt.substr(tag.start, tag.end - tag.start)).c_str());
+                         dbg_esc(g.substr(b0, tag.start - b0), 260).c_str(),
+                         dbg_esc(g.substr(tag.start, tag.end - tag.start)).c_str());
                 // T1-f: a DA control tag that closes while a tool-call/parameter
                 // is still open means the pending recall would re-prefill inside
                 // an open tool-call (a derail risk). The L1 da_trace above already
@@ -6960,6 +6991,11 @@ private:
                     const auto & offloaded = slot.task->params.da_offloaded;
                     std::vector<size_t> keep_idx;
                     bool did_refill = false;
+                    // item 4 (B2 gate): a recall must not re-prefill inside an
+                    // open tool-call/parameter (the opening tag would sit in the
+                    // prompt, only the closing tail in the generation). Both
+                    // case-0 recall paths below drop (no enqueue) when set.
+                    const bool block_recall = in_tool || in_param;
                     for (int32_t n : tag.keep_nums) {
                         // kv-offload (get-on-focus): n points to an evicted (offloaded)
                         // chunk (number >= base + n_chunks). Fetch its text from the
@@ -6973,6 +7009,21 @@ private:
                             // output stays vanilla (mirrors the da_rm/da_b guards).
                             if (slot.da_measure_only) {
                                 SLT_INF(slot, "kv_offload: get-on-focus chunk %d SKIPPED (measure-only) - no store GET / KV refill; output stays vanilla\n", n);
+                                continue;
+                            }
+                            // item 4 (B2 gate): a tool-call/parameter is open at tag
+                            // close - a recall re-prefilled here would land inside it
+                            // (opening tag in the prompt, closing only generated).
+                            // Drop the recall (no enqueue).
+                            if (block_recall) {
+                                SLT_WRN(slot, "kv_offload: get-on-focus chunk %d DROPPED (B2 gate: open tool-call in_tool=%d in_param=%d) - recall would re-prefill inside an open tool-call\n",
+                                        n, in_tool, in_param);
+                                continue;
+                            }
+                            // item 6: the same offloaded chunk is not re-recalled within
+                            // a request (it would land in the KV twice).
+                            if (std::find(slot.da_recalled_chunk_ids.begin(), slot.da_recalled_chunk_ids.end(), n) != slot.da_recalled_chunk_ids.end()) {
+                                SLT_WRN_DBG(slot, "kv_offload: get-on-focus chunk %d already recalled this request - skipping (dedup)\n", n);
                                 continue;
                             }
                             bool found = false;
@@ -7006,9 +7057,14 @@ private:
                                     // the model's own tag. post_decode() applies the
                                     // queue after the commit and samples the next token
                                     // from the refill's last logits row.
-                                    slot.da_pending_refill.insert(slot.da_pending_refill.end(),
-                                                                  toks.begin(), toks.end());
-                                    did_refill = true;
+                                    // item 6: one unit per chunk (wrapped individually
+                                    // in kv_offload_refill), recorded for per-request
+                                    // dedup so a re-focus does not land it twice.
+                                    if (!toks.empty()) {
+                                        slot.da_pending_refill.push_back(toks);
+                                        slot.da_recalled_chunk_ids.push_back(n);
+                                        did_refill = true;
+                                    }
                                 } else {
                                     SLT_WRN(slot, "kv_offload: GET failed for offloaded chunk %d - fail-open\n", n);
                                 }
@@ -7038,7 +7094,14 @@ private:
                     // refilled tail onto da_seq, exactly like the Option C get-on-focus path.
                     // Fail-open. measure-only (Phase 0) skips the re-prefill so the KV is
                     // not mutated and the output stays vanilla (mirrors the da_rm/da_b guards).
-                    if (slot.kv_holes_active && !keep_idx.empty() && !slot.da_measure_only) {
+                    if (slot.kv_holes_active && !keep_idx.empty() && !slot.da_measure_only && block_recall) {
+                        // item 4 (B2 gate): a tool-call/parameter is open at tag close -
+                        // a holed-chunk recall re-prefilled here would land inside it
+                        // (opening tag in the prompt, closing only generated). Drop the
+                        // recall (no enqueue).
+                        SLT_WRN(slot, "kv_offload: holed-chunk recall DROPPED (B2 gate: open tool-call in_tool=%d in_param=%d) - recall would re-prefill inside an open tool-call\n",
+                                in_tool, in_param);
+                    } else if (slot.kv_holes_active && !keep_idx.empty() && !slot.da_measure_only) {
                         SLT_INF(slot, "kv_offload: checking %zu keep chunk(s) against %zu hole range(s)\n",
                             keep_idx.size(), slot.kv_hole_ranges.size());
                         const int32_t n_prompt = (int32_t) slot.prompt.tokens.size();
@@ -7078,13 +7141,28 @@ private:
                                 for (int32_t p = olo; p < ohi; ++p) {
                                     toks.push_back(slot.prompt.tokens[p]);
                                 }
+                                // item 6: this prompt range is not re-recalled within a
+                                // request (it would land in the KV twice).
+                                bool range_dup = false;
+                                for (const auto & rr : slot.da_recalled_ranges) {
+                                    if (olo < rr.second && rr.first < ohi) { range_dup = true; break; }
+                                }
+                                if (range_dup) {
+                                    SLT_WRN_DBG(slot, "kv_offload: holed chunk %zu overlap [%d,%d) already recalled this request - skipping (dedup)\n",
+                                            n, olo, ohi);
+                                    continue;
+                                }
+                                if (toks.empty()) continue;
                                 SLT_INF(slot, "kv_offload: focus on holed chunk %zu - re-prefilling %d token(s) at [%d,%d)\n",
                                         n, (int) toks.size(), olo, ohi);
                                 // B1: queue (see the get-on-focus path above) -
                                 // post_decode() decodes it after the closing
                                 // token is committed.
-                                slot.da_pending_refill.insert(slot.da_pending_refill.end(),
-                                                              toks.begin(), toks.end());
+                                // item 6: one unit per evicted overlap (wrapped
+                                // individually in kv_offload_refill), recorded for
+                                // per-request dedup.
+                                slot.da_pending_refill.push_back(toks);
+                                slot.da_recalled_ranges.push_back({ olo, ohi });
                                 did_refill = true;
                             }
                         }
@@ -7771,8 +7849,12 @@ private:
             // behavior: the spec check in the first iterate returns before the
             // refill, so a spec slot's refill was silently dropped). Skipping
             // it here also avoids a double sample - the slot already sampled in
-            // the spec iterate above.
+            // the spec iterate above. The control tag WAS consumed though - the
+            // model asked for the chunk and never gets it, so treat the drop as
+            // an explicit fail-open (logged) instead of a silent clear.
             if (slot.can_speculate() && !slot.spec_draft.empty()) {
+                SLT_WRN(slot, "kv_offload: spec slot has %zu queued recall unit(s) but speculative decoding is active - dropping the recall (the tag was consumed, the content is NOT re-prefilled; explicit fail-open)\n",
+                        slot.da_pending_refill.size());
                 slot.da_pending_refill.clear();
                 return;
             }
@@ -8115,29 +8197,61 @@ static void kv_offload_refill_rollback(server_slot & slot, int32_t n_full, int32
 // proceeds without the chunk). The slot's prompt tokens are advanced so
 // pos_next() reflects the new length. HIGH RISK: mid-decode prefill - must be
 // validated by the offload probe before trusting.
-static bool kv_offload_refill(llama_context * ctx, server_slot & slot, const llama_tokens & toks, int32_t * out_last_idx,
+static bool kv_offload_refill(llama_context * ctx, server_slot & slot, const std::vector<std::vector<llama_token>> & units, int32_t * out_last_idx,
                               const std::function<bool()> & on_retry_idle, bool * out_safe_failopen) {
     // No decode has run yet - a failure at this point leaves the ctx output
     // buffer holding the main batch's rows, so the caller can fail-open.
     // Flipped to false once the decode loop starts (see below).
     if (out_safe_failopen) *out_safe_failopen = true;
-    const int32_t n_raw = (int32_t) toks.size();
-    if (n_raw <= 0 || ctx == nullptr) return false;
+    if (ctx == nullptr || units.empty()) return false;
 
     const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
 
-    std::string raw_text = sanitize_recalled_text(common_detokenize(ctx, toks),
-                                                recall_tag_names(vocab));
+    // item 6: each recalled unit is wrapped INDIVIDUALLY (its own
+    // [Recalled Chunk Start]...[End of Recalled Chunk] block) so multiple units
+    // stay separated in the KV - a flat concat fused them with no boundary. The
+    // wrappers are tokenized as their own pieces: gluing them into one string
+    // lets BPE re-merge across the wrapper/text boundary, and the original toks
+    // were made with (true, true), so a plain re-tokenize of the joined string
+    // is not a round trip. When sanitize is a no-op, keep the original token
+    // boundaries exactly (also drops LLAMA_TOKEN_NULL, which a media prompt's
+    // prompt.tokens[p] can be).
+    const llama_tokens pre  = common_tokenize(ctx, "\n[Recalled Chunk Start]\n", false, true);
+    const llama_tokens post = common_tokenize(ctx, "\n[End of Recalled Chunk]\n", false, true);
 
-    std::string sanitized_wrapped_text =
-        "\n[Recalled Chunk Start]\n" + raw_text + "\n[End of Recalled Chunk]\n";
-
-    //SRV_INF("sanitize_recalled_text: %s\n", sanitized_wrapped_text.c_str());
-
-    llama_tokens wrapped_toks = common_tokenize(ctx, sanitized_wrapped_text, false, true);
+    // per-unit (detok, raw_text) for the R1/R3 diagnostics below; unit_diag[u]
+    // always corresponds to units[u] (empty units get empty strings).
+    struct recall_unit_diag { std::string detok; std::string raw_text; };
+    std::vector<recall_unit_diag> unit_diag;
+    unit_diag.reserve(units.size());
+    int32_t n_raw = 0;
+    llama_tokens wrapped_toks;
+    for (size_t u = 0; u < units.size(); u++) {
+        const auto & toks = units[u];
+        n_raw += (int32_t) toks.size();
+        const std::string detok = common_detokenize(ctx, toks);
+        const std::string raw_text = sanitize_recalled_text(detok, recall_tag_names(vocab));
+        unit_diag.push_back({ detok, raw_text });
+        if (toks.empty()) continue;
+        wrapped_toks.insert(wrapped_toks.end(), pre.begin(), pre.end());
+        if (raw_text == detok) {
+            for (llama_token t : toks) {
+                if (t != LLAMA_TOKEN_NULL) wrapped_toks.push_back(t);
+            }
+        } else {
+            const llama_tokens body = common_tokenize(ctx, raw_text, false, true);
+            wrapped_toks.insert(wrapped_toks.end(), body.begin(), body.end());
+        }
+        wrapped_toks.insert(wrapped_toks.end(), post.begin(), post.end());
+    }
+    if (n_raw <= 0) return false;
 
     const int32_t n = (int32_t) wrapped_toks.size();
-    const int32_t n_full = (int32_t) slot.prompt.n_tokens();
+    // KV position, not array index: with media, prompt.tokens holds
+    // LLAMA_TOKEN_NULL placeholders so n_tokens() (array size) diverges from
+    // the next KV position, and the refill's mod_pos would overwrite existing
+    // cells. pos_next() is the true tail of the text-token stream.
+    const int32_t n_full = (int32_t) slot.prompt.tokens.pos_next();
     const llama_seq_id seq = slot.kv_seq();
     const int32_t n_batch = (int32_t) llama_n_batch(ctx);
 
@@ -8164,6 +8278,143 @@ static bool kv_offload_refill(llama_context * ctx, server_slot & slot, const lla
                  (int) slot.id, (int) (slot.task ? slot.task->id : -1),
                  n_raw, n, n_ctrl, n_eog, n_full, (int) slot.prompt.tokens.pos_next(),
                  (int) llama_memory_seq_pos_max(llama_get_memory(ctx), seq), (int) slot.sampled, head.c_str(), tail.c_str());
+        // T1-d: promote the ctrl/eog leak counters to SRV_INF so they land in
+        // the production journal. ctrl>0 = a control tag sanitize missed (H1a);
+        // eog>0 = an EOG inside the recall (the model may stop mid-recall).
+        if (n_ctrl > 0 || n_eog > 0) {
+            SRV_INF("kv_offload R2-leak: slot=%d task=%d ctrl=%d eog=%d (ctrl>0=sanitize miss, eog>0=mid-recall stop risk)\n",
+                    (int) slot.id, (int) (slot.task ? slot.task->id : -1), n_ctrl, n_eog);
+        }
+    }
+
+    // T1-a (R1): refill non-identity check (per unit). The input unit toks is
+    // the original chunk token stream; the refill re-tokenizes detokenize(toks)
+    // with (add_special=false, parse_special=true) after sanitize. If that
+    // round-trip does not reproduce `toks`, the recalled KV is NOT the
+    // original text (H1a). Compares the inner stream (no wrapper) so the
+    // wrapper's own tokens do not count as a mismatch.
+    {
+        auto head8 = [&](const llama_tokens & v) {
+            std::string s;
+            for (size_t i = 0; i < std::min<size_t>(8, v.size()); i++)
+                s += string_format("%d:'%s' ", (int) v[i], dbg_esc(common_token_to_piece(ctx, v[i], true), 24).c_str());
+            return s;
+        };
+        auto tail8 = [&](const llama_tokens & v) {
+            std::string s;
+            for (size_t i = v.size() > 8 ? v.size() - 8 : 0; i < v.size(); i++)
+                s += string_format("%d:'%s' ", (int) v[i], dbg_esc(common_token_to_piece(ctx, v[i], true), 24).c_str());
+            return s;
+        };
+        for (size_t u = 0; u < units.size(); u++) {
+            const auto & toks = units[u];
+            if (toks.empty()) continue;
+            const std::string & detok = unit_diag[u].detok;
+            const std::string & raw_text = unit_diag[u].raw_text;
+            const bool sanitize_changed = (raw_text != detok);
+            llama_tokens inner_toks = common_tokenize(ctx, raw_text, false, true);
+            const int32_t n_inner = (int32_t) inner_toks.size();
+            const int32_t n_u = (int32_t) toks.size();
+            int32_t first_mismatch = -1, n_mismatch = 0;
+            for (int32_t i = 0; i < std::min(n_u, n_inner); i++) {
+                if (toks[i] != inner_toks[i]) {
+                    if (first_mismatch < 0) first_mismatch = i;
+                    n_mismatch++;
+                }
+            }
+            if (n_u != n_inner) n_mismatch += std::abs(n_u - n_inner); // length delta
+            SRV_INF("kv_offload R1: slot=%d task=%d unit=%zu n_raw=%d n_inner=%d n_mismatch=%d first_mismatch=%d sanitize_changed=%d head_raw=[%s] head_inner=[%s] tail_raw=[%s] tail_inner=[%s]\n",
+                    (int) slot.id, (int) (slot.task ? slot.task->id : -1), (int) u,
+                    n_u, n_inner, n_mismatch, first_mismatch, (int) sanitize_changed,
+                    head8(toks).c_str(), head8(inner_toks).c_str(),
+                    tail8(toks).c_str(), tail8(inner_toks).c_str());
+        }
+    }
+
+    // T1-c (R3): tool-call structure of the recalled fragment, measured on
+    // BOTH sides of sanitize_recalled_text():
+    //   pre  = detokenize(toks)  - the original prompt span (what was evicted)
+    //   post = raw_text          - what actually gets re-prefilled into the KV
+    // Why both: if sanitize strips the tool-call tags, post is always 0/0 and a
+    // post-only check can never fire - we would learn nothing about whether the
+    // evicted span was a mid-tool-call slice. `pre` answers that; `post` answers
+    // whether the neutralization actually held. `stripped` therefore also
+    // answers V4 (does recall_tag_names cover the tool-call family?) without
+    // opening recall-sanitize.cpp.
+    //
+    // Two distinct hazards, reported separately:
+    //   headless  (close > open)          - the fragment BEGINS inside a tool
+    //                                       call: orphan closing tags injected.
+    //   ends_open (last opener after last closer) - the fragment ENDS inside a
+    //                                       tool call: the model continues it
+    //                                       and emits the closing tail as NEW
+    //                                       generation (the 66-tok closing-only
+    //                                       signature). This is the one that
+    //                                       predicts the derail, not `imbal`.
+    //
+    // Tag names are assembled from parts: literal tags do not survive
+    // editors / uploads (same idiom as the L1 block in apply_da_tag).
+    //
+    // Logged unconditionally: the negative cases are the denominator for the
+    // R3 <-> derail correlation. One line per refill (refills are rare).
+    {
+        const std::string ops[3] = {
+            std::string("<") + "tool_call>",
+            std::string("<") + "function=",
+            std::string("<") + "parameter=",
+        };
+        const std::string cls[3] = {
+            std::string("</") + "tool_call>",
+            std::string("</") + "function>",
+            std::string("</") + "parameter>",
+        };
+
+        struct tc_stat {
+            int  o[3]      = { 0, 0, 0 };
+            int  c[3]      = { 0, 0, 0 };
+            bool headless  = false;
+            bool ends_open = false;
+        };
+
+        auto scan = [&](const std::string & s) {
+            tc_stat st;
+            size_t last_o = std::string::npos;
+            size_t last_c = std::string::npos;
+            for (int k = 0; k < 3; k++) {
+                st.o[k] = dbg_count(s, ops[k], s.size());
+                st.c[k] = dbg_count(s, cls[k], s.size());
+                if (st.c[k] > st.o[k]) {
+                    st.headless = true;
+                }
+                const size_t po = s.rfind(ops[k]);
+                const size_t pc = s.rfind(cls[k]);
+                if (po != std::string::npos && (last_o == std::string::npos || po > last_o)) last_o = po;
+                if (pc != std::string::npos && (last_c == std::string::npos || pc > last_c)) last_c = pc;
+            }
+            st.ends_open = (last_o != std::string::npos) &&
+                           (last_c == std::string::npos || last_o > last_c);
+            return st;
+        };
+
+        for (size_t u = 0; u < units.size(); u++) {
+            if (units[u].empty()) continue;
+            const std::string & pre = unit_diag[u].detok;         // before sanitize
+            const std::string & raw_text = unit_diag[u].raw_text; // after sanitize (goes into the KV)
+
+            const tc_stat a = scan(pre);
+            const tc_stat b = scan(raw_text);
+
+            const size_t T = raw_text.size();
+            SRV_INF("kv_offload R3: slot=%d task=%d unit=%zu "
+                    "pre tc=%d/%d fn=%d/%d pr=%d/%d headless=%d ends_open=%d | "
+                    "post tc=%d/%d fn=%d/%d pr=%d/%d headless=%d ends_open=%d "
+                    "stripped=%d n_pre=%zu n_post=%zu tail='%s'\n",
+                    (int) slot.id, (int) (slot.task ? slot.task->id : -1), (int) u,
+                    a.o[0], a.c[0], a.o[1], a.c[1], a.o[2], a.c[2], (int) a.headless, (int) a.ends_open,
+                    b.o[0], b.c[0], b.o[1], b.c[1], b.o[2], b.c[2], (int) b.headless, (int) b.ends_open,
+                    (int) (pre != raw_text), pre.size(), T,
+                    dbg_esc(raw_text.substr(T > 120 ? T - 120 : 0), 140).c_str());
+        }
     }
 
     // Hoisted out of the try so the catch path can roll back the partial
@@ -8182,10 +8433,15 @@ static bool kv_offload_refill(llama_context * ctx, server_slot & slot, const lla
         // the recall, samples the closing token's row, keeps the slot + cache).
         {
             const int32_t n_free = llama_memory_n_free_cells(llama_get_memory(ctx));
-            da_trace("slot=%d task=%d L2 refill free cells: n_free=%d n_wrapped=%d\n",
-                     (int) slot.id, (int) (slot.task ? slot.task->id : -1), n_free, n);
-            if (n_free >= 0 && n_free < n) {
-                SLT_WRN(slot, "kv_offload: refill rejected - not enough free cells (n_free=%d < n_wrapped=%d); failing open (the recalled chunk is dropped, the slot continues without it)\n", n_free, n);
+            // Reserve headroom for the generation tail: the model keeps
+            // generating after the refill, and if the refill consumed the last
+            // free cells the next decode would hit the buffer cap and truncate.
+            // The tradeoff is a higher recall drop rate (fail-open).
+            const int32_t n_need = n + 2048;
+            da_trace("slot=%d task=%d L2 refill free cells: n_free=%d n_wrapped=%d n_need=%d\n",
+                     (int) slot.id, (int) (slot.task ? slot.task->id : -1), n_free, n, n_need);
+            if (n_free >= 0 && n_free < n_need) {
+                SLT_WRN(slot, "kv_offload: refill rejected - not enough free cells (n_free=%d < n_wrapped=%d + 2048 tail headroom); failing open (the recalled chunk is dropped, the slot continues without it)\n", n_free, n);
                 return false; // out_safe_failopen is already true
             }
         }
@@ -8269,6 +8525,14 @@ static bool kv_offload_refill(llama_context * ctx, server_slot & slot, const lla
         // round-trip would drop the media index map.
         const size_t old_size = slot.prompt.tokens.size();
         slot.prompt.tokens.insert(wrapped_toks);
+
+        // init_sampler() accepted every prompt token, but the refill bypassed
+        // it - accept the recalled tokens so the sampler state (repeat
+        // penalties, etc.) stays consistent with the context. apply_penalty =
+        // false: this is recalled context, not generated output.
+        for (llama_token t : wrapped_toks) {
+            common_sampler_accept(slot.smpl.get(), t, false);
+        }
 
         SRV_INF("kv_offload: re-prefilled %d token(s) at [%d, %d) on seq %d prompt tokens %zu -> %zu, seq_pos_max %d, took %.0f ms\n",
                 n, n_full, n_full + n, (int) seq, old_size, old_size + (size_t) n,
@@ -9192,12 +9456,28 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                             auto header_len = [](int32_t num) -> size_t {
                                 return (size_t) (15 + (int) std::to_string(num).size()); // "[Magic Chunk N]\n"
                             };
+                            // header_pos is in modified space (final char offset after
+                            // all header insertions, da-layout.cpp). seg.range_lo/hi is
+                            // in original space (kv_offload_evict on the unmodified
+                            // prompt). Comparing the two directly misses headers: a
+                            // header at original h_i sits at modified H_i = h_i +
+                            // sum_{j<i} len_j >= h_i, so H_i <= p skips a header that
+                            // h_i <= p would count -> under-shift -> hole lo drifts
+                            // early. Convert each header back to original space first
+                            // (the i-th header's modified offset minus the lengths of
+                            // the i-1 headers before it), then compare in original space.
+                            std::vector<size_t> header_orig(layout.header_pos.size());
+                            {
+                                size_t acc = 0;
+                                for (size_t i = 0; i < layout.header_pos.size(); i++) {
+                                    header_orig[i] = layout.header_pos[i] - acc;
+                                    acc += header_len((int32_t) (i + 1));
+                                }
+                            }
                             auto mod_pos = [&](size_t p) -> size_t {
                                 size_t shift = 0;
-                                for (size_t i = 0; i < layout.header_pos.size(); i++) {
-                                    if (layout.header_pos[i] <= p) {
-                                        shift += header_len((int32_t) (i + 1));
-                                    }
+                                for (size_t i = 0; i < header_orig.size(); i++) {
+                                    if (header_orig[i] <= p) shift += header_len((int32_t) (i + 1));
                                 }
                                 return p + shift;
                             };
@@ -9211,6 +9491,32 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                                 task.params.kv_hole_pending.push_back({ lo, hi });
                                 SRV_INF_DBG("kv-offload-holes: pending hole %s -> tokens [%d, %d) (%d tokens)\n",
                                         seg.key.c_str(), lo, hi, hi - lo);
+                                // T1-b (R2): validate the hole coordinate mapping.
+                                // Detokenize the token span [lo,hi) (modified
+                                // space) and compare with the segment's original
+                                // text. A match (or edge-only diff from token
+                                // snapping) => the mapping is correct and the
+                                // plan's §1 coordinate hypothesis is discarded;
+                                // a mid-span difference => a real cut.
+                                {
+                                    const std::vector<llama_token> & all_toks = toks;
+                                    const int32_t lo_c = std::max(0, lo);
+                                    const int32_t hi_c = std::min((int32_t) all_toks.size(), hi);
+                                    if (hi_c > lo_c) {
+                                        std::vector<llama_token> sub(all_toks.begin() + lo_c, all_toks.begin() + hi_c);
+                                        const std::string detok = tokens_to_str(ctx_server.vocab, sub);
+                                        const std::string & st = seg.text;
+                                        int32_t first_diff = -1;
+                                        const size_t m = std::min(detok.size(), st.size());
+                                        for (size_t i = 0; i < m; i++) { if (detok[i] != st[i]) { first_diff = (int32_t) i; break; } }
+                                        if (first_diff < 0 && detok.size() != st.size()) first_diff = (int32_t) m;
+                                        auto hd = [](const std::string & s) { return dbg_esc(s.substr(0, 16), 16); };
+                                        auto tl = [](const std::string & s) { return dbg_esc(s.substr(s.size() > 16 ? s.size() - 16 : 0), 16); };
+                                        SRV_INF("kv-offload R2: seg=%s tokens[%d,%d) n_segtext=%zu n_detok=%zu first_diff=%d head_seg=[%s] head_detok=[%s] tail_seg=[%s] tail_detok=[%s]\n",
+                                                seg.key.c_str(), lo, hi, st.size(), detok.size(), first_diff,
+                                                hd(st).c_str(), hd(detok).c_str(), tl(st).c_str(), tl(detok).c_str());
+                                    }
+                                }
                             }
                         }
                         SRV_INF_DBG("da_auto: %zu chunk(s) from %zu source message(s), %zu token(s) - %s path%s%s\n",
