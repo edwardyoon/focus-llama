@@ -102,7 +102,18 @@ struct server_slot;
 // recall, sample the closing token's row, keep the slot and its cache). Flipped
 // to false once the decode loop starts (the buffer is overwritten; a failure
 // then must abort the slot).
-static bool kv_offload_refill(llama_context * ctx, server_slot & slot, const std::vector<std::vector<llama_token>> & units, int32_t * out_last_idx = nullptr,
+// A queued recall unit (item 6): its tokens plus the dedup key to commit to
+// slot.da_recalled_* only if the refill SUCCEEDS. chunk_id (>= 0) marks a
+// get-on-focus unit (keyed by offloaded chunk number); range.first (>= 0) marks
+// a holed-chunk unit (keyed by the prompt token range [lo,hi)). Committing on
+// success (not at queue time) means a recall dropped by the free-cell gate or a
+// spec-slot clear is NOT dedup-blocked - the model can re-request and retry.
+struct da_refill_unit {
+    std::vector<llama_token> toks;
+    int32_t chunk_id = -1;
+    std::pair<int32_t, int32_t> range = { -1, -1 };
+};
+static bool kv_offload_refill(llama_context * ctx, server_slot & slot, const std::vector<da_refill_unit> & units, int32_t * out_last_idx = nullptr,
                               const std::function<bool()> & on_retry_idle = nullptr, bool * out_safe_failopen = nullptr);
 
 static common_speculative_output_limits server_output_limits(const common_params & params) {
@@ -451,17 +462,20 @@ struct server_slot {
     // from the refill's last logits so the model continues after the
     // recalled content. Request-scoped (cleared in reset()).
     // One element per recalled unit (item 6): get-on-focus pushes one unit per
-    // offloaded chunk, the holed-chunk path one unit per evicted overlap.
+    // offloaded chunk, the holed-chunk path one unit per evicted overlap (or
+    // remainder of it, after subtracting the already-recalled part - 2-2).
     // kv_offload_refill wraps EACH unit individually so the units stay
     // separated in the KV (a flat concat fused them with no boundary).
-    std::vector<std::vector<llama_token>> da_pending_refill;
-    // item 6: per-request recall dedup (cleared in reset()). da_recalled_ranges
+    std::vector<da_refill_unit> da_pending_refill;
+    // item 6/2-3: per-request recall dedup (cleared in reset()). da_recalled_ranges
     // = prompt token ranges [lo,hi) already recalled via the holed-chunk path;
     // da_recalled_chunk_ids = offloaded chunk numbers already recalled via
-    // get-on-focus. The model can re-focus the same chunk across multiple
-    // <focus> tags in one request - without this the content lands in the KV
-    // twice. Checked AND recorded at queue time (apply_da_tag); a recall later
-    // dropped by the free-cell gate is not re-offered (rare, accepted).
+    // get-on-focus. Committed ONLY on refill success (post_decode) - a recall
+    // dropped by the free-cell gate or a spec-slot clear is NOT recorded, so
+    // the model can re-request and retry (recording at queue time turned a
+    // drop into a permanent block: the model re-emits the tag, the dedup
+    // skips it, and it loops until the buffer cap). Units queued in the same
+    // apply_da_tag pass are additionally checked against da_pending_refill.
     std::vector<std::pair<int32_t, int32_t>> da_recalled_ranges;
     std::vector<int32_t> da_recalled_chunk_ids;
     // batch index (within the refill's final sub-batch) of the last
@@ -6971,7 +6985,10 @@ private:
             // share before the attention restriction kicked in. The non-restriction
             // tags (</focus>/</local>/<global>/</global>, type 2-5) do not start
             // the restricted phase, so they are not recorded here.
-            if ((tag.type == 0 || tag.type == 1) && slot.da_first_tag_gen < 0) {
+            // A B2 no-op focus tag (open tool-call, see case 0) applies no
+            // restriction, so it does not start the measured restricted phase.
+            if ((tag.type == 0 || tag.type == 1) && slot.da_first_tag_gen < 0 &&
+                    !(tag.type == 0 && (in_tool || in_param))) {
                 slot.da_first_tag_gen = (int32_t) slot.stats.n_gen;
             }
 
@@ -6991,11 +7008,30 @@ private:
                     const auto & offloaded = slot.task->params.da_offloaded;
                     std::vector<size_t> keep_idx;
                     bool did_refill = false;
-                    // item 4 (B2 gate): a recall must not re-prefill inside an
-                    // open tool-call/parameter (the opening tag would sit in the
-                    // prompt, only the closing tail in the generation). Both
-                    // case-0 recall paths below drop (no enqueue) when set.
+                    // item 2-1 (B2 gate): a tool-call/parameter is open at tag
+                    // close. A recall re-prefilled here would land INSIDE it
+                    // (opening tag in the prompt, closing only generated), and
+                    // the mode switch would still run - a focus on a fully-holed
+                    // chunk copies an EMPTY range, leaving the model attending
+                    // to scaffold+tail only (the L3 signature: holed == len,
+                    // did_refill = 0). No-op the whole tag: no recall, no mode
+                    // switch. Staying in the current mode always keeps at least
+                    // as much information as a restricted mode.
                     const bool block_recall = in_tool || in_param;
+                    if (block_recall) {
+                        SLT_WRN(slot, "kv_offload: focus tag NO-OP (B2 gate: open tool-call in_tool=%d in_param=%d) - no recall, no mode switch\n",
+                                in_tool, in_param);
+                        break;
+                    }
+                    // item 2-3: dedup against committed keys (successful
+                    // refills) and units queued in this same pass (two tags can
+                    // close in one apply_da_tag loop with no refill between).
+                    // A dropped recall is in neither, so a re-request retries.
+                    const auto chunk_recalled = [&slot](int32_t cid) {
+                        if (std::find(slot.da_recalled_chunk_ids.begin(), slot.da_recalled_chunk_ids.end(), cid) != slot.da_recalled_chunk_ids.end()) return true;
+                        for (const auto & u : slot.da_pending_refill) if (u.chunk_id == cid) return true;
+                        return false;
+                    };
                     for (int32_t n : tag.keep_nums) {
                         // kv-offload (get-on-focus): n points to an evicted (offloaded)
                         // chunk (number >= base + n_chunks). Fetch its text from the
@@ -7011,19 +7047,13 @@ private:
                                 SLT_INF(slot, "kv_offload: get-on-focus chunk %d SKIPPED (measure-only) - no store GET / KV refill; output stays vanilla\n", n);
                                 continue;
                             }
-                            // item 4 (B2 gate): a tool-call/parameter is open at tag
-                            // close - a recall re-prefilled here would land inside it
-                            // (opening tag in the prompt, closing only generated).
-                            // Drop the recall (no enqueue).
-                            if (block_recall) {
-                                SLT_WRN(slot, "kv_offload: get-on-focus chunk %d DROPPED (B2 gate: open tool-call in_tool=%d in_param=%d) - recall would re-prefill inside an open tool-call\n",
-                                        n, in_tool, in_param);
-                                continue;
-                            }
-                            // item 6: the same offloaded chunk is not re-recalled within
-                            // a request (it would land in the KV twice).
-                            if (std::find(slot.da_recalled_chunk_ids.begin(), slot.da_recalled_chunk_ids.end(), n) != slot.da_recalled_chunk_ids.end()) {
-                                SLT_WRN_DBG(slot, "kv_offload: get-on-focus chunk %d already recalled this request - skipping (dedup)\n", n);
+                            // item 6/2-3: the same offloaded chunk is not re-recalled
+                            // within a request (it would land in the KV twice).
+                            // Committed ids (successful refills) + units queued in
+                            // this same pass; a dropped recall is in neither, so a
+                            // re-request retries.
+                            if (chunk_recalled(n)) {
+                                SLT_WRN_DBG(slot, "kv_offload: get-on-focus chunk %d already recalled/queued this request - skipping (dedup)\n", n);
                                 continue;
                             }
                             bool found = false;
@@ -7057,12 +7087,15 @@ private:
                                     // the model's own tag. post_decode() applies the
                                     // queue after the commit and samples the next token
                                     // from the refill's last logits row.
-                                    // item 6: one unit per chunk (wrapped individually
-                                    // in kv_offload_refill), recorded for per-request
-                                    // dedup so a re-focus does not land it twice.
+                                    // item 6/2-3: one unit per chunk (wrapped individually
+                                    // in kv_offload_refill). The dedup key (chunk_id) is
+                                    // committed to da_recalled_chunk_ids only on refill
+                                    // success (post_decode), so a dropped recall retries.
                                     if (!toks.empty()) {
-                                        slot.da_pending_refill.push_back(toks);
-                                        slot.da_recalled_chunk_ids.push_back(n);
+                                        da_refill_unit unit;
+                                        unit.toks = std::move(toks);
+                                        unit.chunk_id = n;
+                                        slot.da_pending_refill.push_back(std::move(unit));
                                         did_refill = true;
                                     }
                                 } else {
@@ -7094,14 +7127,9 @@ private:
                     // refilled tail onto da_seq, exactly like the Option C get-on-focus path.
                     // Fail-open. measure-only (Phase 0) skips the re-prefill so the KV is
                     // not mutated and the output stays vanilla (mirrors the da_rm/da_b guards).
-                    if (slot.kv_holes_active && !keep_idx.empty() && !slot.da_measure_only && block_recall) {
-                        // item 4 (B2 gate): a tool-call/parameter is open at tag close -
-                        // a holed-chunk recall re-prefilled here would land inside it
-                        // (opening tag in the prompt, closing only generated). Drop the
-                        // recall (no enqueue).
-                        SLT_WRN(slot, "kv_offload: holed-chunk recall DROPPED (B2 gate: open tool-call in_tool=%d in_param=%d) - recall would re-prefill inside an open tool-call\n",
-                                in_tool, in_param);
-                    } else if (slot.kv_holes_active && !keep_idx.empty() && !slot.da_measure_only) {
+                    // item 2-4: the holed-chunk B2 branch is gone with the case-0
+                    // no-op break above - a B2 focus tag never reaches here.
+                    if (slot.kv_holes_active && !keep_idx.empty() && !slot.da_measure_only) {
                         SLT_INF(slot, "kv_offload: checking %zu keep chunk(s) against %zu hole range(s)\n",
                             keep_idx.size(), slot.kv_hole_ranges.size());
                         const int32_t n_prompt = (int32_t) slot.prompt.tokens.size();
@@ -7137,32 +7165,38 @@ private:
                                         n, hole.first, hole.second);
                                     continue;
                                 }
-                                llama_tokens toks;
-                                for (int32_t p = olo; p < ohi; ++p) {
-                                    toks.push_back(slot.prompt.tokens[p]);
-                                }
-                                // item 6: this prompt range is not re-recalled within a
-                                // request (it would land in the KV twice).
-                                bool range_dup = false;
+                                // item 2-2: subtract the already-recalled parts
+                                // (committed ranges + units queued in this pass)
+                                // and queue only the remainder, so a partial
+                                // overlap does not lose the new part.
+                                std::vector<std::pair<int32_t, int32_t>> rem = { { olo, ohi } };
                                 for (const auto & rr : slot.da_recalled_ranges) {
-                                    if (olo < rr.second && rr.first < ohi) { range_dup = true; break; }
+                                    da_subtract_range(rem, rr.first, rr.second);
                                 }
-                                if (range_dup) {
+                                for (const auto & u : slot.da_pending_refill) {
+                                    if (u.range.first >= 0) da_subtract_range(rem, u.range.first, u.range.second);
+                                }
+                                if (rem.empty()) {
                                     SLT_WRN_DBG(slot, "kv_offload: holed chunk %zu overlap [%d,%d) already recalled this request - skipping (dedup)\n",
                                             n, olo, ohi);
                                     continue;
                                 }
+                                llama_tokens toks;
+                                for (const auto & r : rem) {
+                                    for (int32_t p = r.first; p < r.second; ++p) {
+                                        toks.push_back(slot.prompt.tokens[p]);
+                                    }
+                                }
                                 if (toks.empty()) continue;
                                 SLT_INF(slot, "kv_offload: focus on holed chunk %zu - re-prefilling %d token(s) at [%d,%d)\n",
                                         n, (int) toks.size(), olo, ohi);
-                                // B1: queue (see the get-on-focus path above) -
-                                // post_decode() decodes it after the closing
-                                // token is committed.
-                                // item 6: one unit per evicted overlap (wrapped
-                                // individually in kv_offload_refill), recorded for
-                                // per-request dedup.
-                                slot.da_pending_refill.push_back(toks);
-                                slot.da_recalled_ranges.push_back({ olo, ohi });
+                                // item 6/2-3: one unit per evicted overlap (wrapped individually in
+                                // kv_offload_refill). The dedup key (range) is committed to
+                                // da_recalled_ranges only on success.
+                                da_refill_unit u;
+                                u.toks = std::move(toks);
+                                u.range = { olo, ohi };
+                                slot.da_pending_refill.push_back(std::move(u));
                                 did_refill = true;
                             }
                         }
@@ -7883,6 +7917,13 @@ private:
             if (ok) {
                 slot.da_refill_out_idx = last_idx;
                 refill_ran_this_iter = true;
+                // item 2-3: commit the dedup keys ONLY on success, so a recall
+                // dropped by the free-cell gate (or a spec-slot clear) stays
+                // retryable - the model can re-emit the tag and get it.
+                for (const auto & unit : slot.da_pending_refill) {
+                    if (unit.chunk_id >= 0) slot.da_recalled_chunk_ids.push_back(unit.chunk_id);
+                    if (unit.range.first >= 0) slot.da_recalled_ranges.push_back(unit.range);
+                }
             } else if (safe_failopen && !ctx_out_clobbered) {
                 // Rejected BEFORE any decode ran (the free-cell hard gate) AND
                 // no earlier refill in this pass decoded - the ctx output buffer
@@ -8197,7 +8238,7 @@ static void kv_offload_refill_rollback(server_slot & slot, int32_t n_full, int32
 // proceeds without the chunk). The slot's prompt tokens are advanced so
 // pos_next() reflects the new length. HIGH RISK: mid-decode prefill - must be
 // validated by the offload probe before trusting.
-static bool kv_offload_refill(llama_context * ctx, server_slot & slot, const std::vector<std::vector<llama_token>> & units, int32_t * out_last_idx,
+static bool kv_offload_refill(llama_context * ctx, server_slot & slot, const std::vector<da_refill_unit> & units, int32_t * out_last_idx,
                               const std::function<bool()> & on_retry_idle, bool * out_safe_failopen) {
     // No decode has run yet - a failure at this point leaves the ctx output
     // buffer holding the main batch's rows, so the caller can fail-open.
@@ -8227,7 +8268,7 @@ static bool kv_offload_refill(llama_context * ctx, server_slot & slot, const std
     int32_t n_raw = 0;
     llama_tokens wrapped_toks;
     for (size_t u = 0; u < units.size(); u++) {
-        const auto & toks = units[u];
+        const auto & toks = units[u].toks;
         n_raw += (int32_t) toks.size();
         const std::string detok = common_detokenize(ctx, toks);
         const std::string raw_text = sanitize_recalled_text(detok, recall_tag_names(vocab));
@@ -8307,7 +8348,7 @@ static bool kv_offload_refill(llama_context * ctx, server_slot & slot, const std
             return s;
         };
         for (size_t u = 0; u < units.size(); u++) {
-            const auto & toks = units[u];
+            const auto & toks = units[u].toks;
             if (toks.empty()) continue;
             const std::string & detok = unit_diag[u].detok;
             const std::string & raw_text = unit_diag[u].raw_text;
@@ -8397,7 +8438,7 @@ static bool kv_offload_refill(llama_context * ctx, server_slot & slot, const std
         };
 
         for (size_t u = 0; u < units.size(); u++) {
-            if (units[u].empty()) continue;
+            if (units[u].toks.empty()) continue;
             const std::string & pre = unit_diag[u].detok;         // before sanitize
             const std::string & raw_text = unit_diag[u].raw_text; // after sanitize (goes into the KV)
 
