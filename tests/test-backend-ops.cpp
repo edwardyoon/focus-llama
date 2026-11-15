@@ -13240,14 +13240,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_opt_step_adamw(GGML_TYPE_F32, {10, 5, 4, 3}));
     test_cases.emplace_back(new test_opt_step_sgd(GGML_TYPE_F32, {10, 5, 4, 3}));
 
-    for (bool with_bias : {false, true}) {
-        test_cases.emplace_back(new test_mul_mat_fusion(GGML_TYPE_F8_E4M3, GGML_GLU_OP_SWIGLU, 16, 32, 256,
-            false, 1, 1, false, with_bias, false, true, {1, 1}));
-    }
-    test_cases.emplace_back(new test_mul_mat_fusion(GGML_TYPE_F8_E4M3, GGML_GLU_OP_SWIGLU, 16, 32, 256,
-        false, 1, 1, false, false, false, true, {2, 1}));
-    test_cases.emplace_back(new test_mul_mat_fusion(GGML_TYPE_F8_E4M3, GGML_GLU_OP_SWIGLU, 16, 31, 257,
-        false, 1, 1, false, false, false, true, {1, 1}));
+    // F8_E4M3 mul_mat_fusion cases removed: the fork's ggml has no F8_E4M3
+    // type (upstream-only), this test file was synced from upstream
 
     for (ggml_type type : base_types) {
         for (bool with_gate : {false, true}) {
