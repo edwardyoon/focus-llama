@@ -1229,6 +1229,8 @@ public:
     common_batch(struct llama_context * ctx)
         : batch(llama_batch_ext_init(ctx)) {}
 
+    void clear() { llama_batch_ext_clear(batch.get()); }
+
     void add(llama_token id, llama_pos pos, llama_seq_id seq_id, bool logits) {
         const int32_t idx = llama_batch_ext_add_token(batch.get(), seq_id, id);
         llama_batch_ext_set_pos(batch.get(), idx, &pos);
