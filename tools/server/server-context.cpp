@@ -8589,12 +8589,15 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     bool ok = !offs.empty();
 
                     // chunk c = [header_c, header_{c+1}) ; last = [header_last, tail)
+                    // header_pos_mod (modified-text coordinates) - header_pos is
+                    // original-text and would drift left by the earlier headers'
+                    // lengths as c grows.
                     std::vector<std::pair<int32_t, int32_t>> chunks;
                     if (ok) {
-                        chunks.reserve(layout.header_pos.size());
-                        for (size_t c = 0; c < layout.header_pos.size(); c++) {
-                            const size_t next = c + 1 < layout.header_pos.size() ? layout.header_pos[c + 1] : layout.tail_pos;
-                            const int32_t lo = da_char_to_token_nearest(offs, layout.header_pos[c]);
+                        chunks.reserve(layout.header_pos_mod.size());
+                        for (size_t c = 0; c < layout.header_pos_mod.size(); c++) {
+                            const size_t next = c + 1 < layout.header_pos_mod.size() ? layout.header_pos_mod[c + 1] : layout.tail_pos;
+                            const int32_t lo = da_char_to_token_nearest(offs, layout.header_pos_mod[c]);
                             const int32_t hi = da_char_to_token_nearest(offs, next);
                             if (lo < 0 || hi < 0 || hi <= lo) {
                                 ok = false;
@@ -8605,6 +8608,45 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                             // apply_da_rm consume these as [lo, hi) removal ranges.
                             chunks.push_back({ lo, hi });
                         }
+                    }
+                    // Diagnostic (guards the header_pos_mod coordinate fix):
+                    // each chunk's token range must start at its [Magic Chunk N]
+                    // header. The nearest-boundary snap can shift the start by a
+                    // token or two, so the check is "the header appears within
+                    // the first 20 detokenized tokens of the chunk", not an
+                    // exact prefix match.
+                    if (ok) {
+                        size_t n_mismatch = 0;
+                        size_t first_mismatch = 0;  // 1-based chunk number, 0 = none
+                        size_t n_logged = 0;
+                        for (size_t c = 0; c < chunks.size(); c++) {
+                            const int32_t lo = chunks[c].first;
+                            std::string piece;
+                            for (int32_t t = lo; t < lo + 20 && t < (int32_t) toks.size(); t++) {
+                                piece += common_token_to_piece(ctx_server.vocab, toks[t], true);
+                            }
+                            // first 24 chars, backed off to a UTF-8 boundary
+                            size_t n = piece.size() < 24 ? piece.size() : 24;
+                            while (n > 0 && n < piece.size() && ((unsigned char) piece[n] & 0xC0) == 0x80) {
+                                n--;
+                            }
+                            std::string head = piece.substr(0, n);
+                            for (char & ch : head) {
+                                if ((unsigned char) ch < 0x20 || ch == 0x7F) ch = ' ';
+                            }
+                            const std::string expected = "[Magic Chunk " + std::to_string(c + 1) + "]";
+                            if (piece.find(expected) == std::string::npos) {
+                                n_mismatch++;
+                                if (first_mismatch == 0) first_mismatch = c + 1;
+                                if (n_logged < 5) {
+                                    SRV_INF("da_auto: chunk %zu header mismatch head='%s' lo=%d\n",
+                                            c + 1, head.c_str(), lo);
+                                    n_logged++;
+                                }
+                            }
+                        }
+                        SRV_INF("da_auto: chunk header check - n_chunks=%zu mismatch=%zu first_mismatch=%zu\n",
+                                chunks.size(), n_mismatch, first_mismatch);
                     }
                     std::pair<int32_t, int32_t> filler = { -1, -1 };
                     if (ok && layout.filler.second > layout.filler.first) {
