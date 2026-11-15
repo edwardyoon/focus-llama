@@ -13,7 +13,7 @@
 static inline bool rc_is_ident(unsigned char c) {
     return std::isalnum(c) || c == '_' || c == ':' || c == '-';
 }
-static inline bool rc_is_blank(unsigned char c) { return c == ' ' || c == '\t'; }
+static inline bool rc_is_blank(unsigned char c) { return std::isspace(c) != 0; }
 
 static std::string rc_lower(std::string s) {
     std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return (char) std::tolower(c); });
@@ -105,32 +105,36 @@ static bool rc_sanitize_tag_at(const std::string & s, size_t i,
         return false;
     }
 
-    // 3) 여는 태그: 식별자 바로 뒤의 '<'는 제네릭/비교식으로 보고 제외 (vector<function>, a<global)
-    if (i > 0 && (rc_is_ident((unsigned char) s[i - 1]) || s[i - 1] == ':')) return false;
-
     size_t k = q;
     if (k < n && s[k] == '=') {
         // <function=name>, <parameter=key>
         k++;
         while (k < n && s[k] != '>' && s[k] != '<' && !std::isspace((unsigned char) s[k])) k++;
     } else {
-        // <focus>, <focus magic_chunks="3" ...>
+        // <focus>, <focus magic_chunks="3" ...> - "..."과 '...' 속성값 모두
         while (true) {
             size_t a = k;
             while (a < n && rc_is_blank((unsigned char) s[a])) a++;
             if (a == k) break;
             size_t b = a;
             while (b < n && rc_is_ident((unsigned char) s[b])) b++;
-            if (b == a || b + 1 >= n || s[b] != '=' || s[b + 1] != '"') break;
+            if (b == a || b + 1 >= n || s[b] != '=' || (s[b + 1] != '"' && s[b + 1] != '\'')) break;
+            const char quote = s[b + 1];
             size_t c = b + 2;
-            while (c < n && s[c] != '"' && s[c] != '\n') c++;
-            if (c >= n || s[c] != '"') break;
+            while (c < n && s[c] != quote && s[c] != '\n') c++;
+            if (c >= n || s[c] != quote) break;
             k = c + 1;
         }
     }
     size_t e = k;
     while (e < n && rc_is_blank((unsigned char) s[e])) e++;
     if (e >= n || s[e] != '>') return false;  // `a<global && b>c` 같은 코드는 여기서 탈락
+
+    // 3) 여는 태그: 식별자 바로 뒤의 '<'는 제네릭/비교식으로 보고 제외 (vector<function>, a<global).
+    //    단, 정확히 <이름>(속성 없음)이고 이름이 스페셜 토큰이면 치환한다 — done<focus>처럼
+    //    단어에 붙은 진짜 제어 토큰은 parse_special=true 재토큰화 시 실제 제어 토큰이 되어
+    //    누출 경로가 되므로 가드를 건너뛴다. 속성이 있는 형태(vector<focus x="1">)는 가드 유지.
+    if (k != q && i > 0 && (rc_is_ident((unsigned char) s[i - 1]) || s[i - 1] == ':')) return false;
 
     out += "[past_";
     out.append(s, p, k - p);   // 이름 + 속성 원문 그대로
