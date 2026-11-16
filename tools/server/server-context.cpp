@@ -6619,24 +6619,30 @@ private:
             int32_t n_full   = (int32_t) slot.prompt.n_tokens();
             const bool    in_focus = slot.da_mode == DA_MODE_FOCUS;
             const bool    in_local = slot.da_mode == DA_MODE_LOCAL;
+            // Tool-call / parameter state at tag close, computed on the
+            // pre-erase generated_text (the tag is still in it here). When a
+            // tool-call or parameter is still open at tag close, a recall
+            // re-prefilled here would land INSIDE it (the opening tag is in
+            // the prompt, only the closing tail would be generated). The
+            // in-tool gate below (and the B2 gate in case 0) use these.
+            // Tag names are assembled from parts: literal tags do not
+            // survive editors / uploads.
+            const std::string tc_open  = std::string("<")  + "tool_call>";
+            const std::string tc_close = std::string("</") + "tool_call>";
+            const std::string pr_open  = std::string("<")  + "parameter=";
+            const std::string pr_close = std::string("</") + "parameter>";
+            const std::string & g_txt = slot.generated.text;
+            const int in_tool  = dbg_count(g_txt, tc_open,  tag.start) > dbg_count(g_txt, tc_close, tag.start) ? 1 : 0;
+            const int in_param = dbg_count(g_txt, pr_open,  tag.start) > dbg_count(g_txt, pr_close, tag.start) ? 1 : 0;
 
             // L1: tag-closed snapshot - the state the refill decision runs
             // on. B1 check: prompt_tokens == seq_pos_max + 1 means the
             // sampled closing token is not in the KV yet (it commits in the
             // next handle_last_sampled_token). in_tool = 1 means the tag
-            // fired mid tool call (B2).
+            // fired mid tool call (B2). in_tool/in_param are computed above
+            // on the pre-erase generated_text (g_txt).
             {
-                // tag names are assembled from parts: literal tags do not
-                // survive editors / uploads
-                const std::string tc_open  = std::string("<")  + "tool_call>";
-                const std::string tc_close = std::string("</") + "tool_call>";
-                const std::string pr_open  = std::string("<")  + "parameter=";
-                const std::string pr_close = std::string("</") + "parameter>";
-
-                const std::string & g = slot.generated.text;
                 const size_t b0 = tag.start > 240 ? tag.start - 240 : 0;
-                const int in_tool  = dbg_count(g, tc_open,  tag.start) > dbg_count(g, tc_close, tag.start) ? 1 : 0;
-                const int in_param = dbg_count(g, pr_open,  tag.start) > dbg_count(g, pr_close, tag.start) ? 1 : 0;
 
                 da_trace("slot=%d task=%d L1 tag closed type=%d nums=%zu n_gen=%d mode=%d seq=%d prompt_tokens=%d seq_pos_max=%d sampled=%d spec_draft=%zu in_tool=%d in_param=%d before='%s' tag='%s'\n",
                          (int) slot.id, (int) slot.task->id,
@@ -6645,8 +6651,19 @@ private:
                          (int) llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.kv_seq()),
                          (int) slot.sampled, slot.spec_draft.size(),
                          in_tool, in_param,
-                         dbg_esc(g.substr(b0, tag.start - b0), 260).c_str(),
-                         dbg_esc(g.substr(tag.start, tag.end - tag.start)).c_str());
+                         dbg_esc(g_txt.substr(b0, tag.start - b0), 260).c_str(),
+                         dbg_esc(g_txt.substr(tag.start, tag.end - tag.start)).c_str());
+                // T1-f: a DA control tag that closes while a tool-call/parameter
+                // is still open means the pending recall would re-prefill inside
+                // an open tool-call (a derail risk). The L1 da_trace above already
+                // carries in_tool/in_param but is DBG-gated; promote the signal
+                // to SRV_INF and warn when either is set (B2 gate would defer).
+                if (in_tool || in_param) {
+                    SRV_INF("kv_offload L1: slot=%d task=%d control tag closed with open tool-call: in_tool=%d in_param=%d n_gen=%d mode=%d (recall would re-prefill inside an open tool-call)\n",
+                            (int) slot.id, (int) slot.task->id, in_tool, in_param,
+                            (int) slot.stats.n_gen, (int) slot.da_mode);
+                    SLT_WRN_DBG(slot, "kv_offload L1: tag closed while in_tool=%d in_param=%d - B2 gate would defer this recall\n", in_tool, in_param);
+                }
 
                 // arm the per-token trace (L4) for the next 24 tokens
                 slot.da_trace_left = 24;
@@ -6673,6 +6690,23 @@ private:
             }
             slot.da_tag_scan_pos = tag.start;
 
+            // In-tool gate: a restricting tag (<focus>/<local>) that closes
+            // inside an open tool-call / parameter would flip the mode (B
+            // switch / A removal / refill queue) while the tool-call opening
+            // is still in the prompt, so the opening drops out of attention
+            // and the model only emits the closing tail (headless tail).
+            // Ignore it: the tag is already erased (not in the output) and the
+            // mode is left unchanged. Non-restricting tags (</focus>,
+            // </local>, <global>, type 2-5) must ALWAYS be processed - they
+            // are the only way back to GLOBAL, so ignoring them would trap
+            // the slot in FOCUS/LOCAL.
+            const bool restricting = (tag.type == 0 || tag.type == 1);
+            if (restricting && (in_tool || in_param)) {
+                SLT_INF(slot, "da_tag: type=%d IGNORED inside tool call (in_tool=%d in_param=%d) n_gen=%d mode=%d - tag consumed, mode unchanged\n",
+                        tag.type, in_tool, in_param, (int) slot.stats.n_gen, (int) slot.da_mode);
+                continue;
+            }
+
             // The first token after a mode transition must follow the
             // single-token trajectory (see the DA tag gate in the draft
             // decision) - the next draft step of this slot is skipped.
@@ -6687,6 +6721,12 @@ private:
             if ((tag.type == 0 || tag.type == 1) && slot.da_first_tag_gen < 0) {
                 slot.da_first_tag_gen = (int32_t) slot.stats.n_gen;
             }
+
+            // Applied-tag log: every tag that passed the in-tool gate and now
+            // runs the mode transition below (SLT_INF so it is visible in
+            // production, not just under FOCUS_SPARSE_DEBUG).
+            SLT_INF(slot, "da_tag: type=%d applied (in_tool=%d in_param=%d) n_gen=%d mode=%d seq=%d\n",
+                    tag.type, in_tool, in_param, (int) slot.stats.n_gen, (int) slot.da_mode, (int) slot.kv_seq());
 
             switch (tag.type) {
                 case 0: { // <focus magic_chunks="N"> (or "1,3") : enter/switch FOCUS
