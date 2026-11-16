@@ -3016,6 +3016,9 @@ private:
                 const std::string & g = slot.generated_text;
                 const size_t E = g.size();
 
+                // close > open is the derail signature (a headless closing
+                // tail). open > close (the model mentioning the tags as text)
+                // is NOT a symptom - counting it flagged ~52% of turns.
                 const bool unbalanced =
                     dbg_count(g, "<tool_call>", E) != dbg_count(g, "</tool_call>", E) ||
                     dbg_count(g, "<function=", E) != dbg_count(g, "</function>", E) ||
@@ -6082,6 +6085,23 @@ private:
                 continue;
             }
 
+            // <local> block: the model emits <local> from learned habit even
+            // after the prompt txt is fixed, and the mode transition would
+            // still run and pollute the experiment. Ignore it: the tag is
+            // already erased (not in the output) and the mode is left
+            // unchanged. </local> (type 3) is NOT ignored - no slot is ever
+            // in LOCAL state, so its da_set_mode(GLOBAL) is a no-op anyway.
+            // Default on; FOCUS_DA_NO_LOCAL=0 disables it for A/B comparison.
+            static const bool da_no_local = []() {
+                const char * e = getenv("FOCUS_DA_NO_LOCAL");
+                return !e || atoi(e) != 0;
+            }();
+            if (tag.type == 1 && da_no_local) {
+                SLT_INF(slot, "da_tag: type=1 (<local>) IGNORED - mode unchanged n_gen=%d mode=%d\n",
+                        (int) slot.stats.n_gen, (int) slot.da_mode);
+                continue;
+            }
+
             // The first token after a mode transition must follow the
             // single-token trajectory (see the DA tag gate in the draft
             // decision) - the next draft step of this slot is skipped.
@@ -8627,8 +8647,8 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                             }
                             auto mod_pos = [&](size_t p) -> size_t {
                                 size_t shift = 0;
-                                for (size_t i = 0; i < header_orig.size(); i++) {
-                                    if (header_orig[i] <= p) shift += header_len((int32_t) (i + 1));
+                                for (size_t i = 0; i < layout.header_pos.size(); i++) {
+                                    if (layout.header_pos[i] <= p) shift += header_len((int32_t) (i + 1));
                                 }
                                 return p + shift;
                             };
