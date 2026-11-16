@@ -6254,30 +6254,47 @@ private:
                             keep_nums.c_str(), hole_str.c_str(), n_prompt);
                         for (size_t n : keep_idx) {
                             const auto & cr = chunks[n];
-                            SLT_INF(slot, "kv_offload:   chunk %zu range [%d,%d)\n", n, cr.first, cr.second);
+                            // Collect every hole overlap of this chunk first (ohi
+                            // clamped to the prompt), then merge touching/
+                            // overlapping intervals: a chunk spanning a
+                            // message-split hole chain used to queue one unit per
+                            // hole (journal: 8+44+1 token fragments, one of them a
+                            // single "\n"), each wrapped in its own [Recalled
+                            // Chunk] block. One merged interval = one recall block.
+                            std::vector<std::pair<int32_t, int32_t>> ov;
                             for (const auto & hole : slot.kv_hole_ranges) {
                                 const int32_t olo = std::max(cr.first, (int32_t) hole.first);
                                 int32_t       ohi = std::min(cr.second, (int32_t) hole.second);
-                                if (ohi <= olo) {
-                                    SLT_INF(slot, "kv_offload:   chunk %zu x hole [%d,%d) - no overlap, skip\n",
-                                        n, hole.first, hole.second);
-                                    continue;
+                                if (ohi > n_prompt) ohi = n_prompt;
+                                if (ohi > olo) ov.push_back({ olo, ohi });
+                            }
+                            std::sort(ov.begin(), ov.end());
+                            // Merge ONLY on next.lo <= current.hi (touching or
+                            // overlapping). A gap between overlaps is KV-resident
+                            // text, not a hole - bridging it would re-prefill text
+                            // the model already has and duplicate it.
+                            std::vector<std::pair<int32_t, int32_t>> merged;
+                            std::vector<size_t> merged_frags;
+                            for (const auto & r : ov) {
+                                if (!merged.empty() && r.first <= merged.back().second) {
+                                    merged.back().second = std::max(merged.back().second, r.second);
+                                    merged_frags.back() += 1;
+                                } else {
+                                    merged.push_back(r);
+                                    merged_frags.push_back(1);
                                 }
-                                if (ohi > n_prompt) {
-                                    SLT_INF(slot, "kv_offload:   chunk %zu x hole [%d,%d) - ohi clamped to prompt (%d)\n",
-                                        n, hole.first, hole.second, n_prompt);
-                                    ohi = n_prompt;
-                                }
-                                if (ohi <= olo) {
-                                    SLT_INF(slot, "kv_offload:   chunk %zu x hole [%d,%d) - no overlap after clamp, skip\n",
-                                        n, hole.first, hole.second);
-                                    continue;
-                                }
+                            }
+                            int32_t ov_tokens = 0;
+                            for (const auto & r : merged) ov_tokens += r.second - r.first;
+                            SLT_INF(slot, "kv_offload:   chunk %zu [%d,%d) overlap fragments=%zu merged=%zu tokens=%d\n",
+                                n, cr.first, cr.second, ov.size(), merged.size(), ov_tokens);
+                            for (size_t mi = 0; mi < merged.size(); ++mi) {
+                                const auto & r = merged[mi];
                                 // item 2-2: subtract the already-recalled parts
                                 // (committed ranges + units queued in this pass)
                                 // and queue only the remainder, so a partial
                                 // overlap does not lose the new part.
-                                std::vector<std::pair<int32_t, int32_t>> rem = { { olo, ohi } };
+                                std::vector<std::pair<int32_t, int32_t>> rem = { r };
                                 for (const auto & rr : slot.da_recalled_ranges) {
                                     da_subtract_range(rem, rr.first, rr.second);
                                 }
@@ -6286,24 +6303,24 @@ private:
                                 }
                                 if (rem.empty()) {
                                     SLT_WRN_DBG(slot, "kv_offload: holed chunk %zu overlap [%d,%d) already recalled this request - skipping (dedup)\n",
-                                            n, olo, ohi);
+                                            n, r.first, r.second);
                                     continue;
                                 }
                                 llama_tokens toks;
-                                for (const auto & r : rem) {
-                                    for (int32_t p = r.first; p < r.second; ++p) {
+                                for (const auto & rp : rem) {
+                                    for (int32_t p = rp.first; p < rp.second; ++p) {
                                         toks.push_back(slot.prompt.tokens[p]);
                                     }
                                 }
                                 if (toks.empty()) continue;
-                                SLT_INF(slot, "kv_offload: focus on holed chunk %zu - re-prefilling %d token(s) at [%d,%d)\n",
-                                        n, (int) toks.size(), olo, ohi);
-                                // item 6/2-3: one unit per evicted overlap (wrapped individually in
+                                SLT_INF(slot, "kv_offload: focus on holed chunk %zu - re-prefilling %d token(s) at [%d,%d) (%zu fragment(s) merged)\n",
+                                        n, (int) toks.size(), r.first, r.second, merged_frags[mi]);
+                                // item 6/2-3: one unit per merged overlap (wrapped individually in
                                 // kv_offload_refill). The dedup key (range) is committed to
                                 // da_recalled_ranges only on success.
                                 da_refill_unit u;
                                 u.toks = std::move(toks);
-                                u.range = { olo, ohi };
+                                u.range = r;
                                 slot.da_pending_refill.push_back(std::move(u));
                                 did_refill = true;
                             }
