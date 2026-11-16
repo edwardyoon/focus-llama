@@ -3057,6 +3057,9 @@ private:
                 const std::string & g = slot.generated.text;
                 const size_t E = g.size();
 
+                // close > open is the derail signature (a headless closing
+                // tail). open > close (the model mentioning the tags as text)
+                // is NOT a symptom - counting it flagged ~52% of turns.
                 const bool unbalanced =
                     dbg_count(g, "<tool_call>", E) != dbg_count(g, "</tool_call>", E) ||
                     dbg_count(g, "<function=", E) != dbg_count(g, "</function>", E) ||
@@ -6704,6 +6707,23 @@ private:
             if (restricting && (in_tool || in_param)) {
                 SLT_INF(slot, "da_tag: type=%d IGNORED inside tool call (in_tool=%d in_param=%d) n_gen=%d mode=%d - tag consumed, mode unchanged\n",
                         tag.type, in_tool, in_param, (int) slot.stats.n_gen, (int) slot.da_mode);
+                continue;
+            }
+
+            // <local> block: the model emits <local> from learned habit even
+            // after the prompt txt is fixed, and the mode transition would
+            // still run and pollute the experiment. Ignore it: the tag is
+            // already erased (not in the output) and the mode is left
+            // unchanged. </local> (type 3) is NOT ignored - no slot is ever
+            // in LOCAL state, so its da_set_mode(GLOBAL) is a no-op anyway.
+            // Default on; FOCUS_DA_NO_LOCAL=0 disables it for A/B comparison.
+            static const bool da_no_local = []() {
+                const char * e = getenv("FOCUS_DA_NO_LOCAL");
+                return !e || atoi(e) != 0;
+            }();
+            if (tag.type == 1 && da_no_local) {
+                SLT_INF(slot, "da_tag: type=1 (<local>) IGNORED - mode unchanged n_gen=%d mode=%d\n",
+                        (int) slot.stats.n_gen, (int) slot.da_mode);
                 continue;
             }
 
