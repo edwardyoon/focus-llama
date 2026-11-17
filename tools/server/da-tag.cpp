@@ -42,6 +42,7 @@ focus_parse_t parse_focus_tag(const std::string & s, size_t from,
         return FOCUS_TAG_NONE;
     }
     while (i < n && std::isspace((unsigned char) s[i])) i++;
+    if (i < n && s[i] == '>') { end = i + 1; return FOCUS_TAG_DONE; }  // <focus>: consume-only, no numbers
     // magic_chunks - a partial name at end-of-string is still open
     if (n - i < 12) {
         if (s.compare(i, n - i, attr, n - i) != 0) return FOCUS_TAG_NONE;
@@ -62,7 +63,7 @@ focus_parse_t parse_focus_tag(const std::string & s, size_t from,
     }
     if (i == n) return FOCUS_TAG_OPEN;
     bool closed  = false;
-    bool has_num = false;
+    bool junk    = false;
     while (i < n) {
         unsigned char c = (unsigned char) s[i];
         if (std::isdigit(c)) {
@@ -73,9 +74,9 @@ focus_parse_t parse_focus_tag(const std::string & s, size_t from,
                 c = (i < n) ? (unsigned char) s[i] : 0;
             } while (std::isdigit(c));
             nums.push_back(v);
-            has_num = true;
             continue;
         }
+        if (junk && c == '\n') return FOCUS_TAG_NONE;  // a broken value must not eat the next line
         if (c == ',' || std::isspace(c)) {
             i++;
             continue;
@@ -85,11 +86,14 @@ focus_parse_t parse_focus_tag(const std::string & s, size_t from,
             i++;
             continue;
         }
-        if (c == '>' && has_num) {
+        if (c == '>') {
+            if (junk) nums.clear();  // discard: "3-5" must not parse as {3,5}
             end = i + 1;
             return FOCUS_TAG_DONE;
         }
-        return FOCUS_TAG_NONE;
+        junk = true;
+        i++;
+        continue;
     }
     return FOCUS_TAG_OPEN;
 }

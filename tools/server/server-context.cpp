@@ -2640,6 +2640,15 @@ private:
         return true;
     }
 
+    static size_t tool_closing_hold(const std::string & s) {
+        static const std::string cls[] = {"</tool_call>","</function>","</parameter>"};
+        for (const auto & c : cls)
+            for (size_t k = std::min(s.size(), c.size()-1); k > 0; k--)
+                if (s.compare(s.size()-k, k, c, 0, k) == 0) return k;
+        return 0;
+    }
+    // da_hold = std::max(da_tag_hold_len(...), tool_closing_hold(unsent));
+
     bool process_token(completion_token_output & result, server_slot & slot) {
         // L4: per-token trace right after a tag closed (both the spec-accept
         // and the single-token paths funnel through here)
@@ -2662,6 +2671,7 @@ private:
         // complete tag; on tag close the removals run exactly once, mid-decode
         // (no-op unless the client sent da_chunks, and after it has applied).
         apply_da_tag(slot);
+        scrub_headless_tool_closings(slot);
 
         if (slot.task->params.return_tokens) {
             slot.generated_tokens.push_back(result.tok);
@@ -2694,19 +2704,27 @@ private:
                 // no send the stop word in the response. DA tag holdback: a
                 // trailing fragment that could still grow into a control tag
                 // stays unsent until it closes (apply_da_tag then erases it)
-                // or is proven to be plain text; an EOG token flushes it.
+                // or is proven to be plain text. An EOG token drops the held
+                // fragment instead of flushing it: generation is over, so it
+                // can no longer grow into a tag - a partial tag must not leak
+                // to the client. The resize removes it from generated_text as
+                // well, so non-streaming responses lose it too.
                 // Recomputed here because the stop-word erase above may have
                 // removed the previously held fragment.
+                const bool da_eog = llama_vocab_is_eog(vocab, result.tok);
+                const std::string unsent = slot.generated_text.substr(
+                        std::min(slot.n_sent_text, slot.generated_text.size()));
                 size_t da_hold = 0;
-                if (!slot.task->params.da_chunks.empty() &&
-                        !llama_vocab_is_eog(vocab, result.tok)) {
-                    // clamp like the stop-word path above: a stop-word erase
-                    // can truncate generated_text past n_sent_text
-                    da_hold = da_tag_hold_len(slot.generated_text.substr(
-                            std::min(slot.n_sent_text, slot.generated_text.size())),
-                            slot.da_mode);
+                if (!slot.task->params.da_chunks.empty()) {
+                    da_hold = da_tag_hold_len(unsent, slot.da_mode);
                 }
-                const size_t send_end = slot.generated_text.size() - da_hold;
+                // tool-call 닫힘 홀드백: DA 활성 여부와 무관하게 항상 적용
+                const size_t hold = std::max(da_hold, tool_closing_hold(unsent));
+                if (da_eog && hold > 0) {
+                    slot.generated_text.resize(slot.generated_text.size() - hold);
+                }
+                const size_t send_end = slot.generated_text.size() - (da_eog ? 0 : hold);
+
                 result.text_to_send = slot.generated_text.substr(pos, send_end - pos);
                 slot.n_sent_text += result.text_to_send.size();
                 // add the token to slot queue and cache
@@ -2978,6 +2996,31 @@ private:
         }
 
         queue_results.send(std::move(res));
+    }
+
+    // headless tool-call closing scrubber (DA erase와 동일 패턴)
+    static void scrub_headless_tool_closings(server_slot & slot) {
+        static const std::pair<std::string,std::string> fam[] = {
+            {"<tool_call>", "</tool_call>"},
+            {"<function=",  "</function>"},
+            {"<parameter=", "</parameter>"},
+        };
+        std::string & g = slot.generated_text;
+        for (const auto & [op, cl] : fam) {
+            int bal = 0; size_t i = 0;
+            while (i < g.size()) {
+                if (g.compare(i, op.size(), op) == 0) { bal++; i += op.size(); continue; }
+                if (g.compare(i, cl.size(), cl) == 0) {
+                    if (bal > 0) { bal--; i += cl.size(); continue; }  // 정상 닫힘
+                    const size_t len = cl.size();
+                    g.erase(i, len);                                    // headless → 제거
+                    if (slot.n_sent_text > i)
+                        slot.n_sent_text = (slot.n_sent_text >= i+len) ? slot.n_sent_text-len : i;
+                    continue;
+                }
+                i++;
+            }
+        }
     }
 
     void send_final_response(server_slot & slot) {
@@ -6046,7 +6089,21 @@ private:
                 // arm the per-token trace (L4) for the next 24 tokens
                 slot.da_trace_left = 24;
             }
-            
+
+            // In-tool gate (before any erase / mode handling): a tag that
+            // closes while a tool-call or parameter is still open sits inside
+            // the JSON the model is emitting - it is data, not a control
+            // signal. Erasing it would corrupt the tool call (the client
+            // already has the opening, and the text offsets would shift).
+            // Preserve the text, leave the mode unchanged for all types 0~5,
+            // and advance the scan past the tag so it is never re-scanned.
+            if (in_tool || in_param) {
+                SLT_INF(slot, "da_tag: type=%d SKIPPED inside tool call (in_tool=%d in_param=%d) n_gen=%d mode=%d - text preserved, mode unchanged, scan advanced\n",
+                        tag.type, in_tool, in_param, (int) slot.stats.n_gen, (int) slot.da_mode);
+                slot.da_tag_scan_pos = tag.end;
+                continue;
+            }
+
             // consume the tag: erase it from the user-visible text and
             // restart the scan where the tag began (nothing complete can sit
             // before it - the scanner returns the earliest tag)
@@ -6067,23 +6124,6 @@ private:
                         : tag.start;
             }
             slot.da_tag_scan_pos = tag.start;
-
-            // In-tool gate: a restricting tag (<focus>/<local>) that closes
-            // inside an open tool-call / parameter would flip the mode (B
-            // switch / A removal / refill queue) while the tool-call opening
-            // is still in the prompt, so the opening drops out of attention
-            // and the model only emits the closing tail (headless tail).
-            // Ignore it: the tag is already erased (not in the output) and the
-            // mode is left unchanged. Non-restricting tags (</focus>,
-            // </local>, <global>, type 2-5) must ALWAYS be processed - they
-            // are the only way back to GLOBAL, so ignoring them would trap
-            // the slot in FOCUS/LOCAL.
-            const bool restricting = (tag.type == 0 || tag.type == 1);
-            if (restricting && (in_tool || in_param)) {
-                SLT_INF(slot, "da_tag: type=%d IGNORED inside tool call (in_tool=%d in_param=%d) n_gen=%d mode=%d - tag consumed, mode unchanged\n",
-                        tag.type, in_tool, in_param, (int) slot.stats.n_gen, (int) slot.da_mode);
-                continue;
-            }
 
             // <local> block: the model emits <local> from learned habit even
             // after the prompt txt is fixed, and the mode transition would

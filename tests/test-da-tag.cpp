@@ -174,7 +174,7 @@ int main() {
     // --- G2 variants: the hold covers every in-progress form ---------------
     {
         CHECK(da_tag_prefix("<focus magic_chunks='1") == true);
-        CHECK(da_tag_prefix("<focus magic_chunks='1\"") == false);  // wrong closing quote
+        CHECK(da_tag_prefix("<focus magic_chunks='1\"") == true);  // wrong closing quote: junk now holds (consume + discard on '>')
         CHECK(da_tag_prefix("<focus  magic_chunks=\"1") == true);
         CHECK(da_tag_prefix("<focus\nmagic_chunks=\"1") == true);
         CHECK(da_tag_prefix("<focus magic_chunks=\"1\" ") == true);  // waiting for '>'
