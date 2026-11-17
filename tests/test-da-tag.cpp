@@ -140,6 +140,56 @@ int main() {
         CHECK(da_tag_start_allowed("ab\tc", 3, G) == false);  // tab is not a line start
     }
 
+    // --- G2 variants: single quotes / whitespace - the scanner consumes
+    //     them, so the hold must cover them too (the old exact-head check
+    //     released the hold, leaking the tag to the client before the
+    //     scanner could consume it)
+    {
+        da_tag_t t = scan_da_tag("<focus magic_chunks='1'>", 0, G);
+        CHECK(t.type == 0);
+        CHECK(t.keep_nums.size() == 1 && t.keep_nums[0] == 1);
+        CHECK(t.end == 24);
+    }
+    {
+        da_tag_t t = scan_da_tag("<focus  magic_chunks=\"1\">", 0, G);
+        CHECK(t.type == 0);
+        CHECK(t.end == 25);
+    }
+    {
+        da_tag_t t = scan_da_tag("<focus\nmagic_chunks=\"1\">", 0, G);
+        CHECK(t.type == 0);
+        CHECK(t.end == 24);
+    }
+    {
+        da_tag_t t = scan_da_tag("<focus magic_chunks=1>", 0, G);
+        CHECK(t.type == 0);
+        CHECK(t.keep_nums.size() == 1 && t.keep_nums[0] == 1);
+    }
+    {
+        // a longer tag name is data, not a focus tag
+        da_tag_t t = scan_da_tag("<focusx magic_chunks=\"1\">", 0, G);
+        CHECK(t.type < 0);
+    }
+
+    // --- G2 variants: the hold covers every in-progress form ---------------
+    {
+        CHECK(da_tag_prefix("<focus magic_chunks='1") == true);
+        CHECK(da_tag_prefix("<focus magic_chunks='1\"") == true);  // wrong closing quote: junk now holds (consume + discard on '>')
+        CHECK(da_tag_prefix("<focus  magic_chunks=\"1") == true);
+        CHECK(da_tag_prefix("<focus\nmagic_chunks=\"1") == true);
+        CHECK(da_tag_prefix("<focus magic_chunks=\"1\" ") == true);  // waiting for '>'
+    }
+    {
+        // feed the single-quote variant one char at a time
+        const std::string full = "<focus magic_chunks='12'>";
+        for (size_t n = 1; n < full.size(); n++) {
+            const std::string frag = full.substr(0, n);
+            const size_t hold = da_tag_hold_len(frag, G);
+            CHECK(hold == frag.size());
+        }
+        CHECK(da_tag_hold_len(full, G) == 0);
+    }
+
     if (n_failed) {
         std::printf("test-da-tag: %d check(s) FAILED\n", n_failed);
         return 1;
