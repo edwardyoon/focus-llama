@@ -3054,7 +3054,7 @@ private:
             // 14:21 derailment signature (a headless </parameter></function>
             // tail that no client can parse as a functionCall)
             {
-                const std::string & g = slot.generated_text;
+                const std::string & g = slot.generated.text;
                 const size_t E = g.size();
 
                 const bool unbalanced =
@@ -5751,7 +5751,7 @@ private:
 
         // DA: push the n_kv_max bound for this window before the decode
         // (no-op while the value is unchanged; 0 = dense)
-        update_da_n_kv_max(off, batch_view.n_tokens);
+        update_da_n_kv_max(off, batch.view.size());
 
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
@@ -5919,8 +5919,8 @@ private:
             llama_pos max_pos = -1;
             for (int32_t i = 0; i < n_processed; ++i) {
                 const auto & t = batch.tokens[i];
-                if (t.id_slot == slot.kv_seq() && t.is_prompt && t.pos > max_pos) {
-                    max_pos = t.pos;
+                if (t.id_slot == slot.kv_seq() && t.is_prompt && t.pos[0] > max_pos) {
+                    max_pos = t.pos[0];
                 }
             }
             if (max_pos < 0) {
@@ -6628,7 +6628,7 @@ private:
                 const std::string pr_open  = std::string("<")  + "parameter=";
                 const std::string pr_close = std::string("</") + "parameter>";
 
-                const std::string & g = slot.generated_text;
+                const std::string & g = slot.generated.text;
                 const size_t b0 = tag.start > 240 ? tag.start - 240 : 0;
                 const int in_tool  = dbg_count(g, tc_open,  tag.start) > dbg_count(g, tc_close, tag.start) ? 1 : 0;
                 const int in_param = dbg_count(g, pr_open,  tag.start) > dbg_count(g, pr_close, tag.start) ? 1 : 0;
@@ -7942,17 +7942,16 @@ static bool kv_offload_refill(llama_context * ctx, server_slot & slot, const lla
                 *out_last_idx = m - 1;
             }
 
-            llama_batch batch = llama_batch_init(m, 0, 1);
+            common_batch batch(ctx);
 
-            // common_batch_add: manages n_tokens (init leaves it 0) and keeps
-            // seq_id[i] pointing at the malloc'd arrays (llama_batch_free
-            // requires that - overwriting it with a foreign pointer aborts).
+            // common_batch::add appends to the token mirror and the underlying
+            // llama_batch_ext; the batch owns its memory (no manual free).
             for (int32_t i = 0; i < m; i++) {
-                common_batch_add(batch, wrapped_toks[off + i], n_full + off + i,
-                                  { seq }, (off + i == n - 1));
+                batch.add(wrapped_toks[off + i], n_full + off + i, seq,
+                          (off + i == n - 1));
             }
 
-            int ret = llama_decode(ctx, batch);
+            int ret = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
 
             // Keep the draft (MTP) context in sync with the refill: a
             // target-only decode leaves the draft KV empty over the
@@ -7964,8 +7963,6 @@ static bool kv_offload_refill(llama_context * ctx, server_slot & slot, const lla
             if (ret == 0 && slot.spec != nullptr) {
                 spec_ok = common_speculative_process(slot.spec, batch);
             }
-
-            llama_batch_free(batch);
 
             SRV_INF("kv_offload: refill sub-batch [%d,%d) of %d token(s) ret=%d\n",
                     off, off + m, n, ret);
@@ -8708,6 +8705,23 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                 }
             }
 
+            // message delimiters for checkpointing (fork feature; the b12412
+            // rebase dropped the function-level declaration, re-parse per task)
+            common_chat_msg_delimiters delimiters;
+            {
+                const json delims = json_value(data, "message_delimiters", json::array());
+                if (delims.is_array()) {
+                    delimiters.delimiters.reserve(delims.size());
+                    for (const auto & d : delims) {
+                        if (!d.is_object()) continue;
+                        delimiters.delimiters.push_back({
+                            common_chat_role_from_string(d.value("role", std::string())),
+                            d.value("delimiter", std::string()),
+                        });
+                    }
+                }
+                delimiters.tokenize(ctx_server.vocab);
+            }
             task.params.message_spans = task.tokens.find_message_spans(delimiters);
 
             task.id_slot = json_value(data, "id_slot", -1);
