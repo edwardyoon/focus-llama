@@ -550,9 +550,6 @@ struct llama_file::impl {
         // stage through a bounded buffer, so that a large tensor is not held in memory twice while it loads
         const size_t buffer_size = std::min<size_t>(bytes_to_read, LLAMA_DIRECT_IO_BUFFER_SIZE);
 
-        // stage through a bounded buffer, so that a large tensor is not held in memory twice while it loads
-        const size_t buffer_size = std::min<size_t>(bytes_to_read, LLAMA_DIRECT_IO_BUFFER_SIZE);
-
         void * raw_buffer = nullptr;
         int ret = posix_memalign(&raw_buffer, alignment, buffer_size);
         if (ret != 0) {
