@@ -294,7 +294,7 @@ static int64_t kv_min_rows(int64_t n_kv_max, int pct) {
 
 // First failed condition of the MMA f16 sparse gate (nullptr = all pass).
 // Shared by the gate and the journal so the dense fallback carries its reason.
-const char * ggml_cuda_flash_attn_ext_mma_f16_sparse_fail(ggml_backend_cuda_context & ctx, const ggml_tensor * dst) {
+const char * ggml_cuda_flash_attn_ext_mma_f16_sparse_fail(const int cc, const ggml_tensor * dst, const int ncols1, const int ncols2) {
     const ggml_tensor * Q    = dst->src[0];
     const ggml_tensor * K    = dst->src[1];
     const ggml_tensor * V    = dst->src[2];
@@ -307,16 +307,22 @@ const char * ggml_cuda_flash_attn_ext_mma_f16_sparse_fail(ggml_backend_cuda_cont
 
     // On CDNA only the DKQ=576 kernel variant with ncols2=16 is compiled with sparse support.
     if (amd_mfma_available(cc) && !ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(int(Q->ne[0]), int(V->ne[0]), 1, 16)) {
-        return false;
+        return "no CDNA sparse kernel for this shape";
     }
 
     const int32_t n_kv_max = ggml_get_op_params_i32(dst, 4);
 
+    // the dense kernel handles up to 64/ncols2 queries per K/V pass, the single-query gather has to beat that
+    const int64_t n_gather = (ncols1 == 1 ? std::min<int64_t>(Q->ne[1], 64/ncols2) : ncols1) * (int64_t) n_kv_max;
+
     if (n_kv_max <= 0) {
         return "n_kv_max=0";
     }
-    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || !turing_mma_available(cc)) {
+    if (!((GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc)) || amd_mfma_available(cc))) {
         return "no NVIDIA tensor cores";
+    }
+    if (dst->src[5] != nullptr) {
+        return "kv_rows";
     }
     if (mask == nullptr) {
         return "no mask";
@@ -337,25 +343,26 @@ const char * ggml_cuda_flash_attn_ext_mma_f16_sparse_fail(ggml_backend_cuda_cont
         return "mask->ne[2]!=1";
     }
     const int     kv_pct = sparse_gate_threshold_pct();
-    const int64_t kv_min = kv_min_rows(n_kv_max, kv_pct);
+    const int64_t n_thr  = GGML_CUDA_CC_IS_NVIDIA(cc) ? n_gather : n_kv_max;
+    const int64_t kv_min = kv_min_rows(n_thr, kv_pct);
     if (K->ne[1] < std::max<int64_t>(4096, kv_min)) {
         static thread_local char buf[128];
         // Omit the live K->ne[1] (it grows per step, which would defeat the
         // journal's reason-based dedup); it is already in the DENSE log prefix.
-        snprintf(buf, sizeof(buf), "KV < max(4096, min_kv(%d,%d%%)=%lld)",
-                 n_kv_max, kv_pct, (long long) kv_min);
+        snprintf(buf, sizeof(buf), "KV < max(4096, min_kv(%lld,%d%%)=%lld)",
+                 (long long) n_thr, kv_pct, (long long) kv_min);
         return buf;
     }
     return nullptr;
 }
 
-bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
-    GGML_UNUSED_VARS(ctx, dst);
+bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_tensor * dst, const int ncols1, const int ncols2) {
+#ifdef GGML_USE_MUSA
+    GGML_UNUSED_VARS(cc, dst, ncols1, ncols2);
     return false;
 #else
-    return ggml_cuda_flash_attn_ext_mma_f16_sparse_fail(ctx, dst) == nullptr;
-#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    return ggml_cuda_flash_attn_ext_mma_f16_sparse_fail(cc, dst, ncols1, ncols2) == nullptr;
+#endif // !defined(GGML_USE_MUSA)
 }
 
 // First failed condition of the VEC sparse gate (nullptr = all pass).
@@ -438,7 +445,7 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_con
     if constexpr (ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(DKQ, DV, 1, ncols2)) {
         // a sparse variant at the full tile width gathers the union of its queries once, prefer it for large batches
         constexpr bool has_wide_sparse = ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(DKQ, DV, 64/ncols2, ncols2);
-        if (!(has_wide_sparse && Q->ne[1] > 32/ncols2) && ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(cc, dst)) {
+        if (!(has_wide_sparse && Q->ne[1] > 32/ncols2) && ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(cc, dst, 1, ncols2)) {
             ggml_cuda_flash_attn_ext_mma_f16_case<DKQ, DV, 1, ncols2>(ctx, dst);
             return;
         }
@@ -655,7 +662,7 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
 
             GGML_ASSERT(Q->ne[2] % K->ne[2] == 0);
             const int gqa_ratio = Q->ne[2] / K->ne[2];
-            if (amd_mfma_available(cc) && ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(cc, dst)) {
+            if (amd_mfma_available(cc) && ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(cc, dst, 1, 16)) {
                 ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<576, 512, 16>(ctx, dst);
             } else if (gqa_ratio == 20 && GGML_CUDA_CC_IS_NVIDIA(cc)) { // GLM 4.7 Flash
                 if (cc >= GGML_CUDA_CC_DGX_SPARK) {
@@ -969,7 +976,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                 // the sparse gather exists only in the MMA kernel: (DKQ, DV, 1, 8) with GQA > 4
                 const bool sparse_decode = gqa_opt_applies && gqa_ratio > 4 &&
                     ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(K->ne[0], V->ne[0], 1, 8) &&
-                    ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(cc, dst);
+                    ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(cc, dst, 1, 8);
                 if (!sparse_decode && cc >= GGML_CUDA_CC_ADA_LOVELACE && Q->ne[1] == 1 && Q->ne[3] == 1 &&
                         !(gqa_ratio > 4 && (Q->ne[0] >= 256 || K->ne[1] >= 8192))) {
                     return BEST_FATTN_KERNEL_VEC;
@@ -1009,7 +1016,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
     // On CDNA, the sparse MMA kernel is used for DKQ=576 regardless of the head size heuristics.
-    if (amd_mfma_available(cc) && ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(cc, dst)) {
+    if (amd_mfma_available(cc) && ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(cc, dst, 1, 16)) {
         return BEST_FATTN_KERNEL_MMA_F16;
     }
 
