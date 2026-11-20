@@ -9551,8 +9551,8 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                             }
                             auto mod_pos = [&](size_t p) -> size_t {
                                 size_t shift = 0;
-                                for (size_t i = 0; i < header_orig.size(); i++) {
-                                    if (header_orig[i] <= p) shift += header_len((int32_t) (i + 1));
+                                for (size_t i = 0; i < layout.header_pos.size(); i++) {
+                                    if (layout.header_pos[i] <= p) shift += header_len((int32_t) (i + 1));
                                 }
                                 return p + shift;
                             };
