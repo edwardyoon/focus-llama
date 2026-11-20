@@ -66,15 +66,6 @@
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
-// FOCUS_SPARSE_DEBUG: the sparse-attention debug journal flag (fattn.cu's
-// DENSE decision journal uses the same one). The per-sub-batch kv-probe /
-// kv-offload-holes progress lines are gated on it: on a large prefill they
-// fire once per prompt sub-batch and flood the log.
-static bool focus_sparse_debug() {
-    static const bool enabled = getenv("FOCUS_SPARSE_DEBUG") != nullptr;
-    return enabled;
-}
-
 // Upper bound on the generation tail (in KV cells) that the decoupled-KV
 // reject gate and eviction clamp reserve. Reserving the full request n_predict
 // (often 32768) makes resident + recall + gen exceed the buffer for most real
@@ -3587,8 +3578,8 @@ private:
         if (!slot.prompt.checkpoints.empty() &&
                 slot.prompt.checkpoints.back()->n_tokens == slot.prompt.n_tokens() - n_tokens_cur &&
                 slot.prompt.checkpoints.back()->pos_max == pos_max) {
-            // adopt the checkpoint so the min-step eviction below does not erase it
-            slot.prompt.checkpoints.back()->id_task = id_task;
+            // b12412 checkpoints are immutable and shared with the prompt cache, so the
+            // fork's in-place id_task adoption is not possible; skip the duplicate instead
             return;
         }
 
@@ -8389,7 +8380,7 @@ static bool kv_offload_refill(llama_context * ctx, server_slot & slot, const std
             }
             if (n_u != n_inner) n_mismatch += std::abs(n_u - n_inner); // length delta
             SRV_INF("kv_offload R1: slot=%d task=%d unit=%zu n_raw=%d n_inner=%d n_mismatch=%d first_mismatch=%d sanitize_changed=%d head_raw=[%s] head_inner=[%s] tail_raw=[%s] tail_inner=[%s]\n",
-                    (int) slot.id, (int) (slot.task ? slot.task->id : -1), (int) u,
+                    (int) slot.id, (int) (slot.task ? slot.task->id : -1), u,
                     n_u, n_inner, n_mismatch, first_mismatch, (int) sanitize_changed,
                     head8(toks).c_str(), head8(inner_toks).c_str(),
                     tail8(toks).c_str(), tail8(inner_toks).c_str());
@@ -8474,7 +8465,7 @@ static bool kv_offload_refill(llama_context * ctx, server_slot & slot, const std
                     "pre tc=%d/%d fn=%d/%d pr=%d/%d headless=%d ends_open=%d | "
                     "post tc=%d/%d fn=%d/%d pr=%d/%d headless=%d ends_open=%d "
                     "stripped=%d n_pre=%zu n_post=%zu tail='%s'\n",
-                    (int) slot.id, (int) (slot.task ? slot.task->id : -1), (int) u,
+                    (int) slot.id, (int) (slot.task ? slot.task->id : -1), u,
                     a.o[0], a.c[0], a.o[1], a.c[1], a.o[2], a.c[2], (int) a.headless, (int) a.ends_open,
                     b.o[0], b.c[0], b.o[1], b.c[1], b.o[2], b.c[2], (int) b.headless, (int) b.ends_open,
                     (int) (pre != raw_text), pre.size(), T,
