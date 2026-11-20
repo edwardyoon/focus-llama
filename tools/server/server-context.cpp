@@ -9596,24 +9596,11 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                 }
             }
 
-            // message delimiters for checkpointing (fork feature; the b12412
-            // rebase dropped the function-level declaration, re-parse per task)
-            common_chat_msg_delimiters delimiters;
-            {
-                const json delims = json_value(data, "message_delimiters", json::array());
-                if (delims.is_array()) {
-                    delimiters.delimiters.reserve(delims.size());
-                    for (const auto & d : delims) {
-                        if (!d.is_object()) continue;
-                        delimiters.delimiters.push_back({
-                            common_chat_role_from_string(d.value("role", std::string())),
-                            d.value("delimiter", std::string()),
-                        });
-                    }
-                }
-                delimiters.tokenize(ctx_server.vocab);
-            }
-            task.params.message_spans = task.tokens.find_message_spans(delimiters);
+            // message_spans is set by apply_chat_session() above from the
+            // session's message_delimiters (b12412 session model). Re-parsing
+            // data["message_delimiters"] here is a no-op on b12412 (the field is
+            // no longer populated into the request JSON) and would overwrite the
+            // correct spans with empty ones, dropping user-start checkpoints.
 
             task.id_slot = json_value(data, "id_slot", -1);
             sse_ping_interval = task.params.sse_ping_interval;
