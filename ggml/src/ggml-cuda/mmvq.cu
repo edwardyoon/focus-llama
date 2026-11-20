@@ -589,7 +589,7 @@ static constexpr __host__ __device__ int calc_max_nwarps(
         return generic;
     }
     if (table_id == MMVQ_PARAMETERS_ORIN) {
-        return calc_nwarps(type, ncols_dst, MMVQ_PARAMETERS_GENERIC);
+        return calc_max_nwarps(type, ncols_dst, MMVQ_PARAMETERS_GENERIC);
     }
     return 1;
 }
