@@ -4500,28 +4500,18 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_tensor * sinks,
             float     kq_scale,
             int       il) const {
-    const bool is_swa = hparams.is_swa(il);
-
-    auto * inp_attn = inp->get_attn();
-
-    const auto & attn_mask = is_swa ? inp_attn->self_attn_mask_swa : inp_attn->self_attn_mask;
-
     // TODO: support kv_rows - fill the distances over the kv_rows cell lists and pass the rows to build_attn_mha,
     //       needs a kv_rows flash attention with a per-head mask (CUDA has none)
-    GGML_ASSERT(attn_mask.rows == nullptr);
 
-    // a mask per head, in the dense layout of the input mask, which flash attention takes in F16
-    ggml_tensor * kq_mask = attn_mask.raw;
-    if (kq_mask->type != GGML_TYPE_F32) {
-        kq_mask = ggml_cast(ctx0, kq_mask, GGML_TYPE_F32);
-    }
-    kq_mask = ggml_add(ctx0, kq_b, kq_mask);
-    if (cparams.flash_attn) {
+    // kq_b is the fused relative bias + causal mask (ggml_rel_bias_mask), already in the per-head FA layout;
+    // only the FA dtype cast remains
+    ggml_tensor * kq_mask = kq_b;
+    if (cparams.flash_attn && kq_mask->type != GGML_TYPE_F16) {
         kq_mask = ggml_cast(ctx0, kq_mask, GGML_TYPE_F16);
     }
     cb(kq_mask, "kq_mask_rel_pos", il);
 
-    return build_attn_iswa_impl(*this, inp_attn, wo, wo_b, wo_s, q_cur, k_cur, v_cur, nullptr, kq_mask, nullptr, sinks, nullptr, kq_scale, il);
+    return build_attn_iswa_impl(*this, inp->get_attn(), wo, wo_b, wo_s, q_cur, k_cur, v_cur, nullptr, kq_mask, nullptr, sinks, nullptr, kq_scale, il);
 }
 
 void llm_graph_context::build_dense_out(

@@ -5515,6 +5515,68 @@ void ggml_compute_forward_get_rows(
     //}
 }
 
+// ggml_compute_forward_rel_bias_mask
+
+void ggml_compute_forward_rel_bias_mask(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    (void) params;
+
+    const ggml_tensor * table   = dst->src[0];  // F32 {n_head, n_rel, nt, 1}
+    const ggml_tensor * rel_pos = dst->src[1];  // I32 {n_kv, nt, 1, 1}
+    const ggml_tensor * mask    = dst->src[2];  // F16|F32 {n_kv, nt/ns, 1, ns}
+
+    GGML_ASSERT(ggml_is_contiguous(table));
+    GGML_ASSERT(ggml_is_contiguous(rel_pos));
+    GGML_ASSERT(ggml_is_contiguous(mask));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    const int64_t n_kv   = dst->ne[0];
+    const int64_t n_i    = dst->ne[1];
+    const int64_t n_head = dst->ne[2];
+    const int64_t ns     = dst->ne[3];
+
+    const int64_t nt    = rel_pos->ne[1];
+    const int64_t n_rel = table->ne[1];
+
+    // ggml contiguous layout (dim 0 fastest), so for ne = {n0,n1,n2,n3}:
+    //   off(i0,i1,i2,i3) = i0 + i1*n0 + i2*(n0*n1) + i3*(n0*n1*n2)
+    //   table   {n_head,n_rel,nt,1}:  off(h,d,t)   = h + d*n_head + t*(n_head*n_rel)
+    //   rel_pos {n_kv,nt,1,1}:        off(j,t)     = j + t*n_kv
+    //   mask    {n_kv,n_i,1,ns}:      off(j,i,s)   = j + i*n_kv + s*(n_kv*n_i)
+    //   dst     {n_kv,n_i,n_head,ns}: off(j,i,h,s) = j + i*n_kv + h*(n_kv*n_i) + s*(n_kv*n_i*n_head)
+    const float   * table_d   = (const float   *) table->data;
+    const int32_t * rel_pos_d = (const int32_t *) rel_pos->data;
+    const char    * mask_d    = (const char    *) mask->data;
+    char          * dst_d     = (char          *) dst->data;
+
+    for (int64_t s = 0; s < ns; s++) {
+        for (int64_t h = 0; h < n_head; h++) {
+            for (int64_t i = 0; i < n_i; i++) {
+                for (int64_t j = 0; j < n_kv; j++) {
+                    // reshape_4d({n_head,n_kv,nt,1} -> {n_head,n_kv,ni,ns}) keeps nb[0] and re-derives the
+                    // rest, so the token index is t = i + s*n_i (not i*ns + s)
+                    const int64_t t = i + s*n_i;
+                    const int32_t d = rel_pos_d[j + t*n_kv];
+                    GGML_ASSERT(d >= 0 && d < n_rel);
+                    const float bias = table_d[h + d*n_head + t*(n_head*n_rel)];
+                    const int64_t moff = j + i*n_kv + s*(n_kv*n_i);
+                    const float mval = (mask->type == GGML_TYPE_F16)
+                        ? ggml_fp16_to_fp32(((const ggml_fp16_t *) mask_d)[moff])
+                        : ((const float *) mask_d)[moff];
+                    const float val = bias + mval;
+                    const int64_t doff = j + i*n_kv + h*(n_kv*n_i) + s*(n_kv*n_i*n_head);
+                    if (dst->type == GGML_TYPE_F16) {
+                        ((ggml_fp16_t *) dst_d)[doff] = ggml_fp32_to_fp16(val);
+                    } else {
+                        ((float *) dst_d)[doff] = val;
+                    }
+                }
+            }
+        }
+    }
+}
+
 template<typename src_t, typename idx_t>
 static void ggml_compute_forward_set_rows_impl(
         const ggml_compute_params * params,

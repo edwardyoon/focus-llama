@@ -432,6 +432,7 @@ extern "C" {
         GGML_OP_GLU,
 
         GGML_OP_SLEEP,
+        GGML_OP_REL_BIAS_MASK,
 
         GGML_OP_COUNT,
     };
@@ -1550,6 +1551,23 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,  // data
             struct ggml_tensor  * b); // row indices
+
+    // fused: gather the relative bias table by distance and add the causal mask,
+    // output in the per-head attention mask layout. Replaces the get_rows + reshape
+    // + permute + cont + add + cast chain without materializing the intermediate
+    // n_kv x n_tokens x n_head buffer.
+    //
+    // table   F32   [n_head, n_rel, nt, 1]     - bias table (per head, distance, query token)
+    // rel_pos I32   [n_kv, nt, 1, 1]           - distance index per (kv position, query token)
+    // mask    F16|F32 [n_kv, nt/ns, 1, ns]     - causal mask (broadcast over heads)
+    //
+    // return  [n_kv, nt/ns, n_head, ns] (type of mask)
+    //         dst[j, i, h, s] = table[h, rel_pos[j, i*ns+s], i*ns+s, 0] + mask[j, i, 0, s]
+    GGML_API struct ggml_tensor * ggml_rel_bias_mask(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * table,
+            struct ggml_tensor  * rel_pos,
+            struct ggml_tensor  * mask);
 
     GGML_API struct ggml_tensor * ggml_get_rows_back(
             struct ggml_context * ctx,
