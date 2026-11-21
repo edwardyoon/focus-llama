@@ -5536,7 +5536,6 @@ void ggml_compute_forward_rel_bias_mask(
     const int64_t n_head = dst->ne[2];
     const int64_t ns     = dst->ne[3];
 
-    const int64_t nt    = rel_pos->ne[1];
     const int64_t n_rel = table->ne[1];
 
     // ggml contiguous layout (dim 0 fastest), so for ne = {n0,n1,n2,n3}:

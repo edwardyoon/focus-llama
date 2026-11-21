@@ -43,7 +43,7 @@ static __global__ void k_rel_bias_mask(
     const int32_t d = rel_pos[j + t*n_kv];
     const float bias = table[h + d*n_head + t*(n_head*n_rel)];
     const float mval = (float) mask[j + i*n_kv + s*(n_kv*n_i)];
-    dst[idx] = ggml_cuda_cast<T>(bias + mval);
+    dst[idx] = (T)(bias + mval);
 }
 
 void ggml_cuda_op_rel_bias_mask(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
