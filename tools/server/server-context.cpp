@@ -3211,6 +3211,7 @@ private:
             {"<tool_call>", "</tool_call>"},
             {"<function=",  "</function>"},
             {"<parameter=", "</parameter>"},
+            {"<invoke ", "</invoke>"},
         };
         std::string & g = slot.generated.text;
         for (const auto & [op, cl] : fam) {
