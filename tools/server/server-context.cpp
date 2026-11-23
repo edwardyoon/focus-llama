@@ -1,3 +1,8 @@
+#include "da-trace.h"
+#include "da-tag.h"
+#include "da-layout.h"
+#include "recall-sanitize.h"
+#include "sigma-strip.h"
 #include "server-context.h"
 #include <atomic>
 #include <thread>
@@ -15,6 +20,7 @@
 
 #include "build-info.h"
 #include "common.h"
+#include "http.h"
 #include "fit.h"
 #include "llama.h"
 #include "log.h"
@@ -24,16 +30,30 @@
 #include "mtmd-helper.h"
 #include "base64.hpp"
 
+#include <string>
+#include <vector>
+
 #include <algorithm>
+#include <atomic>
+#include <cctype>
+#include <cstdarg>
 #include <cstddef>
 #include <cinttypes>
+#include <ctime>
 #include <deque>
 #include <exception>
+#include <functional>
+#include <iomanip>
 #include <memory>
+#include <numeric>
 #include <filesystem>
 #include <random>
+#include <regex>
+#include <thread>
+#include <unordered_set>
 #include <utility>
 #include <fstream>
+#include <chrono>
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -45,6 +65,48 @@
 #endif
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+
+// Upper bound on the generation tail (in KV cells) that the decoupled-KV
+// reject gate and eviction clamp reserve. Reserving the full request n_predict
+// (often 32768) makes resident + recall + gen exceed the buffer for most real
+// prompts and causes spurious 400s; actual generation is far shorter. If a
+// generation does outgrow this reservation, the buffer-cap graceful stop
+// (process_token) ends it with finish_reason=length instead of a hard decode
+// failure, so the full n_predict need not be reserved.
+static const int64_t KV_GEN_TAIL_CAP = 8192;
+
+// kv-offload (auto-compact replacement): kv_offload_refill is defined below
+// (before da_auto_chunk) but apply_da_tag (mid-decode) calls it earlier, so it
+// must be forward-declared. kv_offload_get is a free function from
+// kv-offload.h, so it needs no local declaration.
+struct server_slot;
+// out_last_idx (optional): on success, receives the batch index (within the
+// final sub-batch) of the refilled block's last token - the only output
+// token of the final llama_decode, i.e. the logits row to sample the next
+// generated token from (B1: the deferred refill must be the last decode
+// before the slot's next sample).
+// on_retry_idle (optional): called on a decode/draft failure - free an idle
+// slot's KV cells (mirrors decode()'s try_clear_idle_slots); return true if a
+// slot was cleared (the same sub-batch is retried).
+// out_safe_failopen (optional): set true while no decode has run yet - a
+// failure at that point (e.g. the free-cell hard gate) leaves the ctx output
+// buffer holding the MAIN batch's rows, so the caller can fail-open (drop the
+// recall, sample the closing token's row, keep the slot and its cache). Flipped
+// to false once the decode loop starts (the buffer is overwritten; a failure
+// then must abort the slot).
+// A queued recall unit (item 6): its tokens plus the dedup key to commit to
+// slot.da_recalled_* only if the refill SUCCEEDS. chunk_id (>= 0) marks a
+// get-on-focus unit (keyed by offloaded chunk number); range.first (>= 0) marks
+// a holed-chunk unit (keyed by the prompt token range [lo,hi)). Committing on
+// success (not at queue time) means a recall dropped by the free-cell gate or a
+// spec-slot clear is NOT dedup-blocked - the model can re-request and retry.
+struct da_refill_unit {
+    std::vector<llama_token> toks;
+    int32_t chunk_id = -1;
+    std::pair<int32_t, int32_t> range = { -1, -1 };
+};
+static bool kv_offload_refill(llama_context * ctx, server_slot & slot, const std::vector<da_refill_unit> & units, int32_t * out_last_idx = nullptr,
+                              const std::function<bool()> & on_retry_idle = nullptr, bool * out_safe_failopen = nullptr);
 
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (!params.mmproj.path.empty()) {
@@ -346,6 +408,179 @@ struct server_slot {
     // state
     slot_state state = SLOT_STATE_IDLE;
 
+    // Declarative Attention: da_rm ranges not yet applied to the KV cache
+    bool da_rm_pending = false;
+
+    // one-shot diagnostic emitted when the da_rm_at boundary is crossed
+    // without applying the removals (e.g. media present)
+    bool da_rm_gate_diag_done = false;
+
+    // true when the prompt contains no media chunks (text tokens == all
+    // tokens). has_mtmd is true whenever an mmproj is loaded, even for
+    // text-only prompts, so the mid-prefill guards test this instead.
+    // Computed once at request start: get_text_tokens() is O(n) and the
+    // batch-fill loop runs per token.
+    bool da_rm_text_only = false;
+
+    // Declarative Attention 2-stream (B): >= 0 once the slot's decode has been
+    // switched to a second sequence (the keep ranges were copied there via
+    // seq_cp, see apply_da_b). All KV operations and batch tokens of the slot
+    // then use kv_seq() instead of `id`; the original sequence `id` is left
+    // intact. Reset in reset() and its KV cleared in prompt_clear().
+    llama_seq_id da_seq = -1;
+    // set by apply_da_b: the removal boundary position and the number of
+    // prefix tokens copied into da_seq (the logical read set of the second
+    // stream - the attended tokens, not the physical KV scan). Used by the
+    // read-reduction logs (per-step DBG, final INF in release()).
+    int32_t da_bound = -1;
+    size_t  da_keep_count = 0;
+    // DA mode state machine (P3) - see da_mode_t above.
+    da_mode_t da_mode = DA_MODE_GLOBAL;
+    // chunk indices (0-based, into task->params.da_chunks) currently kept:
+    // B path = present on da_seq, A path = not removed. Only meaningful when
+    // da_mode != DA_MODE_GLOBAL.
+    std::vector<int32_t> da_keep_chunks;
+    // DA tag scanner: char offset in generated_text up to which the text has
+    // already been scanned for complete tags (each tag is consumed exactly
+    // once; a tag may span several generated tokens).
+    size_t da_tag_scan_pos = 0;
+    // DA tag gate (P6): set by apply_da_tag() when a control tag closed -
+    // the next draft step is skipped so the first token after the mode
+    // transition follows the single-token trajectory (a batch-verified token
+    // at the transition can diverge numerically and drop the answer).
+    // Consumed by the draft decision.
+    bool da_skip_draft = false;
+    // B1 fix (2026-10-06 14:21): the tag-closing token is sampled in
+    // post_decode() but committed to the KV only in the NEXT predict()'s
+    // handle_last_sampled_token(). Refilling at tag close inserted the
+    // recalled chunk BEFORE that token - the model's own tag got split
+    // across the recalled block and the continuation derailed (a
+    // mid-tool-call <focus> leaked a headless tool-call tail). The refill
+    // tokens are now queued here and applied in the next post_decode() -
+    // after the closing token is committed - and the next token is sampled
+    // from the refill's last logits so the model continues after the
+    // recalled content. Request-scoped (cleared in reset()).
+    // One element per recalled unit (item 6): get-on-focus pushes one unit per
+    // offloaded chunk, the holed-chunk path one unit per evicted overlap (or
+    // remainder of it, after subtracting the already-recalled part - 2-2).
+    // kv_offload_refill wraps EACH unit individually so the units stay
+    // separated in the KV (a flat concat fused them with no boundary).
+    std::vector<da_refill_unit> da_pending_refill;
+    // item 6/2-3: per-request recall dedup (cleared in reset()). da_recalled_ranges
+    // = prompt token ranges [lo,hi) already recalled via the holed-chunk path;
+    // da_recalled_chunk_ids = offloaded chunk numbers already recalled via
+    // get-on-focus. Committed ONLY on refill success (post_decode) - a recall
+    // dropped by the free-cell gate or a spec-slot clear is NOT recorded, so
+    // the model can re-request and retry (recording at queue time turned a
+    // drop into a permanent block: the model re-emits the tag, the dedup
+    // skips it, and it loops until the buffer cap). Units queued in the same
+    // apply_da_tag pass are additionally checked against da_pending_refill.
+    std::vector<std::pair<int32_t, int32_t>> da_recalled_ranges;
+    std::vector<int32_t> da_recalled_chunk_ids;
+    // batch index (within the refill's final sub-batch) of the last
+    // refilled token's logits row; the next sample is taken from it
+    // (-1 = none this step). Request-scoped.
+    int32_t da_refill_out_idx = -1;
+    // da_trace: number of post-tag tokens still to trace in detail (set at
+    // tag close, decremented per generated token). Request-scoped.
+    int32_t da_trace_left = 0;
+    // P2: true once a DA removal has actually been applied to this slot's KV
+    // (A path: holes cut into the original sequence; B path: switched to
+    // da_seq). Drives the release() cache policy - a tag request that never
+    // emitted a tag keeps its prompt cache like a vanilla request.
+    bool da_applied = false;
+    // P2: true once an A-path removal (seq_rm holes) was actually applied.
+    // B path may fall back to A (apply_da_b preconditions), so the release()
+    // cache policy keys on the path actually taken, not on task params:
+    // A holes are baked into the cached sequence (clear), a B slot that
+    // returned to the original sequence mid-decode keeps its cache.
+    bool da_removed_a = false;
+    // kv-offload Option B (--kv-offload-holes): holes cut into this slot's MAIN
+    // sequence at eviction time (the evicted segments' KV is removed via
+    // llama_memory_seq_rm, positions are NOT re-based). They persist across
+    // release() between requests: release() keeps the prompt cache (the kv_
+    // holes_active branch) so the next request re-matches at n_past=full and
+    // re-prefills 1 token instead of the evicted tail.
+    //   kv_hole_ranges : applied holes (the ledger) - drives the release()
+    //                    cache policy and the n_kv_max dense override.
+    // The pending holes (not yet applied) are request-scoped: they live in
+    // task_params::kv_hole_pending (set by the eviction gate) and are read
+    // directly at the n_past check - NOT stored in the slot (a slot takeover
+    // would otherwise apply the previous session's stale holes to the new
+    // sequence). Cleared only when the whole sequence is wiped (prompt_clear
+    // or the n_past==0 takeover) - reset() must NOT clear them (the holes live
+    // in the shared cache, not in the per-request slot state).
+    std::vector<std::pair<llama_pos, llama_pos>> kv_hole_ranges;
+    bool kv_holes_active = false;
+    // kv-offload-holes: the FocusMemory session this slot's KV belongs to
+    // (learned from task.params.kv_offload_session at launch, persists across
+    // release() while the prompt cache is kept). Key of the context's
+    // kv_session_cut entry - lets prompt_clear refresh it even when the slot
+    // is idle (task already gone).
+    std::string kv_session;
+    // kv-offload-holes progressive apply (prefill-time hole cutting): per-hole
+    // progress while the prompt is being (re-)prefilled. applied_until: [lo,
+    // applied_until) is already cut from the KV. Request-scoped: cleared in
+    // reset() and at the STARTED block - the gate re-plans the same holes
+    // every request, so progress never carries over. The applied ledger
+    // (kv_hole_ranges) records only fully cut holes; a partial cut that
+    // survives to the next request is completed by the n_past batch path
+    // (re-cutting the full range is idempotent).
+    struct kv_hole_progress_entry {
+        llama_pos lo = 0;
+        llama_pos hi = 0;
+        llama_pos applied_until = 0; // [lo, applied_until) already cut
+        bool fail_logged = false;    // one-shot warn per rejected cut
+    };
+    std::vector<kv_hole_progress_entry> kv_hole_progress;
+    // peak KV-resident tokens (processed - cut) observed during the
+    // progressive prefill cut; 0 = not measured (no progressive cut this
+    // request). Logged once at the DONE_PROMPT -> GENERATING transition.
+    int32_t kv_hole_peak_resident = 0;
+    // set by the n_cache_reuse shift block: the shift moved the KV, so the
+    // pending hole coordinates (final token space) are stale - the n_past
+    // batch path and the progressive path both defer the holes.
+    bool kv_hole_shift_blocked = false;
+    // kv-offload refill failure: a partial refill was written to the KV and
+    // its attention-KV rollback failed (a recurrent-state hybrid cannot
+    // partially roll back), so the slot's KV is inconsistent with
+    // prompt.tokens. release() must prompt_clear() this slot instead of
+    // keeping the prompt cache. Request-scoped: reset() clears it.
+    bool refill_poisoned = false;
+    // Phase 0 (measure-only): server-level flag copied at slot init. When set,
+    // apply_da_rm/apply_da_b skip the KV mutation (output stays vanilla) so the
+    // tag state machine + logging can measure g (tag position) and emission
+    // rate on real traffic without touching the KV cache.
+    bool da_measure_only = false;
+    // DA tail floor (plans/continous_work2.md): the most recent da_tail_keep
+    // tokens before the removal boundary are always kept - subtracted from the
+    // removal ranges in apply_da_rm/apply_da_b next to the Sigma anchor. The
+    // keep set is the union of the tag selection, the Sigma anchor and the
+    // tail: without the floor, the work region the model was just in (not
+    // covered by any magic_chunks tag) is masked out at a B switch and the
+    // model forgets what it just did. Server-level, copied at slot init
+    // (0 = legacy behavior).
+    int32_t da_tail_keep = 8192;
+    // DA 2-stream (B) no-benefit skip threshold (plans/continous_work2.md,
+    // optional item): when > 0, apply_da_b skips the switch if fewer than
+    // this many tokens would be removed - the switch cost outweighs a tiny
+    // removal and the output stays vanilla. 0 = always switch (legacy).
+    // Server-level, copied at slot init.
+    int32_t da_b_min_remove = 0;
+    // Phase 0: generated-token index at which the first <focus>/<local> tag
+    // closed (-1 = no restriction tag emitted yet). release() logs it together
+    // with the total n_gen to give g = first_tag / total (the global-step
+    // share before the first attention restriction).
+    int32_t da_first_tag_gen = -1;
+    // P5 instrumentation (logical attended tokens, not measured bytes):
+    // n_da_removed is the A-path removed-token count (read set = n_full -
+    // n_da_removed). The per-step counters live in stats (server_slot_stats)
+    // so they reach the response timings via stats.to_json().
+    uint32_t n_da_removed = 0;
+    llama_seq_id kv_seq() const {
+        return da_seq >= 0 ? da_seq : (llama_seq_id) id;
+    }
+
     server_prompt prompt;
 
     bool prompt_save(server_prompt_cache & prompt_cache) const {
@@ -391,11 +626,30 @@ struct server_slot {
     }
 
     void prompt_clear() {
-        SLT_TRC(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
+        SLT_INF(*this, "clearing prompt with %zu tokens (seq %d)\n", prompt.tokens.size(), id);
 
         mem.seq_rm(id, -1, -1);
+        // a 2-stream (B) slot also holds the keep ranges on its second
+        // sequence; without this the cells would leak into the unified pool
+        // and the next request could pick up the same seq id with stale KV
+        if (da_seq >= 0) {
+            mem.seq_rm(da_seq, -1, -1);
+        }
 
         prompt.clear();
+
+        // Option B: the whole main sequence is gone, so the applied-hole
+        // ledger is stale and must not survive into the next request
+        kv_hole_ranges.clear();
+        kv_holes_active = false;
+        kv_hole_progress.clear();
+        // the session's actual-cut entry must drop with the ledger, or the
+        // watermark gate keeps subtracting holes that no longer exist
+        // (2026-10-10: idle-slot clear lost the ledger, the gate stayed idle
+        // and the KV refilled to the buffer cap)
+        if (callback_on_kv_holes_change) {
+            callback_on_kv_holes_change(*this);
+        }
     }
 
     std::vector<common_adapter_lora_info> lora;
@@ -429,6 +683,9 @@ struct server_slot {
 
     std::function<void(int /* id_slot */)>   callback_on_release;
     std::function<void(const server_slot &)> callback_on_reset; // called before reset()
+    // kv-offload-holes: refresh the context's kv_session_cut entry after the
+    // applied-hole ledger changes (set by the context; no-op if unset)
+    std::function<void(const server_slot &)> callback_on_kv_holes_change;
 
     // this is for printing timings with slot progress, not part of metrics
     int64_t t_print_last = 0;
@@ -464,6 +721,35 @@ struct server_slot {
         n_accepted_per_pos.clear();
 
         n_predict_max = -1;
+
+        // 2-stream (B) switch + DA state machine are request-scoped
+        da_seq           = -1;
+        da_bound         = -1;
+        da_keep_count    = 0;
+        da_mode          = DA_MODE_GLOBAL;
+        da_keep_chunks.clear();
+        da_tag_scan_pos  = 0;
+        da_skip_draft    = false;
+        da_pending_refill.clear();
+        da_recalled_ranges.clear();
+        da_recalled_chunk_ids.clear();
+        da_refill_out_idx = -1;
+        da_trace_left     = 0;
+        da_applied       = false;
+        da_removed_a     = false;
+        n_da_removed     = 0;
+        da_first_tag_gen = -1;
+
+        // kv-offload refill poison is request-scoped: the poisoned KV dies with the
+        // prompt cache at release(), so the flag must not leak into the next request
+        // (unlike kv_holes_active, which persists in the shared cache).
+        refill_poisoned = false;
+
+        // kv-offload-holes progressive apply: request-scoped progress (the
+        // applied ledger kv_hole_ranges persists in the shared cache)
+        kv_hole_progress.clear();
+        kv_hole_peak_resident = 0;
+        kv_hole_shift_blocked = false;
 
         llama_set_sampler(ctx_tgt, id, nullptr);
 
@@ -612,6 +898,25 @@ struct server_slot {
         return n_draft_max;
     }
 
+    // DA 2-pass overhead accounting: count a mode transition only when the
+    // mode actually changes, and attribute each generated token to the mode
+    // active at sample time (a closing tag is processed after its last token
+    // is counted, so the tag tokens are attributed to the mode they were
+    // generated in - the global "search" phase, not the focus "re-reason").
+    void da_set_mode(da_mode_t m) {
+        if (da_mode != m) {
+            stats.da_n_transitions += 1;
+            da_mode = m;
+        }
+    }
+    void da_count_generated_token() {
+        switch (da_mode) {
+            case DA_MODE_GLOBAL: stats.da_tokens_global += 1; break;
+            case DA_MODE_FOCUS:  stats.da_tokens_focus  += 1; break;
+            case DA_MODE_LOCAL:  stats.da_tokens_local  += 1; break;
+        }
+    }
+
     // add sampled token of this slot to the batch, optionally add the speculative draft tokens if any
     void handle_last_sampled_token(server_batch & batch) {
         bool add_ok = true;
@@ -629,7 +934,7 @@ struct server_slot {
                     // text embeddings broadcast the same position across the M-RoPE sections
                     const llama_pos p = prompt.tokens.pos_next();
                     const llama_pos pos[GGML_MROPE_SECTIONS] = { p, p, p, 0 };
-                    add_ok &= batch.add_embd(id, inp_embd.data() + (size_t) i * batch.n_embd, pos, i == n_rows - 1, false);
+                    add_ok &= batch.add_embd(kv_seq(), inp_embd.data() + (size_t) i * batch.n_embd, pos, i == n_rows - 1, false);
                     if (i < n_rows - 1) {
                         prompt.tokens.push_back(tok_track);
                     }
@@ -638,7 +943,7 @@ struct server_slot {
                     inp_embd.clear(); // rows are consumed, the next step produces new ones
                 }
             } else {
-                add_ok &= batch.add(id, sampled, prompt.tokens.pos_next(), true, false);
+                add_ok &= batch.add(kv_seq(), sampled, prompt.tokens.pos_next(), true, false);
             }
 
             SLT_DBG(*this, "slot decode token, id=%d, n_ctx = %d, n_tokens = %d, truncated = %d\n",
@@ -656,16 +961,56 @@ struct server_slot {
 
             auto pos0 = prompt.tokens.pos_next();
 
-            add_ok &= batch.add(id, sampled, pos0++, true, false);
+            add_ok &= batch.add(kv_seq(), sampled, pos0++, true, false);
             for (auto token : spec_draft) {
-                add_ok &= batch.add(this->id, token, pos0++, true, false);
+                add_ok &= batch.add(this->kv_seq(), token, pos0++, true, false);
             }
         }
 
         GGML_ASSERT(add_ok && "batch must be large enough to hold the sampled and draft tokens");
 
+        // L4: the tokens already in the prompt just before this commit -
+        // if a refill was (wrongly) inserted earlier, its tail shows up here
+        if (da_trace_left > 0) {
+            std::string s;
+            const size_t n = prompt.tokens.size();
+            for (size_t i = n > 12 ? n - 12 : 0; i < n; i++) {
+                const llama_token t = prompt.tokens[i];
+                if (t != LLAMA_TOKEN_NULL) {
+                    s += string_format("%d:'%s' ", (int) t, dbg_esc(common_token_to_piece(ctx_tgt, t, true), 24).c_str());
+                }
+            }
+            da_trace("slot=%d task=%d L4 commit sampled=%d pos=%d seq=%d prev12=[%s]\n",
+                     (int) id, (int) (task ? task->id : -1),
+                     (int) sampled, (int) prompt.tokens.pos_next(), (int) kv_seq(), s.c_str());
+        }
+
         prompt.tokens.push_back(tok_track);
         prompt.tokens.insert(spec_draft);
+
+        // 2-stream (B) read-reduction log: the logical read set (attended
+        // tokens) is the kept prefix plus the tokens added after the boundary
+        // ("read 30 of 100"). The FA kernels still scan the full [0, n_kv)
+        // range but skip fully-masked chunks (see apply_da_b), so the
+        // physical KV load shrinks at chunk granularity; this number is the
+        // logical (attended) count, not a measured byte count.
+        if (da_seq >= 0) {
+            const int32_t n_full = (int32_t) prompt.n_tokens();
+            const int32_t n_read = (int32_t) da_keep_count + (n_full - da_bound);
+            stats.n_da_restricted_steps += 1;
+            stats.n_da_attended_tokens  += (uint64_t) n_read;
+            stats.da_removed_a          = false;
+            SLT_DBG(*this, "da_b: decode #%d: logical read set %d of %d token(s) on seq %d (%zu kept + %d after boundary %d; seq %d holds all %d)\n",
+                    n_full - 1, n_read, n_full, da_seq, da_keep_count, n_full - da_bound, da_bound, id, n_full);
+        } else if (da_applied && n_da_removed > 0) {
+            // A path: the holes stay in the original sequence; the logical
+            // read set is the full length minus the removed tokens
+            const int32_t n_full = (int32_t) prompt.n_tokens();
+            const int32_t n_read = std::max(0, n_full - (int32_t) n_da_removed);
+            stats.n_da_restricted_steps += 1;
+            stats.n_da_attended_tokens  += (uint64_t) n_read;
+            stats.da_removed_a          = true;
+        }
     }
 
     void release() {
@@ -674,15 +1019,141 @@ struct server_slot {
 
             SLT_INF(*this, "stop processing: n_tokens = %d, truncated = %d\n", prompt.n_tokens(), truncated);
 
+            da_trace("slot=%d task=%d L7 release stop=%d prompt=%d holes=%zu holes_active=%d da_seq=%d da_applied=%d mode=%d poisoned=%d pending_refill_units=%zu\n",
+                     (int) id, (int) (task ? task->id : -1), (int) stop, (int) prompt.n_tokens(),
+                     kv_hole_ranges.size(), (int) kv_holes_active, (int) da_seq, (int) da_applied, (int) da_mode, (int) refill_poisoned,
+                     da_pending_refill.size());
+
+            // 2-stream (B) final read-reduction summary (logical read set, see
+            // handle_last_sampled_token)
+            if (da_seq >= 0) {
+                const int32_t n_full = (int32_t) prompt.n_tokens();
+                const int32_t n_read = (int32_t) da_keep_count + (n_full - da_bound);
+                SLT_INF_DBG(*this, "da_b: finished on seq %d - final logical read set %d of %d token(s) (%zu kept prefix + %d after boundary %d); seq %d kept intact\n",
+                        da_seq, n_read, n_full, da_keep_count, n_full - da_bound, da_bound, id);
+            }
+
+            // P5: DA instrumentation summary (logical attended tokens, not
+            // measured bytes) - also exposed in the response timings
+            if (stats.n_da_restricted_steps > 0) {
+                const uint64_t n_full = prompt.n_tokens();
+                const uint64_t n_full_steps = n_full * stats.n_da_restricted_steps;
+                const double reduction = n_full_steps > 0
+                        ? 100.0 * (1.0 - (double) stats.n_da_attended_tokens / (double) n_full_steps) : 0.0;
+                SLT_INF_DBG(*this, "da: %s path - %lu restricted step(s), logical attended %lu of %lu token-step(s) (-%.1f%%)\n",
+                        stats.da_removed_a ? "A" : "B",
+                        (unsigned long) stats.n_da_restricted_steps,
+                        (unsigned long) stats.n_da_attended_tokens,
+                        (unsigned long) n_full_steps, reduction);
+            }
+
+            // 2-pass overhead summary: mode-transition count and the
+            // generated-token share per mode (global = search phase, focus =
+            // re-reason phase). The transition sequence itself is in the
+            // da_tag: lines above.
+            if (stats.da_n_transitions > 0) {
+                SLT_INF_DBG(*this, "da_overhead: %lu transition(s), generated tokens by mode: global %lu / focus %lu / local %lu (of %lu total)\n",
+                        (unsigned long) stats.da_n_transitions,
+                        (unsigned long) stats.da_tokens_global,
+                        (unsigned long) stats.da_tokens_focus,
+                        (unsigned long) stats.da_tokens_local,
+                        (unsigned long) stats.n_gen);
+            }
+
+            // Phase 0 (measure-only): report the tag-position distribution
+            // (g) on real traffic. g = first_tag / total is the global-step
+            // share before the first attention restriction; the break-even
+            // gate uses (1+d)*(g + (1-g)*r). Only logged in measure-only mode
+            // (the production path keeps its current summary).
+            if (da_measure_only && da_first_tag_gen >= 0) {
+                const double total = (double) stats.n_gen;
+                const double g     = total > 0 ? (double) da_first_tag_gen / total : 0.0;
+                SLT_INF_DBG(*this, "da_measure: first <focus>/<local> tag at generated token %d of %lu - g=%.4f (global-step share before restriction)\n",
+                        da_first_tag_gen, (unsigned long) stats.n_gen, g);
+            }
+
             t_last_used = ggml_time_us();
 
             state = SLOT_STATE_IDLE;
 
-            // do not keep context of the child slots - the parent's context is enough
-            // nor of the stateless slots - no task ever reuses it
-            if (task->is_child() || task->is_stateless() || audio_stream || task->type == SERVER_TASK_TYPE_REALTIME) {
+            // DA cache policy (P2):
+            // - child / stateless / audio / realtime slot: always clear (no reuse)
+            // - static da_rm request: KV holes in the original sequence -> clear
+            // - DA tag request that applied a removal (da_applied):
+            //     B path: the original sequence is intact; copy the tail
+            //             generated on da_seq back so it holds the full
+            //             conversation, free da_seq, and KEEP the prompt cache
+            //             (the next turn reuses the complete prefix)
+            //     A path: holes persist in the original sequence -> clear
+            // - DA tag request that never emitted a tag: cache kept (vanilla)
+            // - kv-offload get-on-focus refill: the refilled chunk is appended
+            //   at the tail with KV and prompt.tokens in sync, so it is just part
+            //   of the generated tail - the B path copies it back (or the default
+            //   keeps it) and the next request's prefix match (get_common_prefix
+            //   + keep_first + seq_rm) trims it. Keeping the cache (not the old
+            //   prompt_clear) avoids the full re-prefill stall.
+            if (refill_poisoned) {
+                // kv-offload refill failed mid-way and its attention-KV rollback was a
+                // no-op (recurrent-state hybrid cannot partially roll back): the KV is
+                // inconsistent with prompt.tokens, so the prompt cache cannot be kept.
+                SLT_INF(*this, "clearing slot after poisoned kv-offload refill (KV rollback no-op): %zu prompt tokens\n",
+                        prompt.tokens.size());
                 prompt_clear();
+            } else if (task->is_child() || task->is_stateless() || audio_stream || task->type == SERVER_TASK_TYPE_REALTIME) {
+                prompt_clear();
+            } else if (!task->params.da_rm.empty()) {
+                SLT_INF(*this, "clearing slot after da_rm request: %zu prompt tokens, %zu range(s)\n",
+                        prompt.tokens.size(), task->params.da_rm.size());
+                prompt_clear();
+            } else if (da_applied && da_seq >= 0) {
+                const int32_t n_full = (int32_t) prompt.n_tokens();
+                if (n_full > da_bound) {
+                    mem.seq_cp(da_seq, id, da_bound, n_full);
+                }
+                mem.seq_rm(da_seq, -1, -1);
+                SLT_INF_DBG(*this, "da_b: returned %d generated token(s) to seq %d - prompt cache kept\n",
+                        n_full - da_bound, id);
+                da_seq = -1;
+            } else if (da_removed_a) {
+                // A path (or a B request that fell back to A): holes persist
+                // in the original sequence -> the cached prompt is not
+                // reusable
+                SLT_INF(*this, "clearing slot after DA removal (A path, holes persist): %zu prompt tokens\n",
+                        prompt.tokens.size());
+                prompt_clear();
+            } else if (kv_holes_active) {
+                // Option B (--kv-offload-holes): the evicted segments' KV was
+                // cut out of the main sequence (positions not re-based) but
+                // the prompt text is unchanged, so the next request re-matches
+                // at n_past=full and re-prefills 1 token instead of the
+                // evicted tail -> KEEP the prompt cache. (Placed after the DA
+                // branches on purpose: da_applied must still get its tail
+                // copy-back and da_removed_a must still clear - those win.)
+                SLT_INF_DBG(*this, "kv-offload-holes: prompt cache kept (%zu prompt tokens, %zu hole range(s), %d token span)\n",
+                        prompt.tokens.size(), kv_hole_ranges.size(),
+                        std::accumulate(kv_hole_ranges.begin(), kv_hole_ranges.end(), 0,
+                                        [](int s, const auto & r) { return s + (int) (r.second - r.first); }));
+                // kv-probe (release): physical occupancy at cache-keep time, before
+                // any checkpoint restore of the next turn. used (buffer - free)
+                // already far above the ledger-based resident here means the cut
+                // never happened (H1); a jump only after restore means H2
+                // (2026-10-10 2nd incident).
+                // (2026-10-14) Disabled: logging-only occupancy probe, issue resolved.
+                /*
+                {
+                    const int32_t n_free = llama_memory_n_free_cells(llama_get_memory(mem.ctx_tgt));
+                    int64_t probe_cut = 0;
+                    for (const auto & r : kv_hole_ranges) {
+                        probe_cut += (int64_t) (r.second - r.first);
+                    }
+                    SLT_INF_DBG(*this, "kv-probe (release): free=%d ledger_cut=%d prompt=%d\n",
+                            n_free, (int) probe_cut, (int) prompt.n_tokens());
+                }
+                */
             }
+            // a B slot that returned to the original sequence mid-decode
+            // (</focus> before the end) has a plain sequence again: the
+            // prompt cache is kept, like a vanilla request
 
             // mtmd_helper always re-eval the whole prompt
             if (task->type == SERVER_TASK_TYPE_TTS) {
@@ -1088,6 +1559,112 @@ public:
         metrics.reset_bucket();
     }
 
+    // kv-offload-holes: refresh the session's actual-cut entry from the
+    // slot's applied-hole ledger (kv_hole_ranges). Called at every ledger
+    // mutation (n_past apply/expire, progressive-cut completion, prompt_clear)
+    // so the watermark gate sees the holes that are physically cut in the KV
+    // right now, not the cumulative PUT history (see the kv_session_cut
+    // member for why). No-op for slots without a known session (plain
+    // traffic, or before the first da_auto turn). Public: the watermark gate
+    // in server_routes reads the entry via kv_session_cut_get().
+    void kv_session_cut_update(const server_slot & slot) {
+        if (slot.kv_session.empty()) {
+            return;
+        }
+        int64_t cut = 0;
+        for (const auto & r : slot.kv_hole_ranges) {
+            cut += (int64_t) (r.second - r.first);
+        }
+        std::lock_guard<std::mutex> lk(kv_session_cut_mutex);
+        kv_session_cut[slot.kv_session] = cut;
+        // 2026-10-12: mirror the ranges too - the gate needs per-range
+        // coordinates to apply the expire rule (the total alone cannot say
+        // which holes survive the new n_past).
+        kv_session_holes[slot.kv_session] = slot.kv_hole_ranges;
+    }
+
+    // kv-offload-holes: the actual-cut count for the watermark gate. 0 when
+    // the session has no (known) cut holes - e.g. a fresh session, or after
+    // its ledger was dropped by a prompt_clear.
+    int64_t kv_session_cut_get(const std::string & session) {
+        std::lock_guard<std::mutex> lk(kv_session_cut_mutex);
+        const auto it = kv_session_cut.find(session);
+        return it != kv_session_cut.end() ? it->second : 0;
+    }
+
+    // kv-offload-holes (2026-10-12): the shared hole-expire rule (formerly
+    // inline at task start): a hole survives a re-prefill at n_past iff its
+    // KV range is entirely inside the matched prefix (hi <= n_past);
+    // otherwise its cells were freshly rewritten and the cut no longer
+    // applies. Returns the surviving ranges. Static so the task-start path
+    // (queue thread, the real n_past) and the gate's kv_session_valid_cut
+    // (HTTP thread, the simulated n_past) use the exact same rule.
+    static std::vector<std::pair<int32_t,int32_t>> kv_holes_survive(
+            const std::vector<std::pair<int32_t,int32_t>> & ranges, int64_t n_past) {
+        std::vector<std::pair<int32_t,int32_t>> out;
+        for (const auto & r : ranges) {
+            if (r.second <= n_past) {
+                out.push_back(r);
+            }
+        }
+        return out;
+    }
+
+    // kv-offload-holes (2026-10-12): the gate-side valid-cut estimate (HTTP
+    // thread). The cut-ledger total (kv_session_cut_get) overcounts the holes
+    // that survive this request: the client rewrites/compacts the history, so
+    // the new prompt's LCP with the previous one (the task-start n_past) is
+    // far below the previous prompt size, and every hole with hi > n_past
+    // expires (its KV is re-prefilled). Projecting resident = prompt -
+    // ledger_cut then pins the gate "idle" while the physical KV re-fills to
+    // the buffer cap (2026-10-12 13:35-13:54: 11x full re-prefill, ~55s
+    // each, then the find_slot cascade).
+    //
+    // The LCP is computed against the session's last accepted prompt (the
+    // kv_last_prompt copy - the slot's residual prompt is queue-thread owned
+    // and must not be read from the HTTP thread). The effective n_past is the
+    // LCP minus the given margin: a checkpoint restore can land below the
+    // LCP by up to the checkpoint spacing, and the da_auto re-tokenization
+    // can shift the chunk headers by up to one chunk. When uncertain, bias to
+    // the evict-plan side - over-planning is a few idempotent PUTs,
+    // under-planning is a 55s prefill + failure.
+    int64_t kv_session_valid_cut(const std::string & session, const llama_tokens & cur,
+                                 int64_t margin, size_t * lcp_out = nullptr) {
+        std::lock_guard<std::mutex> lk(kv_session_cut_mutex);
+        const auto pit = kv_last_prompt.find(session);
+        if (pit == kv_last_prompt.end()) {
+            return 0; // no history - nothing can be assumed cut
+        }
+        const size_t max_idx = std::min(cur.size(), pit->second.size());
+        size_t lcp = 0;
+        while (lcp < max_idx && cur[lcp] == pit->second[lcp]) {
+            lcp++;
+        }
+        if (lcp_out) {
+            *lcp_out = lcp;
+        }
+        const int64_t n_eff = (int64_t) lcp - margin;
+        if (n_eff < 0) {
+            return 0;
+        }
+        const auto hit = kv_session_holes.find(session);
+        if (hit == kv_session_holes.end()) {
+            return 0;
+        }
+        int64_t cut = 0;
+        for (const auto & r : kv_holes_survive(hit->second, n_eff)) {
+            cut += (int64_t) (r.second - r.first);
+        }
+        return cut;
+    }
+
+    // kv-offload-holes (2026-10-12): record the session's last accepted
+    // prompt (the gate's LCP reference for the next request).
+    void kv_last_prompt_set(const std::string & session, const llama_tokens & tokens) {
+        std::lock_guard<std::mutex> lk(kv_session_cut_mutex);
+        kv_last_prompt[session] = tokens;
+    }
+
 private:
     // note: accessing these fields outside of this class is not thread-safe
     // use server_context methods instead
@@ -1098,6 +1675,9 @@ private:
     common_init_result_ptr llama_init;
 
     llama_context * ctx_tgt = nullptr;
+
+    // DA (W2): the n_kv_max value last pushed to ctx_tgt, for the change log
+    int64_t da_n_kv_max_last = 0;
 
     server_batch batch;
 
@@ -1124,6 +1704,31 @@ private:
 
     // slots / clients
     std::vector<server_slot> slots;
+
+    // kv-offload-holes: session -> tokens currently cut from the KV (the sum
+    // of the owning slot's kv_hole_ranges ledger). The watermark gate reads
+    // this (kv_session_cut_get) instead of the cumulative PUT volume: holes
+    // expire when the KV is re-prefilled and the ledger is dropped by
+    // prompt_clear, so the PUT history overstates the offloaded amount and
+    // the gate stays "idle" while the physical KV refills to the buffer cap
+    // (2026-10-10 incident: resident 19919 reported, ~101k actually resident).
+    // Written on the queue thread (ledger mutations), read on the HTTP thread
+    // (the gate) - mutex-guarded.
+    std::mutex kv_session_cut_mutex;
+    std::map<std::string, int64_t> kv_session_cut;
+    // kv-offload-holes (2026-10-12): session -> the owning slot's applied-hole
+    // ranges (kv_hole_ranges), mirrored for the HTTP-thread gate. The gate
+    // must not touch the slot's ledger (queue-thread owned - the 2026-10-12
+    // 13:35 gate ran 3ms before the prior task's release). Written by
+    // kv_session_cut_update on every ledger mutation, same mutex.
+    std::map<std::string, std::vector<std::pair<int32_t,int32_t>>> kv_session_holes;
+    // kv-offload-holes (2026-10-12): session -> the last accepted request's
+    // original prompt tokens (the gate's LCP reference). The gate (HTTP
+    // thread) compares the current prompt against this stored copy - NOT the
+    // slot's residual prompt (queue-thread owned). Updated when a request
+    // passes the gate; a rejected request leaves it untouched (the KV state
+    // did not change, so the reference must not move either).
+    std::map<std::string, llama_tokens> kv_last_prompt;
 
     int trace = 0;        // env: LLAMA_TRACE
     int slots_debug = 0;  // env: LLAMA_SERVER_SLOTS_DEBUG
@@ -1235,9 +1840,7 @@ private:
 
         const bool has_mmproj = !params.mmproj.path.empty();
         const bool has_draft = params.speculative.has_dft();
-        const bool spec_mtp = std::find(params_base.speculative.types.begin(),
-                                        params_base.speculative.types.end(),
-                                        COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
+        const bool spec_mtp = params_base.speculative.has_mtp();
         const bool has_spec = has_draft || spec_mtp;
 
         if (callback_state) {
@@ -1323,7 +1926,31 @@ private:
             params_base.load_progress_callback_user_data = &load_progress_text;
         }
 
+        // 2-stream (B) reserves sequence ids beyond the slot ids (da_seq is
+        // always >= n_slots, so it can never collide with a slot's own sequence
+        // or an idle slot's cached prompt). apply_da_b scans [n_slots,
+        // n_seq_max) for a free id and gives each B slot its own, so with
+        // n_parallel slots all able to sit on the B path at once, n_seq_max
+        // must reach 2*n_slots or the extra slots fall back to the
+        // irreversible A path. In --kv-unified mode n_ctx_seq is the full pool
+        // regardless of n_seq_max, so the extra ids cost only sequence
+        // metadata, not KV capacity. n_parallel is the sole driver of
+        // cparams.n_seq_max (common.cpp), so bump it only around context
+        // creation and restore it before the slot loop reads it.
+        //
+        // n_outputs_max must move with it: llama_context::output_reserve sizes
+        // the output buffer for max(n_outputs, n_seq_max) rows and asserts
+        // n_outputs_max >= n_seq_max, so the reserved ids need that many rows.
+        const int n_da_b_slots   = params_base.n_parallel;
+        const int n_da_b_seq_max = 2 * n_da_b_slots;
+        if (params_base.kv_unified) {
+            params_base.n_parallel = n_da_b_seq_max;
+            params_base.n_outputs_max = std::max(params_base.n_outputs_max, n_da_b_seq_max);
+        }
+
         llama_init = common_init_from_params(params_base);
+
+        params_base.n_parallel = n_da_b_slots;
 
         model_tgt = llama_init->model();
         ctx_tgt   = llama_init->context();
@@ -1358,6 +1985,18 @@ private:
 
             {
                 common_params params_dft = common_base_params_to_speculative(params_base);
+
+                // the draft context must accept the same da_seq ids as the
+                // target context: common_memory::seq_cp operates on both, and
+                // a B slot reserves an id in [n_slots, n_seq_max).
+                // common_base_params_to_speculative fixed n_outputs_max to the
+                // original slot count, so widen n_seq_max AND n_outputs_max
+                // together (llama_context::output_reserve asserts
+                // n_outputs_max >= n_seq_max).
+                if (params_base.kv_unified) {
+                    params_dft.n_parallel = n_da_b_seq_max;
+                    params_dft.n_outputs_max = std::max(params_dft.n_outputs_max, n_da_b_seq_max);
+                }
 
                 // progress callback
                 params_dft.load_progress_callback           = load_progress_callback;
@@ -1504,6 +2143,84 @@ private:
             SRV_TRC("%s", "speculative decoding will use checkpoints\n");
         }
 
+        // kv-offload buffer decoupling: startup validation.
+        // (3c) a decoupled buffer (B > 0) smaller than the logical context only
+        //      works with the eviction mechanism (kv_offload + focus-memory host);
+        //      without it nothing can be evicted, so a prompt longer than B
+        //      hard-fails in find_slot - reject. (B >= n_ctx needs no eviction:
+        //      the buffer covers the whole position range.)
+        if (params_base.kv_cache_size > 0 &&
+                params_base.kv_cache_size < params_base.n_ctx &&
+                !(params_base.kv_offload && !params_base.focus_memory_host.empty())) {
+            SRV_ERR("kv_offload: buffer %d cells < n_ctx %d without the eviction path (--kv-offload-threshold + --fm-offload host) - prompts longer than the buffer hard-fail (find_slot); enable eviction or raise --kv-cache-size\n",
+                    params_base.kv_cache_size, params_base.n_ctx);
+            return false;
+        }
+        // (a) the buffer must hold the hot window (threshold) + headroom even with
+        //     retain = 0; below that no retain value is safe - reject.
+        if (params_base.kv_offload && params_base.kv_cache_size > 0 &&
+                params_base.kv_cache_size < params_base.kv_offload_threshold + 16384) {
+            SRV_ERR("kv_offload: buffer %d cells < threshold %d + headroom 16384 - the hot window alone exceeds the buffer (find_slot failure); raise --kv-cache-size or lower --kv-offload-threshold\n",
+                    params_base.kv_cache_size, params_base.kv_offload_threshold);
+            return false;
+        }
+        // (c) the buffer cannot hold threshold + retain + headroom: the runtime
+        //     clamp shrinks the effective retain - warn with the clamped value.
+        if (params_base.kv_offload && params_base.kv_cache_size > 0 &&
+                params_base.kv_cache_size <
+                params_base.kv_offload_threshold + params_base.kv_retain_tokens + 16384) {
+            SRV_WRN("kv_offload: buffer %d cells < threshold %d + retain %d + headroom 16384 - effective retain clamped to %d (find_slot failure risk if pin is large)\n",
+                    params_base.kv_cache_size, params_base.kv_offload_threshold,
+                    params_base.kv_retain_tokens,
+                    params_base.kv_cache_size - 16384 - params_base.kv_offload_threshold);
+        }
+        // (d) the buffer cannot even hold threshold + gen tail + headroom: the
+        //     clamp degenerates (effective retain -> 0) and the reject gate fails
+        //     every request regardless of eviction - warn with the minimum
+        //     required buffer. The gen tail is the capped reservation (the runtime
+        //     gate/clamp reserve min(n_predict, KV_GEN_TAIL_CAP), not the full
+        //     n_predict).
+        {
+            const int64_t gen_tail = params_base.n_predict > 0 ?
+                std::min<int64_t>(params_base.n_predict, KV_GEN_TAIL_CAP) : 0;
+            if (params_base.kv_offload && params_base.kv_cache_size > 0 &&
+                    params_base.kv_cache_size <
+                    params_base.kv_offload_threshold + gen_tail + 16384) {
+                SRV_WRN("kv_offload: buffer %d cells < threshold %d + gen tail %d + headroom 16384 - minimum required buffer is %d; even with perfect eviction the generation tail exceeds the budget (400 on every request); raise --kv-cache-size to >= %d or lower --kv-offload-threshold/--n-predict\n",
+                        params_base.kv_cache_size, params_base.kv_offload_threshold,
+                        (int) gen_tail,
+                        (int) (params_base.kv_offload_threshold + gen_tail + 16384),
+                        (int) (params_base.kv_offload_threshold + gen_tail + 16384));
+            }
+        }
+        // (e) high/low watermark (holes mode): the high watermark must be >= the
+        //     low (drain) target, and a request just below the high watermark
+        //     (the idle band's worst case) must still fit the prefill peak
+        //     (resident + n_batch in holes mode) plus the gen tail under the
+        //     buffer cap - otherwise the request would be rejected (400) before
+        //     eviction can trigger. high == 0 = legacy per-turn gate (no check).
+        if (params_base.kv_offload && params_base.kv_offload_high > 0) {
+            if (params_base.kv_offload_high < params_base.kv_offload_threshold) {
+                SRV_ERR("kv_offload: --kv-offload-high %d < --kv-offload-threshold %d - the high watermark must be >= the low (drain) target\n",
+                        params_base.kv_offload_high, params_base.kv_offload_threshold);
+                return false;
+            }
+            if (!params_base.kv_offload_holes) {
+                SRV_WRN("kv_offload: --kv-offload-high %d is set but --kv-offload-holes is off - the watermark is holes-mode only (Option C needs the evict plan every request to reduce the prompt text) - ignoring --kv-offload-high (legacy per-turn gate)\n",
+                        params_base.kv_offload_high);
+            } else if (params_base.kv_cache_size > 0) {
+                const int64_t gen_tail = params_base.n_predict > 0 ?
+                    std::min<int64_t>(params_base.n_predict, KV_GEN_TAIL_CAP) : 0;
+                if ((int64_t) params_base.kv_offload_high + params_base.n_batch + gen_tail > (int64_t) params_base.kv_cache_size - 16384) {
+                    SRV_ERR("kv_offload: --kv-offload-high %d + batch %d + gen tail %d exceeds buffer %d - headroom 16384 - a request just below the high watermark would be rejected before eviction can trigger; lower --kv-offload-high to <= %d or raise --kv-cache-size\n",
+                            params_base.kv_offload_high, params_base.n_batch, (int) gen_tail,
+                            params_base.kv_cache_size,
+                            (int) (params_base.kv_cache_size - 16384 - params_base.n_batch - gen_tail));
+                    return false;
+                }
+            }
+        }
+
         // setup slots
         SRV_INF("initializing, n_slots = %d, n_ctx_slot = %d, kv_unified = '%s'\n",
                 params_base.n_parallel, n_ctx_slot(), params_base.kv_unified ? "true" : "false");
@@ -1516,7 +2233,17 @@ private:
         // try speculative decoding
         if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
             try {
-                spec.reset(common_speculative_init(params_base.speculative, params_base.n_parallel));
+                // In --kv-unified mode the 2-stream (B) DA path reserves n_da_b_slots
+                // extra sequence ids (n_slots..2*n_slots, see apply_da_b) that both ctxs
+                // accept (context n_seq_max = 2*n_parallel, bumped above). The
+                // speculative per-seq state (dparams + each impl's per-seq vectors)
+                // must cover all of them too, or a B slot drafting on da_seq hits the
+                // `seq_id < dparams.size()` assert. The extra ids stay idle
+                // (drafting=false) until B slots use them, so non-B / non-unified
+                // paths are unaffected.
+                const uint32_t n_seq_spec =
+                        (uint32_t) params_base.n_parallel + (params_base.kv_unified ? (uint32_t) n_da_b_slots : 0u);
+                spec.reset(common_speculative_init(params_base.speculative, n_seq_spec));
             } catch (const std::exception & e) {
                 SRV_ERR("failed to initialize speculative decoding context: %s\n", e.what());
                 if (params_base.speculative.has_synth()) {
@@ -1551,6 +2278,9 @@ private:
             slot.mem.init(ctx_tgt, ctx_dft);
             slot.spec    = spec.get();
             slot.n_ctx   = n_ctx_slot();
+            slot.da_measure_only = params_base.da_measure_only;
+            slot.da_tail_keep    = params_base.da_tail_keep;
+            slot.da_b_min_remove = params_base.da_b_min_remove;
 
             slot.mctx                   = mctx;
             slot.prompt.tokens.has_mtmd = mctx != nullptr;
@@ -1574,6 +2304,10 @@ private:
                 if (slot.stats.n_gen > 0) {
                     metrics_on_prediction(slot);
                 }
+            };
+
+            slot.callback_on_kv_holes_change = [this](const server_slot & slot) {
+                kv_session_cut_update(slot);
             };
 
             slot.reset();
@@ -2042,6 +2776,19 @@ private:
         // the per-request limit takes priority over the global one
         slot.n_predict_max = task.params.n_predict != -1 ? task.params.n_predict : params_base.n_predict;
 
+        // kv-offload-holes: learn the session owning this slot's KV so ledger
+        // mutations (including prompt_clear on an idle slot) can refresh the
+        // context's kv_session_cut entry. A takeover by another session drops
+        // the old session's entry now: its holes will be expired/cleared by
+        // the prefill, and a stale entry would understate its resident.
+        if (!task.params.kv_offload_session.empty() && task.params.kv_offload_session != slot.kv_session) {
+            if (!slot.kv_session.empty()) {
+                std::lock_guard<std::mutex> lk(kv_session_cut_mutex);
+                kv_session_cut[slot.kv_session] = 0;
+            }
+            slot.kv_session = task.params.kv_offload_session;
+        }
+
         slot.task = std::make_unique<const server_task>(std::move(task));
 
         if (slot.task->type == SERVER_TASK_TYPE_TTS) {
@@ -2081,12 +2828,39 @@ private:
         return true;
     }
 
+    static size_t tool_closing_hold(const std::string & s) {
+        static const std::string cls[] = {"</tool_call>","</function>","</parameter>"};
+        for (const auto & c : cls)
+            for (size_t k = std::min(s.size(), c.size()-1); k > 0; k--)
+                if (s.compare(s.size()-k, k, c, 0, k) == 0) return k;
+        return 0;
+    }
+    // da_hold = std::max(da_tag_hold_len(...), tool_closing_hold(unsent));
+
     bool process_token(completion_token_output & result, server_slot & slot) {
+        // L4: per-token trace right after a tag closed (both the spec-accept
+        // and the single-token paths funnel through here)
+        if (slot.da_trace_left > 0) {
+            da_trace("slot=%d task=%d L4 tok n_gen=%d id=%d piece='%s' prompt_tokens=%d mode=%d seq=%d\n",
+                     (int) slot.id, (int) slot.task->id,
+                     (int) slot.stats.n_gen, (int) result.tok, dbg_esc(result.text_to_send, 40).c_str(),
+                     (int) slot.prompt.n_tokens(), (int) slot.da_mode, (int) slot.kv_seq());
+            slot.da_trace_left--;
+        }
+
         // remember which tokens were sampled - used for repetition penalties during sampling
         const std::string token_str = result.text_to_send;
         slot.sampled = result.tok;
 
         slot.generated.append(token_str, result.tok);
+
+        // DA tag parser: the model's own <focus magic_chunks="N"> tag drives the
+        // attention restriction. Scan the accumulated text for the first
+        // complete tag; on tag close the removals run exactly once, mid-decode
+        // (no-op unless the client sent da_chunks, and after it has applied).
+        apply_da_tag(slot);
+        scrub_headless_tool_closings(slot);
+
         if (slot.task->params.return_tokens) {
             slot.generated_tokens.push_back(result.tok);
         }
@@ -2113,8 +2887,31 @@ private:
 
             // check if there is any token to predict
             if (send_text) {
-                // no send the stop word in the response
-                result.text_to_send = slot.generated.text.substr(pos, std::string::npos);
+                // no send the stop word in the response. DA tag holdback: a
+                // trailing fragment that could still grow into a control tag
+                // stays unsent until it closes (apply_da_tag then erases it)
+                // or is proven to be plain text. An EOG token drops the held
+                // fragment instead of flushing it: generation is over, so it
+                // can no longer grow into a tag - a partial tag must not leak
+                // to the client. The resize removes it from generated_text as
+                // well, so non-streaming responses lose it too.
+                // Recomputed here because the stop-word erase above may have
+                // removed the previously held fragment.
+                const bool da_eog = llama_vocab_is_eog(vocab, result.tok);
+                const std::string unsent = slot.generated.text.substr(
+                        std::min(slot.n_sent_text, slot.generated.text.size()));
+                size_t da_hold = 0;
+                if (!slot.task->params.da_chunks.empty()) {
+                    da_hold = da_tag_hold_len(unsent, slot.da_mode);
+                }
+                // tool-call 닫힘 홀드백: DA 활성 여부와 무관하게 항상 적용
+                const size_t hold = std::max(da_hold, tool_closing_hold(unsent));
+                if (da_eog && hold > 0) {
+                    slot.generated.text.resize(slot.generated.text.size() - hold);
+                }
+                const size_t send_end = slot.generated.text.size() - (da_eog ? 0 : hold);
+
+                result.text_to_send = slot.generated.text.substr(pos, send_end - pos);
                 slot.n_sent_text += result.text_to_send.size();
                 // add the token to slot queue and cache
             } else {
@@ -2131,14 +2928,66 @@ private:
             slot.has_next_token = true;
         }
 
-        // if context shifting is disabled, make sure that we don't run out of context
-        if (!params_base.ctx_shift && slot.prompt.n_tokens() + 1 >= slot.n_ctx) {
-            slot.truncated      = true;
-            slot.stop           = STOP_TYPE_LIMIT;
-            slot.has_next_token = false;
+        // if context shifting is disabled, make sure that we don't run out of context.
+        // Decoupled-KV mode: the physical buffer (kv_cache_size) fills before the
+        // logical n_ctx. (2026-10-10, incident 2026-10-10-kv-ledger-loss) The
+        // buffer check now uses the PHYSICAL free-cell count
+        // (llama_memory_n_free_cells) instead of the ledger-based resident
+        // projection: the hole ledger can disagree with the physical KV (a slot
+        // cleared by the idle path and re-prefilled reports "holes cut 0" while
+        // ~101k cells are resident), and only the physical count sees that.
+        // Backends without n_free_cells support (return -1) fall back to the
+        // old ledger-based projection.
+        {
+            const int64_t buf_cap = params_base.kv_cache_size > 0 ?
+                (int64_t) params_base.kv_cache_size - 16384 : (int64_t) slot.n_ctx;
+            const int64_t ctx_limit = std::min<int64_t>(slot.n_ctx, buf_cap);
+            int64_t holes_cut = 0;
+            for (const auto & r : slot.kv_hole_ranges) holes_cut += (int64_t) (r.second - r.first);
+            const int32_t n_free = llama_memory_n_free_cells(llama_get_memory(ctx_tgt));
+            // slot.prompt.n_tokens() already includes the generated tokens
+            // (handle_last_sampled_token pushes each decoded token into
+            // slot.prompt before the next decode), so n_gen must NOT be added
+            // again here - doing so halved the effective generation budget.
+            const bool ctx_full = (int64_t) slot.prompt.n_tokens() + 1 >= slot.n_ctx;
+            const bool buf_full = params_base.kv_cache_size > 0 && n_free >= 0 && n_free < 2048;
+            // Fallback estimate (n_free unavailable): the ledger-based resident
+            // projection. In holes mode (Option B) the evicted text stays in the
+            // prompt while its KV cells are cut (kv_hole_ranges ledger), so the
+            // prompt length overstates the resident by the cut span (2026-10-07:
+            // prompt 59358 / resident 46865, 12055 cells free).
+            // The main path (prompt.n_tokens()) already carries the generated
+            // tokens, but kv_hole_peak_resident is a PREFILL snapshot (set at the
+            // n_past check, before any decode) and has none - so n_gen is added
+            // only in that branch. Unconditionally dropping it would make est_full
+            // never fire there -> hard decode failure instead of a graceful stop.
+            int64_t resident_base = (int64_t) slot.prompt.n_tokens() - holes_cut;
+            if (holes_cut == 0 && slot.kv_holes_active && slot.kv_hole_peak_resident > 0) {
+                resident_base = (int64_t) slot.kv_hole_peak_resident + (int64_t) slot.stats.n_gen;
+            }
+            const bool est_full = n_free < 0 &&
+                resident_base + 1 >= ctx_limit;
+            if (!params_base.ctx_shift && (ctx_full || buf_full || est_full)) {
+                slot.truncated      = true;
+                slot.stop           = STOP_TYPE_LIMIT;
+                slot.has_next_token = false;
 
-            SLT_DBG(slot, "stopped due to running out of context capacity, prompt.n_tokens() = %d, task.n_tokens = %d, n_gen = %d, n_ctx = %d\n",
-                    slot.prompt.n_tokens(), slot.task->n_tokens(), (int) slot.stats.n_gen, slot.n_ctx);
+                if (buf_full) {
+                    // INFO (not DBG): the client sees finish_reason=length and
+                    // halts, so the journal must record that the physical KV
+                    // buffer (not the model n_ctx) capped generation.
+                    SRV_INF("slot %d: generation stopped at KV buffer cap - free cells %d < 2048 (prompt %d, holes cut %d, n_gen %d, buffer %d, n_ctx %d) -> finish_reason=length\n",
+                            (int) slot.id, n_free, (int) slot.prompt.n_tokens(), (int) holes_cut,
+                            (int) slot.stats.n_gen, params_base.kv_cache_size, slot.n_ctx);
+                } else if (est_full) {
+                    SRV_INF("slot %d: generation stopped at KV buffer cap (estimate, n_free unavailable) - resident %d (prompt %d - holes cut %d) + n_gen %d >= buffer %d - 16384 (n_ctx %d) -> finish_reason=length\n",
+                            (int) slot.id, (int) resident_base, (int) slot.prompt.n_tokens(), (int) holes_cut,
+                            (int) slot.stats.n_gen, params_base.kv_cache_size, slot.n_ctx);
+                } else {
+                    SLT_DBG(slot, "stopped due to running out of context capacity, prompt.n_tokens() = %d, task.n_tokens = %d, n_gen = %d, n_ctx = %d\n",
+                            slot.prompt.n_tokens(), slot.task->n_tokens(), (int) slot.stats.n_gen, slot.n_ctx);
+                }
+            }
         }
 
         // check the limits
@@ -2347,6 +3196,31 @@ private:
         queue_results.send(std::move(res));
     }
 
+    // headless tool-call closing scrubber (DA erase와 동일 패턴)
+    static void scrub_headless_tool_closings(server_slot & slot) {
+        static const std::pair<std::string,std::string> fam[] = {
+            {"<tool_call>", "</tool_call>"},
+            {"<function=",  "</function>"},
+            {"<parameter=", "</parameter>"},
+        };
+        std::string & g = slot.generated.text;
+        for (const auto & [op, cl] : fam) {
+            int bal = 0; size_t i = 0;
+            while (i < g.size()) {
+                if (g.compare(i, op.size(), op) == 0) { bal++; i += op.size(); continue; }
+                if (g.compare(i, cl.size(), cl) == 0) {
+                    if (bal > 0) { bal--; i += cl.size(); continue; }  // 정상 닫힘
+                    const size_t len = cl.size();
+                    g.erase(i, len);                                    // headless → 제거
+                    if (slot.n_sent_text > i)
+                        slot.n_sent_text = (slot.n_sent_text >= i+len) ? slot.n_sent_text-len : i;
+                    continue;
+                }
+                i++;
+            }
+        }
+    }
+
     void send_final_response(server_slot & slot) {
         auto res = std::make_unique<server_task_result_cmpl_final>();
 
@@ -2358,6 +3232,66 @@ private:
         // keep copy of last generated text for debugging purposes
         if (slots_debug) {
             slot.debug_generated_text = slot.generated.text;
+        }
+
+        // DA: log the full (tag-erased) generation + final DA state so the
+        // server log is self-documenting for diagnosing answer-generation
+        // failures. The client never sees the focus tags (they are erased from
+        // generated_text before being sent), so this is the only place the raw
+        // output and the DA end-state (mode / da_seq / keep / removed) are
+        // captured together for a request.
+        if (!slot.task->params.da_chunks.empty() || slot.da_applied) {
+            SLT_INF_DBG(slot, "da: request complete - n_gen=%d, mode=%s, da_seq=%d, da_bound=%d, keep=%zu, removed=%u, n_full=%d\n",
+                    (int) slot.stats.n_gen,
+                    slot.da_mode == DA_MODE_GLOBAL ? "GLOBAL"
+                        : (slot.da_mode == DA_MODE_FOCUS ? "FOCUS" : "LOCAL"),
+                    (int) slot.da_seq, (int) slot.da_bound,
+                    slot.da_keep_count, slot.n_da_removed,
+                    (int) slot.prompt.n_tokens());
+
+            // L5: leak detection at request end (before generated_text is
+            // moved into the response) - unbalanced tool-call tags are the
+            // 14:21 derailment signature (a headless </parameter></function>
+            // tail that no client can parse as a functionCall)
+            {
+                const std::string & g = slot.generated.text;
+                const size_t E = g.size();
+
+                // close > open is the derail signature (a headless closing
+                // tail). open > close (the model mentioning the tags as text)
+                // is NOT a symptom - counting it flagged ~52% of turns.
+                const bool unbalanced =
+                    dbg_count(g, "<tool_call>", E) != dbg_count(g, "</tool_call>", E) ||
+                    dbg_count(g, "<function=", E) != dbg_count(g, "</function>", E) ||
+                    dbg_count(g, "<parameter=", E) != dbg_count(g, "</parameter>", E);
+                //SLT_INF(slot, "da_trace: final n_gen=%d stop=%d unbalanced=%d tail='%s'\n",
+                //        (int) slot.stats.n_gen, (int) slot.stop, (int) unbalanced, dbg_esc(g.substr(E > 300 ? E - 300 : 0), 320).c_str());
+                if (unbalanced) SLT_WRN_DBG(slot, "%s", "da_trace: DERAIL-SUSPECT (tool-call tags unbalanced)\n");
+                // T1-e: request-end stop state. A closing-only / truncated
+                // derail shows up here as a non-EOS stop with a large n_gen, or
+                // as n_free cells that should have been evicted but were not.
+                SRV_INF("kv_offload req-end: slot=%d task=%d stop=%d n_gen=%d n_free=%d unbalanced=%d (closing-only derail => stop!=EOS or n_gen huge with unbalanced=1)\n",
+                        (int) slot.id, (int) slot.task->id,
+                        (int) slot.stop, (int) slot.stats.n_gen,
+                        (int) llama_memory_n_free_cells(llama_get_memory(ctx_tgt)), (int) unbalanced);
+            }
+
+#if 0  // disabled: re-logged the entire (17K+ char) generation on every DA request,
+      // flooding the journal. The compact "da: request complete" state line above
+      // stays. Re-enable for one-off answer-generation diagnosis only.
+            // single line (newlines escaped) so a line-based journal filter can
+            // capture the whole generation in one record
+            std::string gtext = slot.generated.text;
+            std::string escaped;
+            escaped.reserve(gtext.size());
+            for (char c : gtext) {
+                if (c == '\n')      escaped += "\\n";
+                else if (c == '\r') escaped += "\\r";
+                else                escaped += c;
+            }
+            SLT_INF_DBG(slot, "da: generated_text (%zu chars): %s\n",
+                    gtext.size(), escaped.c_str());
+#endif
         }
 
         // in stream mode, content and tokens are already in last partial chunk
@@ -2375,6 +3309,10 @@ private:
         res->truncated             = slot.truncated;
         res->n_decoded             = slot.stats.n_gen;
         res->n_prompt_tokens       = slot.task->n_tokens();
+        // sigma-strip (E1/E2): calibrate the session's est offset from the
+        // reported prompt-token count and log the per-response observation
+        // line. No-op for sessions that never went through sigma-strip.
+        sigma_strip_note_response(slot.task->params.sigma_session, slot.task->n_tokens());
         res->n_prompt_tokens_cache = slot.stats.n_prompt_cached;
         res->n_tokens_cached       = slot.prompt.n_tokens();
         res->has_new_line          = slot.has_new_line;
@@ -2655,9 +3593,25 @@ private:
         return true;
     }
 
+    // whether the memory state is valid only at its exact final position (hybrid/recurrent),
+    // as opposed to a range of positions (SWA)
+    bool ctx_tgt_state_exact() const {
+        return ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+               ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS;
+    }
+
     // n_tokens_cur: the number of tokens added to the batch for the current slot
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         const int id_task = slot.task->id;
+
+        // an equivalent checkpoint already exists (e.g. it was just restored)
+        if (!slot.prompt.checkpoints.empty() &&
+                slot.prompt.checkpoints.back()->n_tokens == slot.prompt.n_tokens() - n_tokens_cur &&
+                slot.prompt.checkpoints.back()->pos_max == pos_max) {
+            // b12412 checkpoints are immutable and shared with the prompt cache, so the
+            // fork's in-place id_task adoption is not possible; skip the duplicate instead
+            return;
+        }
 
         // evict checkpoints within min-step of a previous checkpoint, unless they were
         // created by the current task
@@ -2708,8 +3662,13 @@ private:
         cur.id_task = id_task;
 
         // [TAG_CHECKPOINTS_FIX_POS_MIN]
-        // TODO: here we incorrectly deterimne that the saved checkpoint data covers the [pos_min, pos_max] range
-        //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
+        // the state of hybrid/recurrent memory is valid only at its exact final position
+        // TODO: for SWA models the saved range can still claim more than it actually covers:
+        //       https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
+        if (ctx_tgt_state_exact()) {
+            pos_min = pos_max;
+        }
+
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
         cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
@@ -3607,6 +4566,12 @@ private:
 
                     // on successful decode, restore the original batch size
                     n_batch = llama_n_batch(ctx_tgt);
+
+                    // kv-offload-holes: cut the pending holes whose KV this
+                    // sub-batch completed (progressive apply - keeps the
+                    // prefill peak near the projected resident instead of the
+                    // raw prompt length)
+                    kv_holes_progressive_apply(off_next);
                 } else {
                     // try again with the updated n_batch
                     continue;
@@ -3764,8 +4729,11 @@ private:
 
                 SLT_WRN(slot, "slot context shift, n_keep = %d, n_left = %d, n_discard = %d\n", n_keep, n_left, n_discard);
 
-                slot.mem.seq_rm (slot.id, n_keep            , n_keep + n_discard);
-                slot.mem.seq_add(slot.id, n_keep + n_discard, slot.prompt.tokens.pos_next(), -n_discard);
+                // kv_seq(): for a 2-stream (B) slot the live KV is on the
+                // second sequence; shifting the original one would leave the
+                // live sequence overflowing
+                slot.mem.seq_rm (slot.kv_seq(), n_keep            , n_keep + n_discard);
+                slot.mem.seq_add(slot.kv_seq(), n_keep + n_discard, slot.prompt.tokens.pos_next(), -n_discard);
 
                 // add generated tokens to cache
                 // ref: https://github.com/ggml-org/llama.cpp/pull/16818#discussion_r2473269481
@@ -3816,14 +4784,44 @@ private:
             generating.push_back(&slot);
 
             if (spec) {
-                common_speculative_get_draft_params(spec.get(), slot.id).drafting = false;
+                // kv_seq(): a 2-stream (B) slot drafts on its second sequence
+                // after the switch (P6)
+                common_speculative_get_draft_params(spec.get(), slot.kv_seq()).drafting = false;
 
                 const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
                 const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
                 const int n_draft_max = slot.get_n_draft_max();
 
-                if (n_draft_max > 0) {
+                // DA tag gate (P6): while a control tag could still close
+                // (the generated tail is a tag prefix) or for the first step
+                // right after a tag closed (da_skip_draft, set by
+                // apply_da_tag()), decode without a new draft. The tag tokens
+                // and the first post-switch token then follow the
+                // single-token trajectory (identical to spec-off) instead of
+                // being batch-verified: a verification batch that closes the
+                // tag carries post-tag tokens the batch cut discards, and a
+                // batch-computed token at the mode transition can diverge
+                // numerically from the single-token one and drop the answer.
+                // The replay branch below is exempt - its leftover draft was
+                // already cut and carries no post-tag tokens.
+                bool da_draft_gate = false;
+                if (n_draft_max > 0 && slot.spec_draft.empty() &&
+                    !slot.task->params.da_chunks.empty()) {
+                    const bool da_just_closed = slot.da_skip_draft;
+                    da_draft_gate = da_just_closed ||
+                            da_tag_inflight(slot.generated.text, slot.da_mode);
+                    slot.da_skip_draft = false;
+                    if (da_draft_gate) {
+                        if (da_just_closed) {
+                            SLT_INF_DBG(slot, "%s", "da_tag: draft skipped (first step after tag close)\n");
+                        } else {
+                            SLT_DBG(slot, "%s", "da_tag: draft skipped (tag in flight)\n");
+                        }
+                    }
+                }
+
+                if (n_draft_max > 0 && !da_draft_gate) {
                     GGML_ASSERT(slot.can_speculate());
 
                     // stale candidates: a replay never reads them, a new draft refills them
@@ -3839,18 +4837,18 @@ private:
 
                         slot.spec_ckpt.update_pos(
                                 slot.prompt.n_tokens(),
-                                llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id),
-                                llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id));
+                                llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.kv_seq()),
+                                llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.kv_seq()));
 
                         if (use_ckpt_dft) {
-                            slot.spec_ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                            slot.spec_ckpt.update_dft(ctx_dft, slot.kv_seq(), LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                         }
 
                         slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
 
                         const bool spec_reject = slot.use_spec_rejection();
 
-                        common_speculative_get_draft_params(spec.get(), slot.id) = {
+                        common_speculative_get_draft_params(spec.get(), slot.kv_seq()) = {
                             /* .drafting = */ true,
                             /* .n_max    = */ n_draft_max,
                             /* .pos0     = */ slot.prompt.tokens.pos_next(),
@@ -3887,11 +4885,11 @@ private:
 
             if (ctx_dft) {
                 if (use_ckpt_dft) {
-                    GGML_ASSERT(ckpt.load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
+                    GGML_ASSERT(ckpt.load_dft(ctx_dft, slot.kv_seq(), LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
                 }
 
-                if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, ckpt.pos_max + 1, -1)) {
-                    GGML_ABORT("failed to remove sequence %d\n", slot.id);
+                if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.kv_seq(), ckpt.pos_max + 1, -1)) {
+                    GGML_ABORT("failed to remove sequence %d\n", (int) slot.kv_seq());
                 }
             }
 
@@ -3906,7 +4904,7 @@ private:
                 if (use_ckpt_tgt) {
                     //const int64_t t_start = ggml_time_us();
 
-                    ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    ckpt.update_tgt(ctx_tgt, slot.kv_seq(), LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
 
                     //const int64_t t_total = ggml_time_us() - t_start;
                     //printf("checkpoint total: %f ms\n", t_total / 1000.0);
@@ -3918,7 +4916,7 @@ private:
                 }
 
                 if (use_ckpt_dft) {
-                    ckpt.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    ckpt.update_dft(ctx_dft, slot.kv_seq(), LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                 }
             }
         });
@@ -3978,8 +4976,46 @@ private:
 
                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
 
+                        // the tag path (da_chunks) supersedes the static da_rm
+                        // removals: the model's own tag decides the ranges
+                        slot.da_rm_pending = !slot.task->params.da_rm.empty() && slot.task->params.da_chunks.empty();
+                        slot.da_rm_gate_diag_done = false;
+
                         SLT_TRC(slot, "new prompt, n_ctx_slot = %d, n_keep = %d, task.n_tokens = %d\n",
                                 slot.n_ctx, slot.task->params.n_keep, slot.task->n_tokens());
+
+                        // da_rm diagnostics: full input state at request start, so the
+                        // journal shows whether the fields arrived and whether the
+                        // mid-prefill gate can run. Note: has_mtmd is true for
+                        // text-only prompts too when the server has an mmproj loaded
+                        // (mctx != nullptr), so n_media distinguishes real media.
+                        if (slot.da_rm_pending || slot.task->params.da_rm_at >= 0) {
+                            const size_t n_total = slot.task->tokens.size();
+                            const size_t n_text  = slot.task->tokens.get_text_tokens().size();
+                            slot.da_rm_text_only = (n_text == n_total);
+                            SLT_INF_DBG(slot, "da_rm: request start - %zu range(s), da_rm_at=%d, da_b=%d, n_tokens=%zu, has_mtmd=%d, n_text=%zu, n_media=%zu\n",
+                                    slot.task->params.da_rm.size(), slot.task->params.da_rm_at,
+                                    (int) slot.task->params.da_b,
+                                    n_total, (int) slot.task->tokens.has_mtmd, n_text, n_total - n_text);
+                            for (const auto & range : slot.task->params.da_rm) {
+                                SLT_INF_DBG(slot, "da_rm:   range [%d, %d)\n", range.first, range.second);
+                            }
+                        }
+
+                        // da_tag diagnostics: the model's own <focus
+                        // magic_chunks="N"> tag drives the removals; the client
+                        // only supplies the chunk layout.
+                        if (!slot.task->params.da_chunks.empty()) {
+                            SLT_INF_DBG(slot, "da_tag: request start - %zu chunk(s), da_b=%d, filler=%s\n",
+                                    slot.task->params.da_chunks.size(), (int) slot.task->params.da_b,
+                                    slot.task->params.da_filler.first >= 0
+                                        ? string_format("[%d, %d)", slot.task->params.da_filler.first, slot.task->params.da_filler.second).c_str()
+                                        : "none");
+                            for (size_t n = 0; n < slot.task->params.da_chunks.size(); n++) {
+                                SLT_INF_DBG(slot, "da_tag:   chunk %zu [%d, %d)\n", n + 1,
+                                        slot.task->params.da_chunks[n].first, slot.task->params.da_chunks[n].second);
+                            }
+                        }
 
                         // print prompt tokens (for debugging)
                         /*if (1) {
@@ -3996,6 +5032,16 @@ private:
 
                         // keep track how many tokens we can reuse from the previous state
                         int n_past = 0;
+                        // Option B (--kv-offload-holes): set if the n_cache_reuse
+                        // shift block moved KV this request - the pending hole
+                        // coordinates (recorded in the final token space) would be
+                        // stale, so the holes are deferred rather than applied.
+                        // Slot member: the progressive (mid-prefill) path in
+                        // decode() reads it too. The progressive progress ledger
+                        // is request-scoped - fresh for every (re-)prefill.
+                        slot.kv_hole_shift_blocked = false;
+                        slot.kv_hole_progress.clear();
+                        slot.kv_hole_peak_resident = 0;
 
                         // empty prompt passed -> release the slot and send empty response
                         if (input_tokens.empty()) {
@@ -4081,6 +5127,10 @@ private:
                                     n_past = std::min(n_past, slot.alora_invocation_start - 1);
                                 }
 
+                                if (n_past > 0) {
+                                    SLT_INF(slot, "cache reuse: n_past = %d\n", n_past);
+                                }
+
                                 const auto n_cache_reuse = slot.task->params.n_cache_reuse;
 
                                 const bool can_cache_reuse =
@@ -4121,6 +5171,11 @@ private:
                                             //    SLT_DBG(slot, "cache token %3zu: %6d '%s'\n", i, prompt_tokens[i], common_token_to_piece(ctx_tgt, prompt_tokens[i]).c_str());
                                             //}
 
+                                            // Option B: the shift moved KV, so any pending
+                                            // hole coordinates (recorded in the pre-shift
+                                            // token space) are stale - defer them.
+                                            slot.kv_hole_shift_blocked = true;
+
                                             const int64_t kv_shift = (int64_t) head_p - (int64_t) head_c;
 
                                             slot.mem.seq_rm (slot.id, head_p, head_c);
@@ -4146,9 +5201,6 @@ private:
                             }
 
                             llama_pos pos_next = slot.prompt.tokens.pos_next(n_past);
-
-                            // number of cached tokens shared with the new prompt, before any checkpoint is restored
-                            const int n_prefix = n_past;
 
                             // ref: https://github.com/ggml-org/llama.cpp/pull/24110
                             const bool has_new_tokens = (n_past < slot.task->n_tokens());
@@ -4203,7 +5255,7 @@ private:
                                     SLT_WRN(slot, "%s\n", st1.str().c_str());
                                 }
 
-                                auto reuse = slot.prompt.get_reuse(n_past, has_new_tokens, n_swa_reuse, pos_min);
+                                auto reuse = slot.prompt.get_reuse(n_past, has_new_tokens, n_swa_reuse, pos_min, ctx_tgt_state_exact());
 
                                 if (reuse.ckpt) {
                                     const auto & cur = *reuse.ckpt;
@@ -4221,7 +5273,29 @@ private:
                                         // restore the draft's speculative state
                                         common_speculative_set_state(spec.get(), slot.id, cur.data_spec);
 
-                                        SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, reuse.n_past, (float) cur.size() / 1024 / 1024);
+                                        // validate the restored state (hybrid/recurrent memory only):
+                                        // a context checkpoint serializes the recurrent state, but its
+                                        // position label was recorded as min(attn, recr). If the attention
+                                        // side was hole-cut - or left stale by an earlier PARTIAL_ONLY
+                                        // restore - when the checkpoint was saved, the label is lower than
+                                        // the recurrent position the state actually holds. Resuming at the
+                                        // label is impossible (the recurrent state cannot roll back beyond
+                                        // n_rs_seq), so discard the checkpoint and re-prefill from 0
+                                        // (plans/2026-10-07-kv-400-incident2.md).
+                                        // The label is compared against the actual recurrent position, not
+                                        // n_tokens - 1: the label == n_tokens - 1 identity holds in the
+                                        // incident logs, but it is not a general invariant - hole/evict
+                                        // paths can diverge n_tokens from position, which would
+                                        // false-positive healthy checkpoints.
+                                        const llama_pos recr_pos = llama_memory_seq_pos_max_recr(llama_get_memory(ctx_tgt), slot.id);
+                                        if (recr_pos >= 0 && recr_pos != cur.pos_max) {
+                                            SLT_WRN(slot, "context checkpoint label (pos_max = %d) does not match the restored recurrent position (%d) - discarding checkpoint, wiping sequence and re-prefilling from 0\n",
+                                                    cur.pos_max, (int) recr_pos);
+                                            slot.mem.seq_rm_checked(slot.id, -1, -1);
+                                            reuse = {};
+                                        } else {
+                                            SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, reuse.n_past, (float) cur.size() / 1024 / 1024);
+                                        }
                                     }
                                 }
 
@@ -4235,11 +5309,19 @@ private:
                             }
 
                             {
-                                // erase any checkpoints with pos_max > pos_next, or that cover tokens not shared with the new prompt
+                                // erase any checkpoints that cover diverged content - once the new
+                                // tokens are decoded, their staleness would become undetectable
+                                const llama_pos pos_stale = std::min(pos_next, slot.task->tokens.pos_next());
+
+                                // an exact checkpoint at the divergence position irreversibly contains
+                                // the diverged token, while a range (SWA) checkpoint gets that entry
+                                // overwritten when decoding resumes from it
+                                const llama_pos pos_stale_min = ctx_tgt_state_exact() ? pos_stale : pos_stale + 1;
+
                                 for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end();) {
                                     const auto & cur = **it;
-                                    if (cur.pos_max > pos_next || cur.n_tokens > n_prefix) {
-                                        SLT_TRC(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_swa = %d, pos_next = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_swa, pos_next, (float) cur.size() / 1024 / 1024);
+                                    if (cur.pos_max > pos_next || cur.pos_max >= pos_stale_min) {
+                                        SLT_INF(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_swa = %d, pos_next = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_swa, pos_next, (float) cur.size() / 1024 / 1024);
                                         it = slot.prompt.checkpoints.erase(it);
                                     } else {
                                         ++it;
@@ -4261,6 +5343,257 @@ private:
                         metrics.add_prompt_cached(n_past);
 
                         slot.prompt.tokens.keep_first(n_past);
+
+                        // Option B (--kv-offload-holes):
+                        // (a) n_past == 0 -> the whole sequence is wiped by the
+                        //     tail seq_rm below, so the applied holes are gone;
+                        //     clear the ledger. Covers every path that zeroes
+                        //     n_past (cache_prompt off, checkpoint do_reset, slot
+                        //     takeover by another session). The pending holes are
+                        //     request-scoped (task_params::kv_hole_pending) and
+                        //     are not applied here (there is no KV to cut) - the
+                        //     gate re-plans them on the next request.
+                        // (b) apply the pending holes (planned by the eviction
+                        //     gate this request, request-scoped) now that the
+                        //     matched-prefix KV is known to exist: each hole must
+                        //     lie fully inside [0, n_past) (its KV was created by
+                        //     an earlier prefill) and the shift block must not
+                        //     have moved the KV. Idempotent: the gate re-plans
+                        //     the same holes every request (the evicted text is
+                        //     kept, so the token count stays over the threshold),
+                        //     so holes already in the applied ledger are skipped.
+                        //     Per-hole: a hole is cut iff its KV is inside the
+                        //     matched prefix (hi <= n_past); the rest are deferred
+                        //     and retried on the next request (disjoint ranges -
+                        //     no cross-hole dependency). All-or-nothing livelocked
+                        //     a growing session: one hole in the re-prefilled tail
+                        //     blocked all ~80 (2026-09-26 production journal).
+                        // Item 4: expire stale ledger entries before (re)applying.
+                        // A hole with hi > n_past sits in the re-prefilled region, so
+                        // its KV was freshly written and is not reliably cut. Keeping
+                        // it inflates the resident projection (n_past - ledger_span)
+                        // and lets the dedup below skip a re-plan that needs the cut.
+                        // Expire it; the gate re-plans and the apply path re-cuts
+                        // once hi <= n_past.
+                        if (n_past > 0 && !slot.kv_hole_ranges.empty()) {
+                            // 2026-10-12: the shared expire rule (kv_holes_survive) -
+                            // the same function the gate's kv_session_valid_cut uses
+                            // with its simulated n_past.
+                            const auto valid = kv_holes_survive(slot.kv_hole_ranges, n_past);
+                            if (valid.size() != slot.kv_hole_ranges.size()) {
+                                for (const auto & r : slot.kv_hole_ranges) {
+                                    if (r.second > n_past) {
+                                        SLT_INF_DBG(slot, "kv-offload-holes: expiring stale hole [%d, %d) (hi > n_past=%d) - KV re-prefilled, re-plan will re-apply\n",
+                                                (int) r.first, (int) r.second, n_past);
+                                    }
+                                }
+                                slot.kv_hole_ranges = std::move(valid);
+                            }
+                            if (slot.kv_hole_ranges.empty()) {
+                                slot.kv_holes_active = false;
+                            }
+                        }
+                        // kv-recut: re-apply every remaining ledger range. All have
+                        // hi <= n_past here (stale ones expired above), so the
+                        // recurrent tail (at n_past) is untouched and the op is an
+                        // idempotent metadata no-op on already-cut ranges. A
+                        // checkpoint restore may re-materialize cells the ledger
+                        // believes are cut (2026-10-10 2nd incident: all 48694
+                        // cut cells survived a PARTIAL_ONLY restore), and the
+                        // n_past path would otherwise never re-cut them (the
+                        // pending dedup skips ranges already in the ledger; an
+                        // idle gate plans nothing). Measure the freed cells so
+                        // the journal confirms the ledger matches the physical
+                        // pool; a rejected range is dropped so the gate's
+                        // resident projection stays honest.
+                        if (n_past > 0 && !slot.kv_hole_shift_blocked && !slot.kv_hole_ranges.empty()) {
+                            auto * m = llama_get_memory(ctx_tgt);
+                            const int32_t f0 = llama_memory_n_free_cells(m);
+                            int span = 0;
+                            for (auto it = slot.kv_hole_ranges.begin(); it != slot.kv_hole_ranges.end(); ) {
+                                if (!slot.mem.seq_rm_checked(slot.kv_seq(), it->first, it->second)) {
+                                    SLT_WRN_DBG(slot, "kv-recut: [%d, %d) rejected - dropping from ledger\n", (int) it->first, (int) it->second);
+                                    it = slot.kv_hole_ranges.erase(it);
+                                    continue;
+                                }
+                                span += it->second - it->first;
+                                ++it;
+                            }
+                            if (slot.kv_hole_ranges.empty()) {
+                                slot.kv_holes_active = false;
+                            }
+                            SLT_INF_DBG(slot, "kv-recut: %zu range(s), span=%d, freed=%d\n",
+                                    slot.kv_hole_ranges.size(), span, llama_memory_n_free_cells(m) - f0);
+                        }
+                        if (n_past == 0) {
+                            if (slot.kv_holes_active || !slot.kv_hole_ranges.empty()) {
+                                SLT_INF_DBG(slot, "kv-offload-holes: n_past=0 (sequence wiped) - clearing hole ledger (%zu applied)\n",
+                                        slot.kv_hole_ranges.size());
+                                slot.kv_hole_ranges.clear();
+                                slot.kv_holes_active = false;
+                            }
+                        } else if (!slot.kv_hole_shift_blocked && !slot.task->params.kv_hole_pending.empty()) {
+                            std::vector<std::pair<int32_t, int32_t>> fresh;
+                            for (const auto & r : slot.task->params.kv_hole_pending) {
+                                // Item 4: overlap-aware dedup. The gate re-plans the
+                                // same holes every request; a re-plan whose range
+                                // overlaps an already-applied entry (even with a
+                                // +-1 coordinate shift) must be skipped - re-cutting
+                                // is a no-op, but recording it again would
+                                // double-count the span (the projection assumes a
+                                // larger cut than physically happened, so it can
+                                // admit a request that overflows the buffer).
+                                bool dup = false;
+                                for (const auto & a : slot.kv_hole_ranges) {
+                                    if (a.first < r.second && r.first < a.second) {
+                                        dup = true;
+                                        break;
+                                    }
+                                }
+                                if (!dup) {
+                                    fresh.push_back(r);
+                                }
+                            }
+                            if (fresh.size() != slot.task->params.kv_hole_pending.size()) {
+                                SLT_INF_DBG(slot, "kv-offload-holes: %zu pending hole(s) already applied - skipping re-apply\n",
+                                        slot.task->params.kv_hole_pending.size() - fresh.size());
+                            }
+                            if (!fresh.empty()) {
+                                int span = 0;
+                                size_t n_applied = 0;
+                                size_t n_deferred = 0;
+                                size_t n_noop = 0;
+                                for (const auto & r : fresh) {
+                                    if (r.first < 0 || r.second <= r.first || r.second > n_past || (size_t) r.second > input_tokens.size()) {
+                                        n_deferred++;
+                                        continue;
+                                    }
+                                    // fail-open (kv-offload never aborts the server): a range that is no longer
+                                    // removable is typically already cut (e.g. a checkpoint restored the KV with
+                                    // the hole while the ledger entry was lost or differs) - re-cutting is a no-op,
+                                    // so record it to keep the per-request re-plan idempotent.
+                                    if (!slot.mem.seq_rm_checked(slot.kv_seq(), r.first, r.second)) {
+                                        SLT_WRN_DBG(slot, "kv-offload-holes: seq_rm no-op for [%d, %d) in main seq %d (n_past=%d) - recording as applied\n",
+                                                r.first, r.second, (int) slot.kv_seq(), n_past);
+                                        slot.kv_hole_ranges.push_back(r);
+                                        n_noop++;
+                                        continue;
+                                    }
+                                    slot.kv_hole_ranges.push_back(r);
+                                    span += r.second - r.first;
+                                    n_applied++;
+                                }
+                                if (n_applied + n_noop > 0) {
+                                    slot.kv_holes_active = true;
+                                }
+                                if (n_applied > 0) {
+                                    SLT_INF_DBG(slot, "kv-offload-holes: applied %zu hole(s), %d token span, in main seq %d (n_past=%d)\n",
+                                            n_applied, span, (int) slot.kv_seq(), n_past);
+                                }
+                                if (n_noop > 0) {
+                                    SLT_INF_DBG(slot, "kv-offload-holes: %zu hole(s) already cut (no-op), recorded in ledger\n", n_noop);
+                                }
+                                if (n_deferred > 0) {
+                                    SLT_INF_DBG(slot, "kv-offload-holes: deferring %zu pending hole(s) (n_past=%d, need hi<=n_past)\n",
+                                            n_deferred, n_past);
+                                }
+                            }
+                        }
+
+                        // kv-offload-holes: the ledger just changed (expire /
+                        // apply / n_past=0 clear) - refresh the session's
+                        // actual-cut entry so the next gate sees the real
+                        // resident.
+                        kv_session_cut_update(slot);
+                        // kv-probe: physical occupancy vs the ledger, so the
+                        // journal shows whether the holes are really cut
+                        // (used ≈ prompt - ledger_cut) or the ledger lags the
+                        // physical state (2026-10-10: holes cut 0 with ~101k
+                        // resident after an idle-slot clear).
+                        /*
+                        if (params_base.kv_cache_size > 0) {
+                            const int32_t n_free = llama_memory_n_free_cells(llama_get_memory(ctx_tgt));
+                            int64_t probe_cut = 0;
+                            for (const auto & r : slot.kv_hole_ranges) {
+                                probe_cut += (int64_t) (r.second - r.first);
+                            }
+                            SLT_INF_DBG(slot, "kv-probe: used=%d free=%d ledger_cut=%d prompt=%d buffer=%d\n",
+                                    n_free >= 0 ? (int) (params_base.kv_cache_size - n_free) : -1, n_free,
+                                    (int) probe_cut, (int) slot.prompt.n_tokens(), params_base.kv_cache_size);
+                        }
+                        */
+
+                        // progressive apply: seed the peak tracker with the
+                        // resident at prefill start (the matched prefix minus
+                        // the holes already cut out of it). The per-batch
+                        // progressive cut (kv_holes_progressive_apply) raises
+                        // it as the head advances; the end-of-prefill summary
+                        // reports it.
+                        {
+                            int32_t ledger_span = 0;
+                            size_t n_stale = 0;
+                            for (const auto & r : slot.kv_hole_ranges) {
+                                ledger_span += r.second - r.first;
+                                if (r.second > n_past) {
+                                    n_stale++;
+                                }
+                            }
+                            if (ledger_span > n_past || n_stale > 0) {
+                                SLT_WRN_DBG(slot, "kv-offload-holes: ledger polluted - span=%d, n_past=%d, %zu stale hole(s) with hi>n_past (overlapping/stale entries inflate the resident projection)\n",
+                                        ledger_span, n_past, n_stale);
+                            }
+                            slot.kv_hole_peak_resident = n_past - ledger_span;
+                        }
+
+                        // (2026-10-12, incident 2026-10-12) Secondary safety net:
+                        // the gate's estimate (HTTP thread) and the actual n_past
+                        // (here, after the checkpoint restore + hole
+                        // expire/recut/apply) can diverge - the gate ran
+                        // milliseconds before the prior task's release, a
+                        // checkpoint restore lands below the LCP, and the
+                        // wipe path clears the ledger. If the projected prefill
+                        // peak cannot fit the physical buffer, fail fast with a
+                        // 503 (retryable: the client compacts and retries
+                        // smaller) instead of the ~60s prefill + find_slot
+                        // cascade + slot abort + KV clear. The progressive cut
+                        // keeps the live-cell peak at the final resident plus
+                        // one in-flight sub-batch, so
+                        //   peak = prompt - (applied + pending cuts) + n_batch.
+                        // The prefill has not started, so the slot's KV is still
+                        // the consistent n_past prefix - release() keeps it for
+                        // the next request's LCP match (no prompt_clear).
+                        if (params_base.kv_cache_size > 0) {
+                            int64_t ledger_cut = 0;
+                            for (const auto & r : slot.kv_hole_ranges) {
+                                ledger_cut += (int64_t) (r.second - r.first);
+                            }
+                            int64_t pending_cut = 0;
+                            if (!slot.kv_hole_shift_blocked) {
+                                // the n_cache_reuse shift moved the KV: the pending
+                                // coordinates are stale and the progressive path
+                                // skips them this prefill - do not count the cut
+                                // (when uncertain, bias to the evict side).
+                                for (const auto & r : slot.task->params.kv_hole_pending) {
+                                    pending_cut += (int64_t) (r.second - r.first);
+                                }
+                            }
+                            const int64_t prefill_peak = (int64_t) slot.task->n_tokens() - ledger_cut - pending_cut + n_batch;
+                            if (prefill_peak > (int64_t) params_base.kv_cache_size) {
+                                SLT_ERR(slot, "kv_offload: prefill peak %d exceeds buffer %d (n_past=%d, ledger_cut=%d, pending_cut=%d) - rejecting with 503 (retryable: client compacts and retries)\n",
+                                        (int) prefill_peak, params_base.kv_cache_size, n_past,
+                                        (int) ledger_cut, (int) pending_cut);
+                                // The message intentionally matches the client's
+                                // context-overflow patterns (and carries the real
+                                // token counts for parseTokenCounts): reactive
+                                // compaction is the recovery path.
+                                send_error(slot,
+                                           string_format("Context length exceeded: %d tokens > %d limit",
+                                                         (int) prefill_peak, params_base.kv_cache_size),
+                                           ERROR_TYPE_UNAVAILABLE);
+                                slot.release();
+                                return;
+                            }
+                        }
 
                         // this is to signal the client that the request has started processing
                         if (slot.task->params.stream) {
@@ -4292,7 +5625,25 @@ private:
 
                     SLT_TRC(slot, "cached n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
 
-                    slot.mem.seq_rm(slot.id, p0, -1);
+                    if (!slot.mem.seq_rm_checked(slot.kv_seq(), p0, -1)) {
+                        // fail-open (the server never aborts on a cache inconsistency): the
+                        // recurrent state cannot be rolled back to n_past - e.g. a context
+                        // checkpoint whose recurrent state is newer than its position label
+                        // (see plans/2026-10-07-kv-400-incident2.md). The cached prefix is
+                        // unusable: wipe the whole sequence (target + draft) and re-prefill
+                        // from 0. Full removal always succeeds (rm_all).
+                        SLT_WRN(slot, "truncate seq_rm failed (p0=%d) - recurrent state cannot roll back to n_past; wiping sequence and re-prefilling from 0\n", p0);
+                        slot.mem.seq_rm_checked(slot.kv_seq(), -1, -1);
+                        slot.prompt.tokens.clear();
+                        slot.stats.n_prompt_cached = 0;
+                        // the wiped KV invalidates the applied holes; the request-scoped
+                        // pending holes survive and are re-cut progressively during the
+                        // re-prefill
+                        slot.kv_hole_ranges.clear();
+                        slot.kv_holes_active = false;
+                        slot.kv_hole_peak_resident = 0;
+                        kv_session_cut_update(slot);
+                    }
 
                     // shared prompt prefix: once it is processed, the children continue from it with their own prompt
                     bool wait_shared = false;
@@ -4310,6 +5661,22 @@ private:
                                 wait_shared = true;
                             }
                         }
+                    }
+
+                    // kv-probe (post-trim): occupancy after the tail trim, so the
+                    // used value is comparable to the ledger (the STARTED-block
+                    // probe runs before this trim and overstates used by the
+                    // trimmed tail - 2026-10-10). Hole sessions only.
+                    // FOCUS_SPARSE_DEBUG-gated: fires once per prompt sub-batch.
+                    if (focus_sparse_debug() && params_base.kv_cache_size > 0 && !slot.kv_hole_ranges.empty()) {
+                        const int32_t n_free = llama_memory_n_free_cells(llama_get_memory(ctx_tgt));
+                        int64_t probe_cut = 0;
+                        for (const auto & r : slot.kv_hole_ranges) {
+                            probe_cut += (int64_t) (r.second - r.first);
+                        }
+                        SLT_INF_DBG(slot, "kv-probe (post-trim): used=%d free=%d ledger_cut=%d prompt=%d\n",
+                                n_free >= 0 ? (int) (params_base.kv_cache_size - n_free) : -1, n_free,
+                                (int) probe_cut, (int) slot.prompt.n_tokens());
                     }
 
                     // If using an alora, there may be uncached tokens that come
@@ -4345,6 +5712,36 @@ private:
                     if (use_mixed_batch() && !slot.can_split() && input_tokens.has_mtmd) {
                         if (!add_prompt_mixed(slot)) {
                             return;
+                        }
+                    }
+
+                    // Declarative Attention: apply the pending removals once prompt
+                    // prefill has crossed da_rm_at. The KV for [0, da_rm_at) is
+                    // complete at this point (tokens pushed in earlier rounds have
+                    // been decoded), so the remaining prompt is prefilled without
+                    // the removed ranges. Mid-prefill application is skipped for
+                    // prompts that contain media (the boundary must not fall
+                    // inside an mtmd chunk); those fall through to the
+                    // post-prefill path. has_mtmd is not the right test here: it
+                    // is true whenever an mmproj is loaded, even for text-only
+                    // prompts, so the guard uses da_rm_text_only (the prompt has
+                    // no media chunks).
+                    if (slot.da_rm_pending && slot.task->params.da_rm_at >= 0 &&
+                            slot.prompt.n_tokens() >= slot.task->params.da_rm_at) {
+                        if (slot.da_rm_text_only) {
+                            if (slot.task->params.da_b) {
+                                apply_da_b(slot, slot.task->params.da_rm, da_static_bound(slot), "at da_rm_at");
+                            } else {
+                                apply_da_rm(slot, slot.task->params.da_rm, da_static_bound(slot), "at da_rm_at");
+                            }
+                            slot.da_rm_pending = false;
+                        } else if (!slot.da_rm_gate_diag_done) {
+                            slot.da_rm_gate_diag_done = true;
+                            const size_t n_total = slot.task->tokens.size();
+                            const size_t n_text  = slot.task->tokens.get_text_tokens().size();
+                            SLT_INF_DBG(slot, "da_rm: mid-prefill boundary reached but skipped (media present) - da_rm_at=%d has_mtmd=%d n_tokens=%d n_text=%zu n_media=%zu; applying after prefill instead (the boundary may fall inside an mtmd chunk)\n",
+                                    slot.task->params.da_rm_at, (int) slot.task->tokens.has_mtmd, (int) slot.prompt.n_tokens(),
+                                    n_text, n_total - n_text);
                         }
                     }
 
@@ -4427,7 +5824,10 @@ private:
                         // embedding requires all tokens in the batch to be output;
                         // MTP also wants logits at every prompt position so the
                         // streaming hook can mirror t_h_nextn into ctx_dft.
-                        add_ok &= batch.add(slot.id,
+                        // kv_seq(): after a 2-stream (B) switch the remaining
+                        // prompt (e.g. the question) is prefilled on the new
+                        // sequence.
+                        add_ok &= batch.add(slot.kv_seq(),
                             cur_tok,
                             /* pos       = */ slot.prompt.tokens.pos_next(),
                             /* output    = */ slot.need_embd(),
@@ -4439,6 +5839,24 @@ private:
                             batch.set_decision_group(batch.size() - 1, slot.task->decision.group[slot.prompt.n_tokens()]);
                         }
                         slot.prompt.tokens.push_back(cur_tok);
+
+                        // Declarative Attention: stop filling at the removal boundary
+                        // so the removals can run before the remaining prompt
+                        // (e.g. the question) is prefilled. Without this break the
+                        // checkpoint offset (4 tokens before the end) would push the
+                        // first batch past da_rm_at and the removal would apply too
+                        // late. da_rm_text_only, not has_mtmd: the latter is true
+                        // for text-only prompts on an mmproj server.
+                        if (slot.da_rm_pending && slot.task->params.da_rm_at >= 0 &&
+                                slot.da_rm_text_only &&
+                                slot.prompt.n_tokens() >= slot.task->params.da_rm_at) {
+                            // fires at most once: da_rm_pending is cleared when the
+                            // gate applies the removals in the next prefill round
+                            SLT_INF_DBG(slot, "da_rm: batch fill stopped at boundary - n_tokens=%d, da_rm_at=%d, %d token(s) left to prefill after removal\n",
+                                    (int) slot.prompt.n_tokens(), slot.task->params.da_rm_at,
+                                    (int) (slot.task->n_tokens() - slot.prompt.n_tokens()));
+                            break;
+                        }
 
                         // break at the last user message, or at user messages at least min step past the last checkpoint
                         if (do_checkpoint && spans.is_user_start(slot.prompt.n_tokens())) {
@@ -4509,7 +5927,13 @@ private:
                     }
 
                     const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
-                    const auto pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+                    // the label a PARTIAL_ONLY checkpoint must record: the position at which
+                    // the serialized state can be resumed. For hybrid memory the state is the
+                    // recurrent state only, so this is the recurrent position - not
+                    // seq_pos_max() (min(attn, recr)), which is lower whenever the attention
+                    // side is hole-cut or truncated to n_past by a checkpoint restore and
+                    // would poison the label below the state (plans/2026-10-07-kv-400-incident2.md)
+                    const auto pos_max = llama_memory_seq_pos_max_partial(llama_get_memory(ctx_tgt), slot.id);
 
                     // nothing to checkpoint yet
                     // TODO: is this check needed?
@@ -4635,6 +6059,10 @@ private:
             has_output |= batch.tokens[i].output;
         }
 
+        // DA: push the n_kv_max bound for this window before the decode
+        // (no-op while the value is unchanged; 0 = dense)
+        update_da_n_kv_max(off, batch.view.size());
+
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
@@ -4668,6 +6096,19 @@ private:
 
                 if (!err.empty()) {
                     SRV_ERR("%s off = %d, n_batch = %d, ret = %d\n", err.c_str(), off, n_batch, ret);
+
+                    // L6: who holds the KV at the moment of the decode fail
+                    // (progressive-cut verification: applied holes + pending
+                    // holes + observed peak vs the buffer)
+                    for (auto & s : slots) {
+                        if (!s.is_processing()) continue;
+                        int span = 0;
+                        for (auto & r : s.kv_hole_ranges) span += (int) (r.second - r.first);
+                        SRV_ERR_DBG("da_trace: decode fail slot=%d prompt=%d cached=%d holes_applied=%zu span=%d progress=%zu pending=%zu peak=%d buffer=%d da_seq=%d\n",
+                                s.id, (int) s.prompt.n_tokens(), (int) s.stats.n_prompt_cached, s.kv_hole_ranges.size(), span,
+                                s.kv_hole_progress.size(), s.task ? s.task->params.kv_hole_pending.size() : 0,
+                                s.kv_hole_peak_resident, params_base.kv_cache_size, (int) s.da_seq);
+                    }
 
                     for (auto & slot : slots) {
                         if (slot.is_processing()) {
@@ -4743,6 +6184,1309 @@ private:
         return true;
     }
 
+    // kv-offload-holes progressive apply (prefill-time hole cutting): after
+    // each successful prompt sub-batch, cut the pending holes whose KV has
+    // been written so far. Without this, a (re-)prefill of a prompt whose
+    // evicted text is kept (Option B) writes every token to cells before the
+    // holes are cut at the next request's n_past check - the prefill peak is
+    // the raw prompt length, which exceeds a decoupled buffer B < n_ctx and
+    // hard-fails in find_slot ("Context size has been exceeded", 2026-10-06
+    // production journal, 66025 tokens vs B = 65536). Cutting as the head
+    // passes keeps the peak near the projected resident + one batch.
+    //
+    // Per hole, [max(lo, applied_until), min(hi, done)) is cut, where done is
+    // this slot's processed prefix length (its max processed position + 1).
+    // The batch path (STARTED block) already cut the holes fully inside the
+    // matched prefix (hi <= n_past) - they are in the applied ledger and are
+    // excluded here; this path handles the holes in the freshly re-prefilled
+    // region that the batch path deferred (hi > n_past).
+    //
+    // The cut reuses the production hole path (common_memory::seq_rm_checked,
+    // fail-open): a rejected cut - e.g. a recurrent-state hybrid whose state
+    // cannot roll back that far (rollback bounded by n_rs_seq) - keeps the
+    // progress and is retried as the head passes the hole (once the head is
+    // past it the cut is a plain untag). If it never cuts, the n_past path
+    // applies it on the next request (the hole's KV is then fully inside the
+    // matched prefix). A fully cut hole joins the applied ledger (drives the
+    // release() cache policy, the dense n_kv_max override, and the
+    // per-request re-plan idempotency).
+    void kv_holes_progressive_apply(int32_t n_processed) {
+        iterate(slots, [&](server_slot & slot) {
+            if (slot.kv_hole_shift_blocked) {
+                return; // the shift moved the KV - the hole coordinates are stale
+            }
+            if (slot.state != SLOT_STATE_PROCESSING_PROMPT && slot.state != SLOT_STATE_DONE_PROMPT) {
+                return; // generation batches carry no prompt tokens
+            }
+            if (!slot.task || slot.task->params.kv_hole_pending.empty()) {
+                return; // no holes planned - zero overhead for plain traffic
+            }
+
+            // this slot's processed prefix length: the max position of its
+            // prompt tokens in the processed part of the batch (+1). The
+            // matched prefix [0, n_past) is not in the batch (its KV already
+            // exists), so the first token of the round sits at n_past.
+            llama_pos max_pos = -1;
+            for (int32_t i = 0; i < n_processed; ++i) {
+                const auto & t = batch.tokens[i];
+                if (t.id_slot == slot.kv_seq() && t.is_prompt && t.pos[0] > max_pos) {
+                    max_pos = t.pos[0];
+                }
+            }
+            if (max_pos < 0) {
+                return; // nothing of this slot's prompt processed yet
+            }
+            const llama_pos done = max_pos + 1;
+
+            // lazily build the per-hole progress ledger for this request:
+            // the pending holes minus the ones already in the applied ledger
+            // (cut by the batch path this request or in a previous one).
+            if (slot.kv_hole_progress.empty()) {
+                for (const auto & r : slot.task->params.kv_hole_pending) {
+                    bool applied = false;
+                    for (const auto & a : slot.kv_hole_ranges) {
+                        if (a.first == r.first && a.second == r.second) {
+                            applied = true;
+                            break;
+                        }
+                    }
+                    if (!applied) {
+                        slot.kv_hole_progress.push_back({ r.first, r.second, r.first });
+                    }
+                }
+            }
+
+            // resident = processed - cut so far (applied ledger + partial
+            // progress cuts); each hole is counted exactly once
+            int32_t cut_total = 0;
+            for (const auto & a : slot.kv_hole_ranges) {
+                cut_total += a.second - a.first;
+            }
+            for (const auto & h : slot.kv_hole_progress) {
+                cut_total += (int32_t) (h.applied_until - h.lo);
+            }
+
+            // the cell pressure is at write time: this batch's cells are
+            // already resident, and the cuts below only free cells for the
+            // next batch - measure the peak before cutting
+            const int32_t resident_pre = (int32_t) done - cut_total;
+            if (resident_pre > slot.kv_hole_peak_resident) {
+                slot.kv_hole_peak_resident = resident_pre;
+            }
+
+            for (size_t i = 0; i < slot.kv_hole_progress.size(); ++i) {
+                auto & h = slot.kv_hole_progress[i];
+                const llama_pos a = std::max(h.lo, h.applied_until);
+                // cut up to done-1, not done: a range with p1 > cell.pos
+                // (cell.pos = done-1 after this batch) straddles the
+                // recurrent tail and enters the rollback branch, which a
+                // hybrid rejects for big holes (rollback bounded by
+                // n_rs_seq). The lagging last token is picked up by the next
+                // round or the final n_past cut.
+                const llama_pos b = std::min(h.hi, done - 1);
+                if (b <= a) {
+                    continue;
+                }
+                if (!slot.mem.seq_rm_checked(slot.kv_seq(), a, b)) {
+                    // fail-open: keep the progress, retry as the head passes
+                    if (!h.fail_logged) {
+                        h.fail_logged = true;
+                        SLT_WRN_DBG(slot, "kv-offload-holes: progressive cut of [%d, %d) rejected at done=%d (seq %d) - retrying as the head passes; if it never cuts, the n_past path applies it on the next request\n",
+                                (int) a, (int) b, (int) done, (int) slot.kv_seq());
+                    }
+                    continue;
+                }
+                h.applied_until = b;
+                cut_total += (int32_t) (b - a);
+                if (b == h.hi) {
+                    // fully cut - join the applied ledger and stop tracking
+                    slot.kv_hole_ranges.push_back({ h.lo, h.hi });
+                    slot.kv_holes_active = true;
+                    slot.kv_hole_progress.erase(slot.kv_hole_progress.begin() + i);
+                    --i;
+                    kv_session_cut_update(slot);
+                    SLT_INF_DBG(slot, "kv-offload-holes: progressive cut completed [%d, %d) at done=%d (seq %d)\n",
+                            (int) h.lo, (int) h.hi, (int) done, (int) slot.kv_seq());
+                }
+            }
+
+            const int32_t resident = (int32_t) done - cut_total;
+            if (resident > slot.kv_hole_peak_resident) {
+                slot.kv_hole_peak_resident = resident;
+            }
+            // FOCUS_SPARSE_DEBUG-gated: fires once per prompt sub-batch.
+            if (focus_sparse_debug()) {
+                SLT_INF_DBG(slot, "kv-offload-holes: prefill progress - done=%d resident=%d (cut %d, peak %d, buffer %d)\n",
+                        (int) done, resident, cut_total, slot.kv_hole_peak_resident, params_base.kv_cache_size);
+            }
+        });
+    }
+
+    // Declarative Attention (W2 physical reduction): the per-batch n_kv_max
+    // bound pushed to the target context before each decode. Backends with a
+    // sparse flash-attention path (CUDA MMA_F16, Metal, Vulkan) use it to
+    // gather only the finite (attended) KV cells of each mask row, so the DA
+    // holes - physically still in the stream (A: cells untagged from the
+    // sequence, B: cells still tagged on the original sequence) - are skipped
+    // instead of read.
+    //
+    // A mask row's finite set grows monotonically with the token position
+    // (each row attends to a superset of the previous row's cells), so the
+    // last token of the batch carries the maximum count. Per slot it is the
+    // logical read set the DA logs already track:
+    //   A path: n_full - n_da_removed
+    //   B path: da_keep_count + (n_full - da_bound)
+    //   plain:  n_full (no holes, the whole causal row is finite)
+    // where n_full = slot.prompt.n_tokens() already includes this batch's
+    // tokens (handle_last_sampled_token adds them before decode() runs).
+    // The bound is set only when at least one slot has holes: for plain
+    // traffic it stays 0, so the flash-attn nodes (and the cached graphs)
+    // are untouched. When holes are present, every processing slot must be
+    // counted - the bound must never under-estimate any row's finite count,
+    // or the excess cells are silently dropped. The value is bucketed to 512
+    // because it is baked into the flash-attn nodes: a change rebuilds the
+    // cached graph, and 512 bounds that to ~1 rebuild per 512 generated
+    // tokens. Prefill batches stay dense (0): the bound must never be set
+    // while prompt tokens are being written, and one tile per query row is
+    // not worth it there.
+    void update_da_n_kv_max(int32_t off, int32_t n_tokens) {
+        // FOCUS_DA_DENSE=1: keep the dense path even with DA holes (A/B
+        // verification of the sparse kernel against the dense reference)
+        static const bool dense_override = []() {
+            const char * e = getenv("FOCUS_DA_DENSE");
+            if (e && atoi(e) != 0) {
+                // log once: without this, a leftover FOCUS_DA_DENSE=1 in the
+                // service env forces dense for the whole process with no trace
+                SRV_INF_DBG("%s", "da: FOCUS_DA_DENSE active - n_kv_max stays 0 (dense forced for A/B verification)\n");
+            }
+            return e && atoi(e) != 0;
+        }();
+        if (dense_override) {
+            return;
+        }
+
+        int64_t n_kv_max = 0;
+
+        bool prefill = false;
+        for (int32_t i = off; i < off + n_tokens; ++i) {
+            if (batch.tokens[i].is_prompt) {
+                prefill = true;
+                break;
+            }
+        }
+
+        if (!prefill) {
+            bool any_holes = false;
+            for (auto & slot : slots) {
+                if (slot.is_processing() && (slot.da_seq >= 0 || slot.da_removed_a || slot.kv_holes_active)) {
+                    any_holes = true;
+                    break;
+                }
+            }
+            if (any_holes) {
+                for (auto & slot : slots) {
+                    if (!slot.is_processing()) {
+                        continue;
+                    }
+                    const int32_t n_full = (int32_t) slot.prompt.n_tokens();
+                    int32_t n_read;
+                    if (slot.da_seq >= 0) {
+                        // B: the slot decodes on da_seq - the compact
+                        // sequence (kept prefix + generated tail), every
+                        // cell finite. kv-offload holes are cut from the main
+                        // sequence, not from da_seq, so they do not appear
+                        // in the da_seq mask.
+                        n_read = (int32_t) slot.da_keep_count + (n_full - slot.da_bound);
+                    } else {
+                        // A / plain: the mask is over the main sequence. The
+                        // non-finite cells are the UNION of the DA-removed
+                        // ranges (masked -inf, cells kept) and the kv-offload
+                        // holes (cells physically cut -> is_empty -> -inf by
+                        // the generic mask). Subtract max of the two, not the
+                        // sum: eviction tends to hit exactly the old filler DA
+                        // already masks, and a double count would under-
+                        // estimate the bound - the excess cells would be
+                        // silently dropped. max is a safe overestimate of the
+                        // union (never under).
+                        int32_t n_kv_holes = 0;
+                        if (slot.kv_holes_active) {
+                            for (const auto & r : slot.kv_hole_ranges) {
+                                n_kv_holes += (int32_t) (r.second - r.first);
+                            }
+                        }
+                        const int32_t n_nonfinite = std::max((int32_t) slot.n_da_removed, n_kv_holes);
+                        n_read = std::max(0, n_full - n_nonfinite);
+                    }
+                    n_kv_max = std::max(n_kv_max, ((int64_t) n_read + 511) / 512 * 512);
+                }
+            }
+        }
+
+        if (n_kv_max != da_n_kv_max_last) {
+            SRV_INF_DBG("da: n_kv_max %lld -> %lld%s\n", (long long) da_n_kv_max_last, (long long) n_kv_max, prefill ? " (prefill, dense)" : "");
+            da_n_kv_max_last = n_kv_max;
+        }
+        llama_set_n_kv_max(ctx_tgt, n_kv_max);
+        // the draft context is intentionally left dense: its prompt length is
+        // not exposed by common_speculative, and the bound must never under-
+        // estimate a row's finite count (the excess cells would be silently
+        // dropped)
+    }
+
+    // The removal boundary for the static (client-supplied da_rm) path: the
+    // da_rm_at position clamped to the prompt length, or the prompt end when
+    // da_rm_at < 0. (The tag path computes its own boundary - the current
+    // decode position - in apply_da_tag.)
+    int32_t da_static_bound(const server_slot & slot) const {
+        const int32_t n_prompt = slot.task->n_tokens();
+        return slot.task->params.da_rm_at >= 0
+            ? std::min(slot.task->params.da_rm_at, n_prompt)
+            : n_prompt;
+    }
+
+    // Subtract [sub_lo, sub_hi) from a list of token ranges. For each range
+    // that overlaps the subtraction range, the overlapping part is removed
+    // (splitting the range into left and right parts when the subtraction
+    // range is in the middle). Ranges that do not overlap are kept unchanged.
+    // Used to guarantee that the Σ anchor range is NOT removed (stays in the
+    // keep set) regardless of the layout scan's classification.
+    static void da_subtract_range(std::vector<std::pair<int32_t, int32_t>> & ranges, int32_t sub_lo, int32_t sub_hi) {
+        if (sub_hi <= sub_lo) {
+            return;
+        }
+        std::vector<std::pair<int32_t, int32_t>> out;
+        for (const auto & r : ranges) {
+            const int32_t lo = r.first;
+            const int32_t hi = r.second;
+            if (hi <= sub_lo || lo >= sub_hi) {
+                out.emplace_back(lo, hi);  // no overlap
+                continue;
+            }
+            if (lo < sub_lo) {
+                out.emplace_back(lo, sub_lo);  // left part
+            }
+            if (hi > sub_hi) {
+                out.emplace_back(sub_hi, hi);  // right part
+            }
+        }
+        ranges = std::move(out);
+    }
+
+    // Total span covered by a range list. Exact on merged lists; on
+    // overlapping lists an overlap is counted once per range (fine for the
+    // newly-kept estimate in da_apply_keep_floor - the floor range is
+    // disjoint from the Sigma anchor, so both call sites see near-merged
+    // ranges).
+    static size_t da_ranges_total(const std::vector<std::pair<int32_t, int32_t>> & ranges) {
+        size_t total = 0;
+        for (const auto & r : ranges) {
+            total += (size_t) (r.second - r.first);
+        }
+        return total;
+    }
+
+    // DA tail floor (plans/continous_work2.md): subtract [bound-K, bound)
+    // from the removal ranges so the most recent K tokens before the removal
+    // boundary are always kept. The keep set is the union of the tag
+    // selection, the Sigma anchor and the tail: without the floor, the work
+    // region the model was just in (not covered by any magic_chunks tag) is
+    // masked out at a B switch and the model forgets what it just did (the
+    // 10-09 12:43 amnesia: ~21k tokens of [42060,63370) masked whole).
+    // Reuses da_subtract_range; the floor is clamped to [0, bound], so
+    // bound < K keeps everything. K <= 0 or bound <= 0: no-op (legacy
+    // behavior). Logs the applied floor, the newly-kept token count and the
+    // remaining removals bucketed by distance from the tail (bound), so the
+    // floor's read-reduction trade is visible in the same log group as the
+    // switch summary.
+    static void da_apply_keep_floor(const server_slot & slot,
+                                    std::vector<std::pair<int32_t, int32_t>> & rm_ranges,
+                                    int32_t bound,
+                                    const char * when) {
+        const int32_t K = slot.da_tail_keep;
+        if (K <= 0 || bound <= 0) {
+            return;
+        }
+        const int32_t lo = std::max(bound - K, 0);
+        const int32_t hi = bound;
+        const size_t before = da_ranges_total(rm_ranges);
+        da_subtract_range(rm_ranges, lo, hi);
+        const size_t newly_kept = before - da_ranges_total(rm_ranges);
+        SLT_INF_DBG(slot, "da: tail_keep=[%d, %d) - %zu token(s) newly kept (K=%d, %s)\n",
+                lo, hi, newly_kept, K, when);
+        // bucket the remaining removals by the distance of the range end
+        // from the tail: how much of what was removed sat close to the work
+        // in progress (0 = touching the boundary)
+        if (!rm_ranges.empty()) {
+            const int32_t edges[] = { 1024, 4096, 8192, 16384, 32768 };
+            size_t bkt[6] = { 0, 0, 0, 0, 0, 0 };
+            for (const auto & r : rm_ranges) {
+                int32_t dist = bound - r.second;
+                if (dist < 0) {
+                    dist = 0;
+                }
+                int b = 0;
+                while (b < 5 && dist >= edges[b]) {
+                    ++b;
+                }
+                bkt[b] += (size_t) (r.second - r.first);
+            }
+            SLT_INF_DBG(slot, "da: removed by distance from tail (%s): <1k=%zu 1-4k=%zu 4-8k=%zu 8-16k=%zu 16-32k=%zu 32k+=%zu\n",
+                    when, bkt[0], bkt[1], bkt[2], bkt[3], bkt[4], bkt[5]);
+        }
+    }
+
+    // Declarative Attention: remove the given prompt token ranges from the KV
+    // cache of the target context (and the draft context, when speculative
+    // decoding is active). The removal is a no-op for positions whose KV does
+    // not exist yet, so callers must invoke it once the covered positions are
+    // fully prefilled (or, for the tag path, mid-decode, where the ranges are
+    // mid-range and the covered positions already exist). Ranges are clamped
+    // to the removal boundary `bound`: the next token is placed at `bound`, so
+    // position bound - 1 must stay in the cache for contiguity.
+    void apply_da_rm(server_slot & slot, const std::vector<std::pair<int32_t, int32_t>> & ranges, int32_t bound, const char * when) {
+        if (ranges.empty()) {
+            return;
+        }
+
+        if (slot.da_measure_only) {
+            SLT_INF_DBG(slot, "da_rm: SKIPPED (measure-only) - %zu range(s) not applied to KV (%s); output stays vanilla\n",
+                    ranges.size(), when);
+            return;
+        }
+
+        const int32_t n_prompt = slot.task->n_tokens();
+
+        SLT_INF_DBG(slot, "da_rm: applying %zu range(s) (%s) - bound=%d, n_prompt=%d\n",
+                ranges.size(), when, bound, n_prompt);
+
+        // Subtract the Σ anchor range from the removal ranges so it is
+        // guaranteed to stay (not removed). The Σ block is server-injected
+        // text (not in the client history) that must remain visible to the
+        // model after a removal, regardless of how the layout scan classifies
+        // the region after the filler.
+        std::vector<std::pair<int32_t, int32_t>> rm_ranges = ranges;
+        {
+            const auto & sig = slot.task->params.da_sigma;
+            if (sig.first >= 0) {
+                const int32_t s_lo = std::max(sig.first, 0);
+                const int32_t s_hi = std::min(sig.second, bound);
+                if (s_hi > s_lo) {
+                    da_subtract_range(rm_ranges, s_lo, s_hi);
+                    SLT_INF_DBG(slot, "da_rm: sigma tokens [%d, %d) kept (subtracted from removal ranges)\n", s_lo, s_hi);
+                }
+            }
+        }
+
+        // Tail floor (plans/continous_work2.md): the most recent K tokens
+        // before the boundary are always kept, next to the Sigma anchor.
+        da_apply_keep_floor(slot, rm_ranges, bound, when);
+
+        for (const auto & range : rm_ranges) {
+            int32_t lo = range.first;
+            int32_t hi = range.second;
+
+            if (lo >= bound) {
+                SLT_WRN_DBG(slot, "da_rm: range [%d, %d) starts at/after the removal boundary %d - skipping\n", lo, hi, bound);
+                continue;
+            }
+
+            // The next token (the prompt continuation, or the first generated
+            // token) is placed at position `bound`. The attention KV cache
+            // requires position contiguity, so the last position of the
+            // prefilled prefix (bound - 1) must remain in the cache. Clamp the
+            // range end to leave it intact; a range that reaches the boundary
+            // would otherwise drop seq_pos_max and make the continuation
+            // non-contiguous (llama_decode returns "Invalid input batch").
+            if (hi > bound - 1) {
+                SLT_WRN_DBG(slot, "da_rm: range [%d, %d) reaches the removal boundary %d - clamping end to %d (position %d must stay for contiguity)\n",
+                        lo, hi, bound, bound - 1, bound - 1);
+                hi = bound - 1;
+            }
+
+            if (hi <= lo) {
+                SLT_WRN_DBG(slot, "da_rm: range [%d, %d) is empty after clamping - skipping\n", lo, hi);
+                continue;
+            }
+
+            bool ok = true;
+            auto * mem_tgt = llama_get_memory(ctx_tgt);
+            if (mem_tgt) {
+                ok = llama_memory_seq_rm(mem_tgt, slot.id, lo, hi) && ok;
+            }
+            if (ctx_dft) {
+                auto * mem_dft = llama_get_memory(ctx_dft);
+                if (mem_dft) {
+                    ok = llama_memory_seq_rm(mem_dft, slot.id, lo, hi) && ok;
+                }
+            }
+            if (ok) {
+                slot.n_da_removed += (uint32_t) (hi - lo);
+                slot.da_applied    = true;
+                slot.da_removed_a  = true;
+            }
+            SLT_INF_DBG(slot, "da_rm: [%d, %d) %s (%s)\n", lo, hi, ok ? "removed" : "rejected", when);
+        }
+    }
+
+    // Declarative Attention 2-stream (B): instead of removing the da_rm ranges
+    // from the slot's own sequence, copy the KEEP ranges (the complement of
+    // da_rm in [0, bound)) to a second sequence via llama_memory_seq_cp and
+    // switch the slot's decode to that sequence. The original sequence is left
+    // intact - B's unique value over the logical removal (A): a global return
+    // (attending the full prompt again) reuses the original sequence without
+    // a re-prefill - the close-tag handler (apply_da_tag case 2-5) copies the
+    // generated tail back and frees da_seq. A's removals stay irreversible.
+    //
+    // Read-reduction semantics: in the unified KV pool, seq_cp only retags
+    // cell metadata - the cells are not moved and the attention scan range
+    // [0, n_kv) is not shortened. The decode's LOGICAL read set (the tokens
+    // it attends to) shrinks to the kept prefix plus the tokens added after
+    // the boundary; the removed cells stay in place, masked with -inf. The
+    // physical KV load IS reduced where the FA kernel skips fully-masked
+    // chunks (Metal: 32-cell decode / 64-block prefill, CPU: per-position;
+    // CUDA unverified), so the reduction is real but chunk-quantized.
+    //
+    // Preconditions (checked here; on violation, fall back to the logical
+    // removal apply_da_rm):
+    //   - the KV must be unified (--kv-unified): a partial-range seq_cp across
+    //     KV streams aborts (llama_kv_cache::seq_cp), while within one stream
+    //     it only retags cell metadata.
+    //   - a sequence id beyond the slot ids must be available: the server
+    //     reserves n_slots extra ids at context creation (n_seq_max = 2*n_slots
+    //     in --kv-unified mode), so up to n_slots B slots can run at once.
+    //     Ids below n_slots are never used - they may hold idle slots' cached
+    //     prompts, which prompt_clear() would destroy.
+    //   - the prefilled prompt must not exceed the removal boundary: the keep
+    //     ranges only cover [0, bound), so tokens in [bound, n_prompt) would
+    //     be missing from the new sequence (the media-blocked after-prefill
+    //     path).
+    //
+    // Read-reduction logs: INF at the switch (keep ranges, logical read set
+    // "N of M"), DBG per decode step (handle_last_sampled_token), INF summary
+    // in release().
+    //
+    // `ranges` are the removal ranges and `bound` the removal boundary, both
+    // supplied by the caller. The static path passes the client's da_rm ranges
+    // and the da_rm_at/prompt-end boundary (before the first generated token).
+    // The tag path (apply_da_tag) passes the tag-derived ranges and the current
+    // decode position: the keep ranges then also cover the already-generated
+    // tokens [n_prompt, bound), which are shared into the second sequence so
+    // the switch stays position-contiguous.
+    void apply_da_b(server_slot & slot, const std::vector<std::pair<int32_t, int32_t>> & ranges, int32_t bound, const char * when) {
+        if (ranges.empty()) {
+            return;
+        }
+
+        if (slot.da_measure_only) {
+            SLT_INF_DBG(slot, "da_b: SKIPPED (measure-only) - %zu range(s) not applied to KV (%s); da_seq stays -1, output stays vanilla\n",
+                    ranges.size(), when);
+            return;
+        }
+
+        if (bound <= 0) {
+            SLT_WRN_DBG(slot, "da_b: removal boundary is empty (bound=%d) - falling back to logical removal (%s)\n", bound, when);
+            apply_da_rm(slot, ranges, bound, when);
+            return;
+        }
+
+        // the keep ranges only cover [0, bound); if the prefilled prompt is
+        // longer than the boundary (the mid-prefill gate was blocked, e.g. by
+        // media, and the removals are applied after prefill), the tokens in
+        // [bound, n_prompt) would be missing from the new sequence
+        if (slot.prompt.n_tokens() > bound) {
+            SLT_WRN_DBG(slot, "da_b: prefilled prompt (%d tokens) exceeds the removal boundary %d - falling back to logical removal (%s)\n",
+                    slot.prompt.n_tokens(), bound, when);
+            apply_da_rm(slot, ranges, bound, when);
+            return;
+        }
+
+        // partial-range seq_cp across KV streams aborts; only the unified pool
+        // (one stream for all sequences) supports it via metadata retagging
+        if (!llama_kv_unified(ctx_tgt) || (ctx_dft && !llama_kv_unified(ctx_dft))) {
+            SLT_WRN_DBG(slot, "da_b: requires --kv-unified (partial-range seq_cp across KV streams is unsupported) - falling back to logical removal (%s)\n", when);
+            apply_da_rm(slot, ranges, bound, when);
+            return;
+        }
+
+        // pick a sequence id beyond the slot ids: ids below n_slots may hold
+        // idle slots' cached prompts, which this slot's prompt_clear() would
+        // destroy. The server reserves n_slots extra ids at context creation
+        // (n_seq_max = 2*n_slots in --kv-unified mode).
+        const int n_seq_max = (int) llama_n_seq_max(ctx_tgt);
+        const int n_slots   = (int) slots.size();
+        llama_seq_id da_seq = -1;
+        for (int i = n_slots; i < n_seq_max; ++i) {
+            bool taken = false;
+            for (auto & other : slots) {
+                // only a processing slot can hold live KV on the id: an idle
+                // slot's da_seq KV was already cleared by prompt_clear() in
+                // release() (and da_seq reset there too), so reusing the id
+                // under it is safe. Counting idle slots would burn the single
+                // reserved id on the first finished request.
+                if (other.is_processing() && other.da_seq == i) {
+                    taken = true;
+                    break;
+                }
+            }
+            if (!taken) {
+                da_seq = (llama_seq_id) i;
+                break;
+            }
+        }
+        if (da_seq < 0) {
+            SLT_WRN_DBG(slot, "da_b: no sequence id beyond the slot ids (n_seq_max=%d, n_slots=%d) - falling back to logical removal (%s)\n", n_seq_max, n_slots, when);
+            apply_da_rm(slot, ranges, bound, when);
+            return;
+        }
+
+        // build the keep ranges: the complement of the removal ranges in
+        // [0, bound). The clamping mirrors apply_da_rm: a range reaching the
+        // boundary is cut at bound - 1 so the last position of the prefilled
+        // prefix stays in the new sequence (position contiguity for the
+        // continuation).
+        //
+        // The removal ranges may be unsorted or overlapping (e.g.
+        // [[100,120],[10,20]]). Clamping, sorting by lo and merging overlaps
+        // BEFORE taking the complement - a forward-only sweep over the raw
+        // ranges would let an out-of-order range corrupt the keep set.
+        std::vector<std::pair<int32_t, int32_t>> rm;
+        for (const auto & range : ranges) {
+            int32_t lo = range.first;
+            int32_t hi = range.second;
+
+            if (lo >= bound) {
+                SLT_WRN_DBG(slot, "da_b: range [%d, %d) starts at/after the removal boundary %d - ignoring for the copy\n", lo, hi, bound);
+                continue;
+            }
+            if (hi > bound - 1) {
+                SLT_WRN_DBG(slot, "da_b: range [%d, %d) reaches the removal boundary %d - clamping end to %d (position %d must stay for contiguity)\n",
+                        lo, hi, bound, bound - 1, bound - 1);
+                hi = bound - 1;
+            }
+            lo = std::max(lo, 0);
+            if (hi <= lo) {
+                continue;
+            }
+            rm.emplace_back(lo, hi);
+        }
+        std::sort(rm.begin(), rm.end());
+        std::vector<std::pair<int32_t, int32_t>> rm_merged;
+        for (const auto & r : rm) {
+            if (!rm_merged.empty() && r.first <= rm_merged.back().second) {
+                rm_merged.back().second = std::max(rm_merged.back().second, r.second);
+            } else {
+                rm_merged.emplace_back(r);
+            }
+        }
+
+        // Subtract the Σ anchor range from the removal ranges so it is
+        // guaranteed to stay in the keep set. The Σ block is server-injected
+        // text (not in the client history) that must remain visible to the
+        // model after a B switch, regardless of how the layout scan classifies
+        // the region after the filler.
+        {
+            const auto & sig = slot.task->params.da_sigma;
+            if (sig.first >= 0) {
+                const int32_t s_lo = std::max(sig.first, 0);
+                const int32_t s_hi = std::min(sig.second, bound);
+                if (s_hi > s_lo) {
+                    da_subtract_range(rm_merged, s_lo, s_hi);
+                    SLT_INF_DBG(slot, "da_b: sigma tokens [%d, %d) kept (subtracted from removal ranges)\n", s_lo, s_hi);
+                }
+            }
+        }
+
+        // Tail floor (plans/continous_work2.md): the most recent K tokens
+        // before the boundary are always kept, next to the Sigma anchor.
+        da_apply_keep_floor(slot, rm_merged, bound, when);
+
+        std::vector<std::pair<int32_t, int32_t>> keep;
+        {
+            int32_t cur = 0;
+            for (const auto & r : rm_merged) {
+                if (r.first > cur) {
+                    keep.emplace_back(cur, std::min(r.first, bound));
+                }
+                cur = std::max(cur, r.second);
+            }
+            if (cur < bound) {
+                keep.emplace_back(cur, bound);
+            }
+        }
+
+        size_t n_keep = 0;
+        for (const auto & r : keep) {
+            n_keep += (size_t) (r.second - r.first);
+        }
+        const size_t n_remove = (size_t) bound - n_keep;
+
+        if (n_remove == 0) {
+            SLT_WRN_DBG(slot, "da_b: removal ranges cover nothing in [0, %d) after clamping - nothing to remove, staying on seq %d (%s)\n", bound, slot.id, when);
+            return;
+        }
+
+        // no-benefit skip (plans/continous_work2.md, optional): when the
+        // removal is tiny, the switch cost (seq_cp, a second sequence id,
+        // the restore copy at release) outweighs the read reduction - stay
+        // on the original sequence, output stays vanilla. The caller only
+        // moves the mode state machine when da_seq >= 0, so the slot stays
+        // GLOBAL. Opt-in via --da-b-min-remove (0 = always switch, so the
+        // small-prompt da_b_smoke mechanism checks keep passing).
+        if (slot.da_b_min_remove > 0 && n_remove < (size_t) slot.da_b_min_remove) {
+            SLT_WRN_DBG(slot, "da_b: only %zu token(s) would be removed (< %d) - skipping the switch, staying on seq %d (%s)\n",
+                    n_remove, slot.da_b_min_remove, slot.id, when);
+            return;
+        }
+
+        // copy each keep range into the fresh sequence (target + draft memory)
+        for (const auto & r : keep) {
+            slot.mem.seq_cp(slot.id, da_seq, r.first, r.second);
+        }
+
+        // switch the slot to the new sequence
+        slot.da_seq        = da_seq;
+        slot.da_bound      = bound;
+        slot.da_keep_count = n_keep;
+        // Mark the removal as applied so release() takes the B-restore
+        // branch (copy the generated tail back to the original sequence and
+        // free da_seq). Without it, a B response that ends mid-FOCUS
+        // (max_tokens hit, no </focus>) leaves da_seq's KV cells in place;
+        // the next request reuses that sequence id and llama_decode rejects
+        // the non-contiguous append ("Invalid input batch").
+        slot.da_applied    = true;
+
+        SLT_INF_DBG(slot, "da_b: switched decode to seq %d (%s) - logical read set now %zu of %d prefix token(s) (%zu removed, -%.1f%%)\n",
+                da_seq, when, n_keep, bound, n_remove, 100.0 * (double) n_remove / (double) bound);
+        for (const auto & r : keep) {
+            SLT_INF_DBG(slot, "da_b:   keep [%d, %d) %zu token(s)\n", r.first, r.second, (size_t) (r.second - r.first));
+        }
+        SLT_INF_DBG(slot, "da_b: original seq %d untouched (%d token(s)) - rollback/reference\n", slot.id, bound);
+    }
+
+    // ---------------------------------------------------------------------
+    // Declarative Attention (DA) tag state machine
+    // ---------------------------------------------------------------------
+    // The model emits control tags in its own output; the server enforces the
+    // matching attention scope mid-decode:
+    //   <focus magic_chunks="N">   enter FOCUS: keep chunk N (1-based) + scaffold
+    //   <local>                   enter LOCAL: scaffold + generated only
+    //   </focus> / </local>       return to GLOBAL (full attention)
+    //   <global> / </global>      (re)enter GLOBAL - no-op when already there
+    // where scaffold = every prompt token outside the chunk/filler ranges
+    // (system, the question, the injected instruction); the generated tail
+    // is always attended.
+    //
+    // B path (task da_b): the decode switches to a second sequence (da_seq)
+    // holding the kept ranges; the original sequence stays intact, so a
+    // switch/return is a seq_rm/seq_cp pair on da_seq (reversible).
+    // A path: seq_rm holes in the original sequence - monotonic, a chunk
+    // removed once is gone for the rest of the request.
+    //
+    // Consumed tags are erased from generated_text (they never reach the
+    // user); a trailing fragment that could still grow into a tag is held
+    // back from the output stream by process_token() via da_tag_hold_len().
+
+    // DA tag state machine (P3): process every control tag that has closed
+    // since the last call and apply the mode transition to the KV cache.
+    // Called from process_token() after each generated token is appended to
+    // slot.generated.text. No-op unless the client supplied the chunk layout
+    // (task params da_chunks). The removal boundary is the current decode
+    // position, so the B switch (or the A removal) stays position-contiguous
+    // for the next token.
+    void apply_da_tag(server_slot & slot) {
+        if (slot.task->params.da_chunks.empty()) {
+            return;
+        }
+
+        const auto & chunks = slot.task->params.da_chunks;
+        const auto & filler = slot.task->params.da_filler;
+        const bool   is_b   = slot.task->params.da_b;
+
+        for (;;) {
+            da_tag_t tag = scan_da_tag(slot.generated.text, slot.da_tag_scan_pos, slot.da_mode);
+            if (tag.type < 0) {
+                break;  // no more complete tags
+            }
+
+            int32_t n_full   = (int32_t) slot.prompt.n_tokens();
+            const bool    in_focus = slot.da_mode == DA_MODE_FOCUS;
+            const bool    in_local = slot.da_mode == DA_MODE_LOCAL;
+            // item 4 (B2 gate): set in the L1 block below. When a tool-call or
+            // parameter is still open at tag close, a recall re-prefilled here
+            // would land INSIDE it (the opening tag is in the prompt, only the
+            // closing tail would be generated). case 0 drops the recall (no
+            // enqueue) when either is set.
+            int in_tool = 0, in_param = 0;
+
+            // L1: tag-closed snapshot - the state the refill decision runs
+            // on. B1 check: prompt_tokens == seq_pos_max + 1 means the
+            // sampled closing token is not in the KV yet (it commits in the
+            // next handle_last_sampled_token). in_tool = 1 means the tag
+            // fired mid tool call (B2).
+            {
+                // tag names are assembled from parts: literal tags do not
+                // survive editors / uploads
+                const std::string tc_open  = std::string("<")  + "tool_call>";
+                const std::string tc_close = std::string("</") + "tool_call>";
+                const std::string pr_open  = std::string("<")  + "parameter=";
+                const std::string pr_close = std::string("</") + "parameter>";
+
+                const std::string & g = slot.generated.text;
+                const size_t b0 = tag.start > 240 ? tag.start - 240 : 0;
+                in_tool  = dbg_count(g, tc_open,  tag.start) > dbg_count(g, tc_close, tag.start) ? 1 : 0;
+                in_param = dbg_count(g, pr_open,  tag.start) > dbg_count(g, pr_close, tag.start) ? 1 : 0;
+
+                da_trace("slot=%d task=%d L1 tag closed type=%d nums=%zu n_gen=%d mode=%d seq=%d prompt_tokens=%d seq_pos_max=%d sampled=%d spec_draft=%zu in_tool=%d in_param=%d before='%s' tag='%s'\n",
+                         (int) slot.id, (int) slot.task->id,
+                         tag.type, tag.keep_nums.size(), (int) slot.stats.n_gen, (int) slot.da_mode, (int) slot.kv_seq(),
+                         (int) slot.prompt.n_tokens(),
+                         (int) llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.kv_seq()),
+                         (int) slot.sampled, slot.spec_draft.size(),
+                         in_tool, in_param,
+                         dbg_esc(g.substr(b0, tag.start - b0), 260).c_str(),
+                         dbg_esc(g.substr(tag.start, tag.end - tag.start)).c_str());
+                // T1-f: a DA control tag that closes while a tool-call/parameter
+                // is still open means the pending recall would re-prefill inside
+                // an open tool-call (a derail risk). The L1 da_trace above already
+                // carries in_tool/in_param but is DBG-gated; promote the signal
+                // to SRV_INF and warn when either is set (B2 gate would defer).
+                if (in_tool || in_param) {
+                    SRV_INF("kv_offload L1: slot=%d task=%d control tag closed with open tool-call: in_tool=%d in_param=%d n_gen=%d mode=%d (recall would re-prefill inside an open tool-call)\n",
+                            (int) slot.id, (int) slot.task->id, in_tool, in_param,
+                            (int) slot.stats.n_gen, (int) slot.da_mode);
+                    SLT_WRN_DBG(slot, "kv_offload L1: tag closed while in_tool=%d in_param=%d - B2 gate would defer this recall\n", in_tool, in_param);
+                }
+
+                // arm the per-token trace (L4) for the next 24 tokens
+                slot.da_trace_left = 24;
+            }
+
+            // In-tool gate (before any erase / mode handling): a tag that
+            // closes while a tool-call or parameter is still open sits inside
+            // the JSON the model is emitting - it is data, not a control
+            // signal. Erasing it would corrupt the tool call (the client
+            // already has the opening, and the text offsets would shift).
+            // Preserve the text, leave the mode unchanged for all types 0~5,
+            // and advance the scan past the tag so it is never re-scanned.
+            if (in_tool || in_param) {
+                SLT_INF(slot, "da_tag: type=%d SKIPPED inside tool call (in_tool=%d in_param=%d) n_gen=%d mode=%d - text preserved, mode unchanged, scan advanced\n",
+                        tag.type, in_tool, in_param, (int) slot.stats.n_gen, (int) slot.da_mode);
+                slot.da_tag_scan_pos = tag.end;
+                continue;
+            }
+
+            // consume the tag: erase it from the user-visible text and
+            // restart the scan where the tag began (nothing complete can sit
+            // before it - the scanner returns the earliest tag)
+            const size_t da_erased = tag.end - tag.start;
+            slot.generated.text.erase(tag.start, da_erased);
+            // The in-progress tag is held back from the output stream by
+            // da_tag_hold_len() (the whole <focus magic_chunks="N> prefix,
+            // not just the opener), so by the time the tag closes it has
+            // normally NOT been sent: n_sent_text == tag.start and the
+            // branch below is a no-op. It remains as a safety net for the
+            // edge where part of the tag leaked (e.g. a literal tag the
+            // model emitted as data) - reconcile the pointer so the send
+            // path (substr(n_sent_text)) stays in range: fully sent - shift
+            // back by the tag length; partially sent - clamp to the start.
+            if (slot.n_sent_text > tag.start) {
+                slot.n_sent_text = (slot.n_sent_text >= tag.end)
+                        ? slot.n_sent_text - da_erased
+                        : tag.start;
+            }
+            slot.da_tag_scan_pos = tag.start;
+
+            // <local> block: the model emits <local> from learned habit even
+            // after the prompt txt is fixed, and the mode transition would
+            // still run and pollute the experiment. Ignore it: the tag is
+            // already erased (not in the output) and the mode is left
+            // unchanged. </local> (type 3) is NOT ignored - no slot is ever
+            // in LOCAL state, so its da_set_mode(GLOBAL) is a no-op anyway.
+            // Default on; FOCUS_DA_NO_LOCAL=0 disables it for A/B comparison.
+            static const bool da_no_local = []() {
+                const char * e = getenv("FOCUS_DA_NO_LOCAL");
+                return !e || atoi(e) != 0;
+            }();
+            if (tag.type == 1 && da_no_local) {
+                SLT_INF(slot, "da_tag: type=1 (<local>) IGNORED - mode unchanged n_gen=%d mode=%d\n",
+                        (int) slot.stats.n_gen, (int) slot.da_mode);
+                continue;
+            }
+
+            // The first token after a mode transition must follow the
+            // single-token trajectory (see the DA tag gate in the draft
+            // decision) - the next draft step of this slot is skipped.
+            slot.da_skip_draft = true;
+
+            // Phase 0 (g measurement): remember where the first restriction
+            // tag (<focus>/<local>) closed. release() combines this with the
+            // total n_gen to report g = first_tag / total, the global-step
+            // share before the attention restriction kicked in. The non-restriction
+            // tags (</focus>/</local>/<global>/</global>, type 2-5) do not start
+            // the restricted phase, so they are not recorded here.
+            // A B2 no-op focus tag (open tool-call, see case 0) applies no
+            // restriction, so it does not start the measured restricted phase.
+            if ((tag.type == 0 || tag.type == 1) && slot.da_first_tag_gen < 0 &&
+                    !(tag.type == 0 && (in_tool || in_param))) {
+                slot.da_first_tag_gen = (int32_t) slot.stats.n_gen;
+            }
+
+            // Applied-tag log: every tag that passed the in-tool gate and now
+            // runs the mode transition below (SLT_INF so it is visible in
+            // production, not just under FOCUS_SPARSE_DEBUG).
+            SLT_INF(slot, "da_tag: type=%d applied (in_tool=%d in_param=%d) n_gen=%d mode=%d seq=%d\n",
+                    tag.type, in_tool, in_param, (int) slot.stats.n_gen, (int) slot.da_mode, (int) slot.kv_seq());
+
+            switch (tag.type) {
+                case 0: { // <focus magic_chunks="N"> (or "1,3") : enter/switch FOCUS
+                    // Resolve the emitted chunk numbers to layout indices:
+                    // the hook numbers chunks monotonically per session, so
+                    // the current block may start at da_chunk_base > 1.
+                    const int32_t base     = slot.task->params.da_chunk_base;
+                    const int32_t n_chunks = (int32_t) chunks.size();
+                    const auto & offloaded = slot.task->params.da_offloaded;
+                    std::vector<size_t> keep_idx;
+                    bool did_refill = false;
+                    // item 2-1 (B2 gate): a tool-call/parameter is open at tag
+                    // close. A recall re-prefilled here would land INSIDE it
+                    // (opening tag in the prompt, closing only generated), and
+                    // the mode switch would still run - a focus on a fully-holed
+                    // chunk copies an EMPTY range, leaving the model attending
+                    // to scaffold+tail only (the L3 signature: holed == len,
+                    // did_refill = 0). No-op the whole tag: no recall, no mode
+                    // switch. Staying in the current mode always keeps at least
+                    // as much information as a restricted mode.
+                    const bool block_recall = in_tool || in_param;
+                    if (block_recall) {
+                        SLT_WRN(slot, "kv_offload: focus tag NO-OP (B2 gate: open tool-call in_tool=%d in_param=%d) - no recall, no mode switch\n",
+                                in_tool, in_param);
+                        break;
+                    }
+                    // item 2-3: dedup against committed keys (successful
+                    // refills) and units queued in this same pass (two tags can
+                    // close in one apply_da_tag loop with no refill between).
+                    // A dropped recall is in neither, so a re-request retries.
+                    const auto chunk_recalled = [&slot](int32_t cid) {
+                        if (std::find(slot.da_recalled_chunk_ids.begin(), slot.da_recalled_chunk_ids.end(), cid) != slot.da_recalled_chunk_ids.end()) return true;
+                        for (const auto & u : slot.da_pending_refill) if (u.chunk_id == cid) return true;
+                        return false;
+                    };
+                    for (int32_t n : tag.keep_nums) {
+                        // kv-offload (get-on-focus): n points to an evicted (offloaded)
+                        // chunk (number >= base + n_chunks). Fetch its text from the
+                        // FocusMemory store and re-prefill it at the tail so the model
+                        // can read it. No KV restriction is applied (the chunk is not in
+                        // the active layout) - the model reads the re-prefilled content
+                        // in the current mode. Fail-open on any store error.
+                        if (n >= base + n_chunks) {
+                            // measure-only (Phase 0): observe the tag position without
+                            // mutating KV - skip the store GET and re-prefill so the
+                            // output stays vanilla (mirrors the da_rm/da_b guards).
+                            if (slot.da_measure_only) {
+                                SLT_INF(slot, "kv_offload: get-on-focus chunk %d SKIPPED (measure-only) - no store GET / KV refill; output stays vanilla\n", n);
+                                continue;
+                            }
+                            // item 6/2-3: the same offloaded chunk is not re-recalled
+                            // within a request (it would land in the KV twice).
+                            // Committed ids (successful refills) + units queued in
+                            // this same pass; a dropped recall is in neither, so a
+                            // re-request retries.
+                            if (chunk_recalled(n)) {
+                                SLT_WRN_DBG(slot, "kv_offload: get-on-focus chunk %d already recalled/queued this request - skipping (dedup)\n", n);
+                                continue;
+                            }
+                            bool found = false;
+                            for (const auto & seg : offloaded) {
+                                if (seg.chunk_id != n) continue;
+                                found = true;
+                                // Diagnostic: the model is asking for an evicted
+                                // chunk - log the fetch so get-on-focus is traceable.
+                                SLT_INF(slot, "kv_offload: get-on-focus chunk %d (key=%s) - fetching from FocusMemory\n",
+                                        n, seg.key.c_str());
+                                std::string text;
+                                // The GET can block up to the read timeout (5s) on a slow or
+                                // unreachable store. Yield to the queue so metrics/cancel tasks
+                                // are still handled while we wait (fail-open either way).
+                                bool got = false;
+                                queue_tasks.yield_to_queue([&]() {
+                                    got = kv_offload_get(slot.task->params.kv_offload_host,
+                                                         slot.task->params.kv_offload_token,
+                                                         slot.task->params.kv_offload_session,
+                                                         seg.key, text);
+                                });
+                                if (got && slot.task->params.kv_offload_vocab) {
+                                    SLT_INF(slot, "kv_offload: GET ok chunk %d - %zu chars, re-prefilling\n",
+                                            n, text.size());
+                                    const llama_tokens toks =
+                                            common_tokenize(slot.task->params.kv_offload_vocab, text, true, true);
+                                    // B1: queue the refill instead of decoding it here -
+                                    // the sampled closing token is not in the KV yet
+                                    // (it commits in the next handle_last_sampled_token),
+                                    // so a tail decode now would land BEFORE it and split
+                                    // the model's own tag. post_decode() applies the
+                                    // queue after the commit and samples the next token
+                                    // from the refill's last logits row.
+                                    // item 6/2-3: one unit per chunk (wrapped individually
+                                    // in kv_offload_refill). The dedup key (chunk_id) is
+                                    // committed to da_recalled_chunk_ids only on refill
+                                    // success (post_decode), so a dropped recall retries.
+                                    if (!toks.empty()) {
+                                        da_refill_unit unit;
+                                        unit.toks = std::move(toks);
+                                        unit.chunk_id = n;
+                                        slot.da_pending_refill.push_back(std::move(unit));
+                                        did_refill = true;
+                                    }
+                                } else {
+                                    SLT_WRN(slot, "kv_offload: GET failed for offloaded chunk %d - fail-open\n", n);
+                                }
+                                break;
+                            }
+                            if (!found) {
+                                SLT_WRN_DBG(slot, "da_tag: magic_chunks number %d is not an active or offloaded chunk - ignored\n", n);
+                            }
+                            continue;
+                        }
+                        if (n < base || n - base >= n_chunks) {
+                            SLT_WRN_DBG(slot, "da_tag: magic_chunks number %d out of range (%d..%d) - ignored\n",
+                                    n, base, base + n_chunks - 1);
+                            continue;
+                        }
+                        const size_t idx = (size_t) (n - base);
+                        if (std::find(keep_idx.begin(), keep_idx.end(), idx) == keep_idx.end()) {
+                            keep_idx.push_back(idx);
+                        }
+                    }
+                    // kv-offload (Option B, --kv-offload-holes): a focused real chunk may
+                    // overlap an applied KV hole (its evicted message's KV was seq_rm'd from
+                    // the main sequence), so the B-switch seq_cp would copy an empty range and
+                    // the model could not read the evicted content. Re-prefill the holed
+                    // overlap at the tail (Option B keeps the text in the prompt, so no store
+                    // GET is needed) so the model can read it; the B switch then copies the
+                    // refilled tail onto da_seq, exactly like the Option C get-on-focus path.
+                    // Fail-open. measure-only (Phase 0) skips the re-prefill so the KV is
+                    // not mutated and the output stays vanilla (mirrors the da_rm/da_b guards).
+                    // item 2-4: the holed-chunk B2 branch is gone with the case-0
+                    // no-op break above - a B2 focus tag never reaches here.
+                    if (slot.kv_holes_active && !keep_idx.empty() && !slot.da_measure_only) {
+                        SLT_INF(slot, "kv_offload: checking %zu keep chunk(s) against %zu hole range(s)\n",
+                            keep_idx.size(), slot.kv_hole_ranges.size());
+                        const int32_t n_prompt = (int32_t) slot.prompt.tokens.size();
+                        std::string keep_nums, hole_str;
+                        for (size_t n : keep_idx) {
+                            if (!keep_nums.empty()) keep_nums += ",";
+                            keep_nums += std::to_string((int) n);
+                        }
+                        for (const auto & hole : slot.kv_hole_ranges) {
+                            if (!hole_str.empty()) hole_str += " ";
+                            hole_str += "[" + std::to_string(hole.first) + "," + std::to_string(hole.second) + ")";
+                        }
+                        SLT_INF(slot, "kv_offload: keep = {%s}, holes = {%s}, prompt tokens = %d\n",
+                            keep_nums.c_str(), hole_str.c_str(), n_prompt);
+                        for (size_t n : keep_idx) {
+                            const auto & cr = chunks[n];
+                            // Collect every hole overlap of this chunk first (ohi
+                            // clamped to the prompt), then merge touching/
+                            // overlapping intervals: a chunk spanning a
+                            // message-split hole chain used to queue one unit per
+                            // hole (journal: 8+44+1 token fragments, one of them a
+                            // single "\n"), each wrapped in its own [Recalled
+                            // Chunk] block. One merged interval = one recall block.
+                            std::vector<std::pair<int32_t, int32_t>> ov;
+                            for (const auto & hole : slot.kv_hole_ranges) {
+                                const int32_t olo = std::max(cr.first, (int32_t) hole.first);
+                                int32_t       ohi = std::min(cr.second, (int32_t) hole.second);
+                                if (ohi > n_prompt) ohi = n_prompt;
+                                if (ohi > olo) ov.push_back({ olo, ohi });
+                            }
+                            std::sort(ov.begin(), ov.end());
+                            // Merge ONLY on next.lo <= current.hi (touching or
+                            // overlapping). A gap between overlaps is KV-resident
+                            // text, not a hole - bridging it would re-prefill text
+                            // the model already has and duplicate it.
+                            std::vector<std::pair<int32_t, int32_t>> merged;
+                            std::vector<size_t> merged_frags;
+                            for (const auto & r : ov) {
+                                if (!merged.empty() && r.first <= merged.back().second) {
+                                    merged.back().second = std::max(merged.back().second, r.second);
+                                    merged_frags.back() += 1;
+                                } else {
+                                    merged.push_back(r);
+                                    merged_frags.push_back(1);
+                                }
+                            }
+                            int32_t ov_tokens = 0;
+                            for (const auto & r : merged) ov_tokens += r.second - r.first;
+                            SLT_INF(slot, "kv_offload:   chunk %zu [%d,%d) overlap fragments=%zu merged=%zu tokens=%d\n",
+                                n, cr.first, cr.second, ov.size(), merged.size(), ov_tokens);
+                            for (size_t mi = 0; mi < merged.size(); ++mi) {
+                                const auto & r = merged[mi];
+                                // item 2-2: subtract the already-recalled parts
+                                // (committed ranges + units queued in this pass)
+                                // and queue only the remainder, so a partial
+                                // overlap does not lose the new part.
+                                std::vector<std::pair<int32_t, int32_t>> rem = { r };
+                                for (const auto & rr : slot.da_recalled_ranges) {
+                                    da_subtract_range(rem, rr.first, rr.second);
+                                }
+                                for (const auto & u : slot.da_pending_refill) {
+                                    if (u.range.first >= 0) da_subtract_range(rem, u.range.first, u.range.second);
+                                }
+                                if (rem.empty()) {
+                                    SLT_WRN_DBG(slot, "kv_offload: holed chunk %zu overlap [%d,%d) already recalled this request - skipping (dedup)\n",
+                                            n, r.first, r.second);
+                                    continue;
+                                }
+                                llama_tokens toks;
+                                for (const auto & rp : rem) {
+                                    for (int32_t p = rp.first; p < rp.second; ++p) {
+                                        toks.push_back(slot.prompt.tokens[p]);
+                                    }
+                                }
+                                if (toks.empty()) continue;
+                                SLT_INF(slot, "kv_offload: focus on holed chunk %zu - re-prefilling %d token(s) at [%d,%d) (%zu fragment(s) merged)\n",
+                                        n, (int) toks.size(), r.first, r.second, merged_frags[mi]);
+                                // item 6/2-3: one unit per merged overlap (wrapped individually in
+                                // kv_offload_refill). The dedup key (range) is committed to
+                                // da_recalled_ranges only on success.
+                                da_refill_unit u;
+                                u.toks = std::move(toks);
+                                u.range = r;
+                                slot.da_pending_refill.push_back(std::move(u));
+                                did_refill = true;
+                            }
+                        }
+                    }
+                    // B1: the queued refill has NOT grown the prompt yet (it
+                    // decodes in the next post_decode, after the closing token
+                    // commits), so the bound stays at the current decode
+                    // position. The recalled block then lands on the tail of
+                    // kv_seq() (da_seq after a B switch) BEHIND the bound,
+                    // where the B read set already reaches (tokens after the
+                    // boundary are read). Kept as a defensive recompute in
+                    // case a future path refills synchronously.
+                    if (did_refill) {
+                        n_full = (int32_t) slot.prompt.n_tokens();
+                    }
+                    if (keep_idx.empty()) {
+                        if (did_refill) {
+                            SLT_INF(slot, "%s", "kv_offload: focus on offloaded chunk(s) - re-prefilled at tail, model reads in current mode");
+                        } else {
+                            SLT_WRN_DBG(slot, "%s", "da_tag: no valid magic_chunks number - tag consumed, mode unchanged\n");
+                        }
+                        break;
+                    }
+                    std::sort(keep_idx.begin(), keep_idx.end());
+
+                    const auto is_kept = [&keep_idx](size_t n) {
+                        return std::find(keep_idx.begin(), keep_idx.end(), n) != keep_idx.end();
+                    };
+                    const auto is_old = [&slot](size_t n) {
+                        return std::find(slot.da_keep_chunks.begin(), slot.da_keep_chunks.end(), (int32_t) n) != slot.da_keep_chunks.end();
+                    };
+                    std::string keep_str;
+                    for (size_t n : keep_idx) {
+                        if (!keep_str.empty()) {
+                            keep_str += ",";
+                        }
+                        keep_str += std::to_string((int) (n + base));
+                    }
+
+                    if (is_b) {
+                        if (slot.da_seq < 0) {
+                            // GLOBAL -> FOCUS: fresh da_seq = scaffold + keep + tail
+                            std::vector<std::pair<int32_t, int32_t>> ranges;
+                            for (size_t n = 0; n < chunks.size(); n++) {
+                                if (!is_kept(n)) {
+                                    ranges.push_back(chunks[n]);
+                                }
+                            }
+                            if (filler.first >= 0) {
+                                ranges.push_back(filler);
+                            }
+                            SLT_INF_DBG(slot, "da_tag: <focus magic_chunks=\"%s\"> closed at generated token %d - B switch, removing %zu range(s), bound=%d\n",
+                                    keep_str.c_str(), (int) slot.stats.n_gen, ranges.size(), n_full);
+                            apply_da_b(slot, ranges, n_full, "at tag close");
+                            if (slot.da_seq >= 0) {
+                                slot.da_set_mode(DA_MODE_FOCUS);
+                                slot.da_keep_chunks.assign(keep_idx.begin(), keep_idx.end());
+                            }
+                        } else if (in_focus) {
+                            // FOCUS -> FOCUS: drop the old keep(s) that left
+                            // the set, copy in the new keep(s)
+                            for (int32_t n : slot.da_keep_chunks) {
+                                if (!is_kept((size_t) n)) {
+                                    slot.mem.seq_rm(slot.da_seq, chunks[n].first, chunks[n].second);
+                                    slot.da_keep_count -= (size_t) (chunks[n].second - chunks[n].first);
+                                }
+                            }
+                            for (size_t n : keep_idx) {
+                                if (!is_old(n)) {
+                                    slot.mem.seq_cp(slot.id, slot.da_seq, chunks[n].first, chunks[n].second);
+                                    slot.da_keep_count += (size_t) (chunks[n].second - chunks[n].first);
+                                }
+                            }
+                            slot.da_keep_chunks.assign(keep_idx.begin(), keep_idx.end());
+                            SLT_INF_DBG(slot, "da_tag: FOCUS switch - now keeping chunk(s) %s\n", keep_str.c_str());
+                        } else {
+                            // LOCAL -> FOCUS: copy the keep(s) into da_seq
+                            for (size_t n : keep_idx) {
+                                slot.mem.seq_cp(slot.id, slot.da_seq, chunks[n].first, chunks[n].second);
+                                slot.da_keep_count += (size_t) (chunks[n].second - chunks[n].first);
+                            }
+                            slot.da_keep_chunks.assign(keep_idx.begin(), keep_idx.end());
+                            slot.da_set_mode(DA_MODE_FOCUS);
+                            SLT_INF_DBG(slot, "da_tag: LOCAL -> FOCUS - keeping chunk(s) %s\n", keep_str.c_str());
+                        }
+                    } else {
+                        // A path: monotonic. The chunks still present in the
+                        // sequence are all of them before the first removal.
+                        std::vector<size_t> present;
+                        if (!slot.da_applied && slot.da_mode == DA_MODE_GLOBAL) {
+                            for (size_t n = 0; n < chunks.size(); n++) {
+                                present.push_back(n);
+                            }
+                        } else {
+                            for (int32_t n : slot.da_keep_chunks) {
+                                present.push_back((size_t) n);
+                            }
+                        }
+                        bool all_present = true;
+                        for (size_t n : keep_idx) {
+                            if (std::find(present.begin(), present.end(), n) == present.end()) {
+                                SLT_WRN_DBG(slot, "da_tag: A path is monotonic - chunk %d was already removed, cannot switch keep (staying %s)\n",
+                                        (int) (n + base), in_focus ? "FOCUS" : (in_local ? "LOCAL" : "GLOBAL"));
+                                all_present = false;
+                                break;
+                            }
+                        }
+                        if (all_present) {
+                            std::vector<std::pair<int32_t, int32_t>> ranges;
+                            for (size_t n : present) {
+                                if (!is_kept(n)) {
+                                    ranges.push_back(chunks[n]);
+                                }
+                            }
+                            if (!slot.da_applied && filler.first >= 0) {
+                                ranges.push_back(filler);
+                            }
+                            SLT_INF_DBG(slot, "da_tag: <focus magic_chunks=\"%s\"> closed at generated token %d - A removal, %zu range(s), bound=%d\n",
+                                    keep_str.c_str(), (int) slot.stats.n_gen, ranges.size(), n_full);
+                            apply_da_rm(slot, ranges, n_full, "at tag close");
+                            slot.da_keep_chunks.assign(keep_idx.begin(), keep_idx.end());
+                            slot.da_set_mode(DA_MODE_FOCUS);
+                        }
+                    }
+                    // L3: are the kept chunks actually alive on da_seq? The
+                    // 4-turn loop signature is holed == len with did_refill = 0
+                    // - the model cannot read a chunk whose KV was evicted and
+                    // never recalled.
+                    if (is_b && slot.da_seq >= 0) {
+                        auto * mem = llama_get_memory(ctx_tgt);
+                        for (size_t n : keep_idx) {
+                            int32_t holed = 0;
+                            for (const auto & h : slot.kv_hole_ranges) {
+                                holed += std::max(0, std::min(chunks[n].second, (int32_t) h.second) - std::max(chunks[n].first, (int32_t) h.first));
+                            }
+                            if (holed > chunks[n].second - chunks[n].first) {
+                                SLT_WRN_DBG(slot, "da: L3 holed=%d > len=%d for keep chunk %d [%d,%d) - ledger spans exceed the chunk (stale/overlapping holes)\n",
+                                        holed, chunks[n].second - chunks[n].first, (int) (n + base), chunks[n].first, chunks[n].second);
+                            }
+                            da_trace("slot=%d task=%d L3 B keep chunk=%d [%d,%d) len=%d holed=%d did_refill=%d da_seq=[%d,%d] bound=%d n_full=%d\n",
+                                     (int) slot.id, (int) slot.task->id,
+                                     (int) (n + base), chunks[n].first, chunks[n].second, chunks[n].second - chunks[n].first, holed, (int) did_refill,
+                                     (int) llama_memory_seq_pos_min(mem, slot.da_seq), (int) llama_memory_seq_pos_max(mem, slot.da_seq),
+                                     (int) slot.da_bound, (int) n_full);
+                        }
+                    }
+                    break;
+                }
+                case 1: { // <local> : enter LOCAL
+                    if (is_b) {
+                        if (slot.da_seq < 0) {
+                            // GLOBAL -> LOCAL: fresh da_seq = scaffold + tail
+                            std::vector<std::pair<int32_t, int32_t>> ranges(chunks.begin(), chunks.end());
+                            if (filler.first >= 0) {
+                                ranges.push_back(filler);
+                            }
+                            SLT_INF_DBG(slot, "da_tag: <local> closed at generated token %d - B switch, removing %zu range(s), bound=%d\n",
+                                    (int) slot.stats.n_gen, ranges.size(), n_full);
+                            apply_da_b(slot, ranges, n_full, "at tag close");
+                            if (slot.da_seq >= 0) {
+                                slot.da_set_mode(DA_MODE_LOCAL);
+                                slot.da_keep_chunks.clear();
+                            }
+                        } else if (in_focus) {
+                            // FOCUS -> LOCAL: drop the kept chunk from da_seq
+                            for (int32_t n : slot.da_keep_chunks) {
+                                slot.mem.seq_rm(slot.da_seq, chunks[n].first, chunks[n].second);
+                                slot.da_keep_count -= (size_t) (chunks[n].second - chunks[n].first);
+                            }
+                            slot.da_keep_chunks.clear();
+                            slot.da_set_mode(DA_MODE_LOCAL);
+                            SLT_INF_DBG(slot, "%s", "da_tag: FOCUS -> LOCAL - keep chunk(s) dropped\n");
+                        }
+                        // LOCAL -> LOCAL: no-op
+                    } else {
+                        // A path: remove every chunk still present
+                        std::vector<size_t> present;
+                        if (!slot.da_applied && slot.da_mode == DA_MODE_GLOBAL) {
+                            for (size_t n = 0; n < chunks.size(); n++) {
+                                present.push_back(n);
+                            }
+                        } else {
+                            for (int32_t n : slot.da_keep_chunks) {
+                                present.push_back((size_t) n);
+                            }
+                        }
+                        std::vector<std::pair<int32_t, int32_t>> ranges;
+                        for (size_t n : present) {
+                            ranges.push_back(chunks[n]);
+                        }
+                        if (!slot.da_applied && filler.first >= 0) {
+                            ranges.push_back(filler);
+                        }
+                        SLT_INF_DBG(slot, "da_tag: <local> closed at generated token %d - A removal, %zu range(s), bound=%d\n",
+                                (int) slot.stats.n_gen, ranges.size(), n_full);
+                        apply_da_rm(slot, ranges, n_full, "at tag close");
+                        slot.da_keep_chunks.clear();
+                        slot.da_set_mode(DA_MODE_LOCAL);
+                    }
+                    break;
+                }
+                case 2:
+                case 3:
+                case 4:
+                case 5: { // </focus> / </local> / <global> / </global> : return to GLOBAL
+                    if (in_local && tag.type == 2) {
+                        SLT_WRN_DBG(slot, "%s", "da_tag: </focus> while in LOCAL - treating as </local>\n");
+                    }
+                    if (slot.da_seq >= 0) {
+                        // B: copy the generated tail back to the original
+                        // sequence and free da_seq - the slot decodes the full
+                        // context again without a re-prefill
+                        if (n_full > slot.da_bound) {
+                            slot.mem.seq_cp(slot.da_seq, slot.id, slot.da_bound, n_full);
+                        }
+                        slot.mem.seq_rm(slot.da_seq, -1, -1);
+                        SLT_INF_DBG(slot, "da_tag: returned to GLOBAL - %d generated token(s) copied back to seq %d, da_seq %d freed\n",
+                                std::max(0, n_full - slot.da_bound), (int) slot.id, (int) slot.da_seq);
+                        slot.da_seq        = -1;
+                        slot.da_bound      = -1;
+                        slot.da_keep_count = 0;
+                        slot.da_keep_chunks.clear();
+                    } else if (slot.da_applied) {
+                        SLT_WRN_DBG(slot, "da_tag: A path removals are irreversible - attention stays restricted (%zu chunk(s) kept), mode nominal GLOBAL\n",
+                                slot.da_keep_chunks.size());
+                    }
+                    // !da_applied: nothing was removed - a clean return
+                    slot.da_set_mode(DA_MODE_GLOBAL);
+                    break;
+                }
+            }
+        }
+    }
+
     void post_decode(int32_t n_batch_tokens, int32_t off) {
         // for checking if a given batch index is inside the current sub-batch
         auto is_inside_view = [&](int32_t idx) {
@@ -4762,6 +7506,93 @@ private:
         auto accept_special_token = [&](server_slot & slot, llama_token token) {
             return params_base.special ||
                 slot.task->params.sampling.preserved_tokens.find(token) != slot.task->params.sampling.preserved_tokens.end();
+        };
+
+        // A deferred refill runs llama_decode inside the slot loop below and
+        // overwrites the ctx output buffer. Set when one ran in this pass so
+        // the stale-logits probe can name the cause in its error.
+        bool refill_ran_this_iter = false;
+
+        // Shared sampling path (probe + sample + accept + stats + process_token)
+        // for the main (non-spec) decode row. Extracted so the deferred-refill
+        // pass (below) can sample a refilling slot from the refill's last row
+        // without duplicating the logic. Returns false if the slot was aborted
+        // or released (the caller must then return from its iterate).
+        auto sample_main_path = [&](server_slot & slot, int32_t tok_idx) -> bool {
+            // Defensive line (2026-10-09 12:43 crash): a decode that ran after
+            // this slot's main-batch row was computed overwrote the ctx output
+            // buffer, so the row no longer resolves and common_sampler's
+            // GGML_ASSERT would abort the whole server. Probe first and abort
+            // this slot with an error instead. The step is unrecoverable:
+            // re-decoding the token is unsafe in the cell-based KV cache
+            // (double-counted K/V).
+            if (llama_get_logits_ith(slot.ctx_tgt, tok_idx) == nullptr) {
+                SLT_ERR(slot, "kv_offload: stale logits row at sampling (a decode ran after this slot's batch row)%s - aborting slot\n",
+                        refill_ran_this_iter ? " (a deferred refill ran this iteration)" : "");
+                send_error(slot, "kv_offload: stale logits row - the slot was aborted (the in-flight step was dropped)");
+                slot.da_pending_refill.clear();
+                slot.i_batch = -1;
+                slot.da_refill_out_idx = -1;
+                slot.release();
+                slot.prompt_clear();
+                return false;
+            }
+
+            llama_token id;
+            {
+                scoped_timer timer(t_sampl, n_sampl);
+                id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
+            }
+
+            slot.i_batch = -1;
+            slot.da_refill_out_idx = -1;  // consumed
+
+            // L4: top-5 probabilities of the token just sampled - the B1
+            // check reads the continuation right after [End of Recalled Chunk]
+            if (slot.da_trace_left > 0) {
+                std::string s;
+                for (const auto & c : get_token_probabilities(slot.ctx_tgt, tok_idx, 5)) {
+                    s += string_format("%d:'%s':%.3f ", (int) c.id, dbg_esc(common_token_to_piece(slot.ctx_tgt, c.id, true), 20).c_str(), c.p);
+                }
+                da_trace("slot=%d task=%d L4 top5 sampled=%d [%s]\n",
+                         (int) slot.id, (int) slot.task->id, (int) id, s.c_str());
+            }
+
+            common_sampler_accept(slot.smpl.get(), id, true);
+
+            // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
+            const int64_t t_now = ggml_time_us();
+
+            slot.stats.n_gen += 1;
+            slot.da_count_generated_token();
+
+            if (slot.stats.n_gen == 1) {
+                slot.stats.update_prompt_last();
+                slot.t_print_last = t_now;
+                slot.n_gen_last = 0;
+            }
+
+            slot.stats.update_gen_last();
+
+            completion_token_output result;
+            result.tok          = id;
+            result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
+            result.prob         = 1.0f; // TODO: set it here instead of doing inside populate_token_probs
+
+            if (slot.task->params.sampling.n_probs > 0) {
+                populate_token_probs(slot, result, slot.task->params.post_sampling_probs, params_base.special, tok_idx);
+            }
+
+            if (!process_token(result, slot)) {
+                // release slot because of stop condition
+                slot.print_timings();
+                send_final_response(slot);
+                slot.release();
+                return false;
+            }
+
+            slot.print_timings_tg();
+            return true;
         };
 
         iterate(slots, [&](server_slot & slot) {
@@ -4805,8 +7636,45 @@ private:
                 // prompt evaluated for next-token prediction
                 slot.state = SLOT_STATE_GENERATING;
 
-                if (slot.can_speculate()) {
-                    common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
+                // kv-offload-holes: one-line summary of the prefill's KV peak
+                // (the progressive cut's success criterion:
+                // peak <= buffer - 16384 headroom).
+                if (!slot.task->params.kv_hole_pending.empty()) {
+                    SLT_INF_DBG(slot, "kv-offload-holes: prefill done - peak resident %d (buffer %d, prompt %d, applied holes %zu)\n",
+                            slot.kv_hole_peak_resident, params_base.kv_cache_size,
+                            (int) slot.prompt.n_tokens(), slot.kv_hole_ranges.size());
+                }
+
+                // Declarative Attention: apply the removals that were not applied
+                // mid-prefill (da_rm_at < 0, prompts containing media, or the
+                // boundary coincides with the end of the prompt). The first generated token
+                // is sampled from the already-computed prompt logits; subsequent
+                // decode steps see the reduced KV.
+                if (slot.da_rm_pending) {
+                    if (slot.task->params.da_rm_at >= 0) {
+                        const size_t n_total = slot.task->tokens.size();
+                        const size_t n_text  = slot.task->tokens.get_text_tokens().size();
+                        SLT_INF_DBG(slot, "da_rm: mid-prefill boundary never applied (da_rm_at=%d has_mtmd=%d n_tokens=%d n_text=%zu n_media=%zu) - applying after prefill\n",
+                                slot.task->params.da_rm_at, (int) slot.task->tokens.has_mtmd, (int) slot.prompt.n_tokens(),
+                                n_text, n_total - n_text);
+                    }
+                    if (slot.task->params.da_b) {
+                        apply_da_b(slot, slot.task->params.da_rm, da_static_bound(slot), "after prefill");
+                    } else {
+                        apply_da_rm(slot, slot.task->params.da_rm, da_static_bound(slot), "after prefill");
+                    }
+                    slot.da_rm_pending = false;
+                }
+
+                // A 2-stream (B) slot that has already switched decodes on its
+                // second sequence (da_seq) - spec was started before the
+                // switch and follows it via kv_seq().
+                // DA tag mode (P6): spec starts before the tag fires. When a
+                // control tag closes mid-decode, the accept loop cuts the
+                // draft batch at the closing token and the mode transition
+                // runs; decoding (and the draft) then continues on kv_seq().
+                if (slot.can_speculate() && slot.da_seq < 0) {
+                    common_speculative_begin(spec.get(), slot.kv_seq(), slot.prompt.tokens.get_text_tokens());
                 }
             } else if (slot.state != SLOT_STATE_GENERATING) {
                 return;
@@ -4816,51 +7684,22 @@ private:
                 return; // sample using speculative decoding
             }
 
-            // shifted according to the current sub-batch
-            const int tok_idx = slot.i_batch - off;
-
-            llama_token id;
-            {
-                scoped_timer timer(t_sampl, n_sampl);
-                id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
-            }
-
-            slot.i_batch = -1;
-
-            common_sampler_accept(slot.smpl.get(), id, true);
-
-            // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
-            const int64_t t_now = ggml_time_us();
-
-            slot.stats.n_gen += 1;
-
-            if (slot.stats.n_gen == 1) {
-                slot.stats.update_prompt_last();
-                slot.t_print_last = t_now;
-                slot.n_gen_last = 0;
-            }
-
-            slot.stats.update_gen_last();
-
-            completion_token_output result;
-            result.tok          = id;
-            result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
-            result.prob         = 1.0f; // TODO: set it here instead of doing inside populate_token_probs
-
-            if (slot.task->params.sampling.n_probs > 0) {
-                populate_token_probs(slot, result, slot.task->params.post_sampling_probs, params_base.special, tok_idx);
-            }
-
-            if (!process_token(result, slot)) {
-                // release slot because of stop condition
-                slot.print_timings();
-                send_final_response(slot);
-                slot.release();
-
+            // B1 (2026-10-09 12:43 crash root cause): a slot with a queued
+            // refill (apply_da_tag) is DEFERRED to the refill pass below. Its
+            // sampling must run AFTER the refill (it samples from the refill's
+            // last row), and the refill must run AFTER every other slot has
+            // sampled - the refill's llama_decode overwrites the ctx output
+            // buffer, and running it inside this loop stale the other slots'
+            // main-batch rows (the GGML_ASSERT abort). Skip it here; the refill
+            // pass (after the spec iterate) runs the refill and samples it.
+            if (!slot.da_pending_refill.empty()) {
                 return;
             }
 
-            slot.print_timings_tg();
+            // sample from the main batch's row (no refill ran for this slot)
+            if (!sample_main_path(slot, slot.i_batch - off)) {
+                return;
+            }
         });
 
         // speculative decoding - main model sample and accept
@@ -4884,6 +7723,36 @@ private:
 
                 GGML_ASSERT(spec_i_batch.size() == n_draft + 1);
                 GGML_ASSERT(slot.spec_draft_q.empty() || (slot.spec_draft_q.size() == slot.spec_draft.size()));
+
+                // Defensive line (2026-10-09 12:43 crash): the backtrace died
+                // in sample_and_accept_n on idx 1 - the first draft row of the
+                // slot that did NOT refill. A deferred refill in another slot's
+                // iterate overwrote the ctx output buffer, so every main-batch
+                // row (the whole spec_i_batch) is stale and common_sampler's
+                // GGML_ASSERT would abort the whole server. Probe before
+                // sampling and abort this slot with an error instead. The step
+                // is unrecoverable: re-decoding the token is unsafe in the
+                // cell-based KV cache (double-counted K/V).
+                int stale_idx = -1;
+                for (int32_t idx : spec_i_batch) {
+                    if (llama_get_logits_ith(slot.ctx_tgt, idx) == nullptr) {
+                        stale_idx = idx;
+                        break;
+                    }
+                }
+                if (stale_idx >= 0) {
+                    SLT_ERR(slot, "kv_offload: stale logits row at spec sampling (idx=%d, a decode ran after this slot's batch row)%s - aborting slot\n",
+                            stale_idx, refill_ran_this_iter ? " (a deferred refill ran this iteration)" : "");
+                    send_error(slot, "kv_offload: stale logits row - the slot was aborted (the in-flight step was dropped)");
+                    slot.da_pending_refill.clear();
+                    slot.i_batch = -1;
+                    slot.da_refill_out_idx = -1;
+                    slot.spec_i_batch.clear();
+                    slot.release();
+                    slot.prompt_clear();
+                    return;
+                }
+                GGML_ASSERT(slot.spec_draft_q.empty() || (slot.spec_draft_q.size() == slot.spec_draft.size()));
                 const auto & synth_probs = common_speculative_get_synth_probs(spec.get());
 
                 // drafters that fill no distribution fall back here
@@ -4905,6 +7774,39 @@ private:
 
                 GGML_ASSERT(accepted.size() >= 1);
 
+                // DA tag batch cut (P6): if a control tag closes inside the
+                // accepted batch, discard everything after the closing token
+                // - the mode transition (apply_da_tag in process_token) must
+                // run before the following tokens are committed to the
+                // output stream and the KV cache. The cut point is the token
+                // whose text contains the tag's closing '>'.
+                if (!slot.task->params.da_chunks.empty()) {
+                    const size_t n_acc_full = accepted.size();
+                    const size_t gen_len    = slot.generated.text.size();
+                    std::string preview;
+                    for (llama_token tok : accepted) {
+                        preview += common_token_to_piece(slot.ctx_tgt, tok, accept_special_token(slot, tok));
+                    }
+                    // a tag may start in the held-back tail of generated_text
+                    // (process_token holds back partial tag openers) and close
+                    // inside this batch; only the closing position matters
+                    const da_tag_t tag = scan_da_tag(slot.generated.text + preview, slot.da_tag_scan_pos, slot.da_mode);
+                    if (tag.type >= 0 && tag.end > gen_len) {
+                        const size_t cut = tag.end - gen_len;  // offset into the preview
+                        size_t off = 0;
+                        for (size_t i = 0; i < accepted.size(); i++) {
+                            const std::string piece = common_token_to_piece(slot.ctx_tgt, accepted[i], accept_special_token(slot, accepted[i]));
+                            if (off + piece.size() >= cut) {
+                                accepted.resize(i + 1);
+                                SLT_INF_DBG(slot, "da_tag: batch cut - %zu of %zu accepted token(s) discarded (tag closed mid-batch)\n",
+                                        n_acc_full - (i + 1), n_acc_full);
+                                break;
+                            }
+                            off += piece.size();
+                        }
+                    }
+                }
+
                 const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
 
                 // the recurrent snapshots are only guaranteed for batches of up to n_rs_seq + 1 tokens, so a longer draft uses its checkpoint
@@ -4919,7 +7821,12 @@ private:
                             SLT_INF(slot, "accepted %2zu/%2zu draft tokens (restore checkpoint)\n", accepted.size() - 1, slot.spec_draft.size());
                         }
 
-                        // partial acceptance is not supported by the context -> truncate the draft and restore the state
+                        // partial acceptance is not supported by the context -> truncate the draft and restore the state.
+                        // the accepted prefix is not committed here: it is replayed and re-verified next round, whose
+                        // accept() would carry the stale draft count of this round. report the partial acceptance now
+                        // via accept_partial - only the adaptive MTP controller consumes it
+                        common_speculative_accept_partial(spec.get(), slot.id, accepted.size() - 1);
+
                         slot.spec_is_replay = true;
                         slot.spec_draft = std::move(accepted);
 
@@ -4927,13 +7834,13 @@ private:
 
                         SLT_DBG(slot, "restoring speculative checkpoint (pos_min = %d, pos_max = %d, size = %zu)\n", ckpt.pos_min, ckpt.pos_max, ckpt.size());
 
-                        GGML_ASSERT(ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
+                        GGML_ASSERT(ckpt.load_tgt(slot.ctx_tgt, slot.kv_seq(), LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
 
                         if (slot.ctx_dft) {
-                            GGML_ASSERT(ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
+                            GGML_ASSERT(ckpt.load_dft(slot.ctx_dft, slot.kv_seq(), LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
                         }
 
-                        slot.mem.seq_rm(slot.id, ckpt.pos_max + 1, -1);
+                        slot.mem.seq_rm(slot.kv_seq(), ckpt.pos_max + 1, -1);
 
                         slot.prompt.tokens.keep_first(ckpt.n_tokens);
                         common_sampler_copy(smpl_save.get(), slot.smpl.get());
@@ -4946,7 +7853,7 @@ private:
                     SLT_INF(slot, "accepted %2zu/%2zu draft tokens\n", accepted.size() - 1, n_draft);
                 }
 
-                common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
+                common_speculative_accept(spec.get(), slot.kv_seq(), accepted.size() - 1);
 
                 slot.spec_draft = std::move(accepted);
             }
@@ -4980,7 +7887,7 @@ private:
             slot.sampled = ids.back(); // last accepted token
             SLT_DBG(slot, "add accepted tokens: sampled=%d, ids.size=%zu, n_draft=%zu\n", slot.sampled, ids.size(), n_draft);
 
-            slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
+            slot.mem.seq_rm(slot.kv_seq(), slot.prompt.tokens.pos_next(), -1);
 
             for (size_t i = 0; i < ids.size(); ++i) {
                 completion_token_output result;
@@ -4995,6 +7902,7 @@ private:
                 }
 
                 slot.stats.n_gen += 1;
+                slot.da_count_generated_token();
 
                 if (!process_token(result, slot)) {
                     slot.print_timings();
@@ -5008,6 +7916,107 @@ private:
             slot.print_timings_tg();
 
             SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int) n_accepted, (int) n_draft, slot.prompt.n_tokens());
+        });
+
+        // Refill pass (B1, 2026-10-09 12:43 crash root cause): run the deferred
+        // refills AFTER every slot (main + spec) has sampled from the main
+        // batch's rows. The refill's llama_decode overwrites the ctx output
+        // buffer, so running it inside the slot loop above stale the other
+        // slots' main-batch rows (the GGML_ASSERT abort). Now all main-batch
+        // rows are consumed before any refill runs, so the other slots are safe.
+        // Each refilling slot samples from its own refill's last row (or the
+        // main batch's row if the refill was rejected by the free-cell gate).
+        // ctx_out_clobbered tracks whether a decode loop already ran in this
+        // pass: once any slot's refill decoded, the ctx output buffer no longer
+        // holds the main batch's rows, so a LATER slot's gate rejection can no
+        // longer fail open (its main-batch row is stale) and must abort.
+        bool ctx_out_clobbered = false;
+        iterate(slots, [&](server_slot & slot) {
+            if (slot.da_pending_refill.empty()) {
+                return;
+            }
+            // A spec slot's refill is NOT applied here (mirrors the original
+            // behavior: the spec check in the first iterate returns before the
+            // refill, so a spec slot's refill was silently dropped). Skipping
+            // it here also avoids a double sample - the slot already sampled in
+            // the spec iterate above. The control tag WAS consumed though - the
+            // model asked for the chunk and never gets it, so treat the drop as
+            // an explicit fail-open (logged) instead of a silent clear.
+            if (slot.can_speculate() && !slot.spec_draft.empty()) {
+                SLT_WRN(slot, "kv_offload: spec slot has %zu queued recall unit(s) but speculative decoding is active - dropping the recall (the tag was consumed, the content is NOT re-prefilled; explicit fail-open)\n",
+                        slot.da_pending_refill.size());
+                slot.da_pending_refill.clear();
+                return;
+            }
+            // The slot was deferred in the first iterate; it must still be
+            // generating. If it was released or moved to another state, drop
+            // the recall.
+            if (slot.state != SLOT_STATE_GENERATING) {
+                slot.da_pending_refill.clear();
+                return;
+            }
+            // Not in this sub-batch's view: post_decode runs per sub-batch and
+            // the first iterate skips out-of-view slots, so the recall must be
+            // kept for the sub-batch that contains it. Do NOT clear it here.
+            if (!is_inside_view(slot.i_batch)) {
+                return;
+            }
+            int32_t last_idx = -1;
+            bool safe_failopen = false;
+            const bool ok = kv_offload_refill(slot.ctx_tgt, slot, slot.da_pending_refill, &last_idx,
+                                              [this] { return try_clear_idle_slots(); }, &safe_failopen);
+            if (!safe_failopen) {
+                // the decode loop ran (success or mid-decode failure) - the ctx
+                // output buffer no longer holds the main batch's rows
+                ctx_out_clobbered = true;
+            }
+            if (ok) {
+                slot.da_refill_out_idx = last_idx;
+                refill_ran_this_iter = true;
+                // item 2-3: commit the dedup keys ONLY on success, so a recall
+                // dropped by the free-cell gate (or a spec-slot clear) stays
+                // retryable - the model can re-emit the tag and get it.
+                for (const auto & unit : slot.da_pending_refill) {
+                    if (unit.chunk_id >= 0) slot.da_recalled_chunk_ids.push_back(unit.chunk_id);
+                    if (unit.range.first >= 0) slot.da_recalled_ranges.push_back(unit.range);
+                }
+            } else if (safe_failopen && !ctx_out_clobbered) {
+                // Rejected BEFORE any decode ran (the free-cell hard gate) AND
+                // no earlier refill in this pass decoded - the ctx output buffer
+                // still holds the MAIN batch's rows, so the closing token's row
+                // (slot.i_batch - off) is valid. Fail-open: drop the recall and
+                // sample that row; the slot continues without the recalled chunk
+                // (keeps its cache).
+                SLT_INF(slot, "%s", "kv_offload: refill skipped (no free cells) - continuing without the recalled chunk\n");
+                // da_refill_out_idx stays -1 -> tok_idx = slot.i_batch - off.
+            } else {
+                // Either a failed refill (mid-decode) OR a gate rejection after
+                // an earlier slot's refill already decoded in this pass: the ctx
+                // logits buffer no longer holds the main batch's rows, so the
+                // closing token's row (slot.i_batch - off) is stale. Re-decoding
+                // the closing token is NOT safe in the cell-based KV cache
+                // (double-counted K/V). Abort the slot instead of sampling a
+                // stale row.
+                if (safe_failopen) {
+                    SLT_ERR(slot, "%s", "kv_offload: refill rejected (no free cells) after another slot's refill already decoded - aborting slot (the main-batch logits row is stale)\n");
+                    send_error(slot, "kv_offload: refill rejected after the ctx output was clobbered - the slot was aborted (the recalled block was dropped to avoid sampling a stale logits row)");
+                } else {
+                    SLT_ERR(slot, "%s", "kv_offload: deferred refill failed - aborting slot (dropping the recalled block to avoid sampling a stale logits row)\n");
+                    send_error(slot, "kv_offload: deferred refill failed - the slot was aborted (the recalled block was dropped to avoid sampling a stale logits row)");
+                }
+                slot.i_batch = -1;
+                slot.release();
+                slot.prompt_clear();
+                slot.da_pending_refill.clear();
+                return;
+            }
+            slot.da_pending_refill.clear();
+            // sample from the refill's last row (or the main batch's row if the
+            // refill was rejected by the free-cell gate)
+            const int tok_idx = slot.da_refill_out_idx >= 0 ? slot.da_refill_out_idx : slot.i_batch - off;
+            if (!sample_main_path(slot, tok_idx)) {
+                return;
+            }
         });
     }
 
@@ -5261,6 +8270,381 @@ void server_context::set_video_decoder(const mtmd_helper_video_decoder * decoder
     impl->init_opt.video_params.decoder = decoder;
 }
 
+// Roll back a partial kv_offload_refill: remove [n_full, -1) (the tail from the
+// pre-refill length onward) on kv_seq(), restoring KV<->prompt.tokens
+// consistency. Runs on every failure (any error class), not only the first
+// sub-batch: a later sub-batch failure leaves the earlier ones' tokens in the
+// KV and the rollback must remove them all. If the removal is a no-op (e.g. a
+// recurrent-state hybrid cannot be partially rolled back), the slot's KV stays
+// inconsistent with prompt.tokens -> mark it poisoned so release()
+// prompt_clear()s it instead of keeping the prompt cache. Harmless when
+// nothing was written (the range contains no cells).
+static void kv_offload_refill_rollback(server_slot & slot, int32_t n_full, int32_t off) {
+    if (!slot.mem.seq_rm_checked(slot.kv_seq(), n_full, -1)) {
+        slot.refill_poisoned = true;
+        SRV_WRN("kv_offload: refill rollback no-op for [%d, -1) in seq %d after %d token(s) - slot poisoned, prompt cache will be cleared on release\n",
+                n_full, (int) slot.kv_seq(), off);
+    }
+}
+
+// Re-prefill an offloaded chunk at the tail of the slot's sequence
+// (get-on-focus). Appends the tokens at positions [n_full, n_full+len) on
+// kv_seq() and runs a prefill decode so the model can attend to the chunk.
+// Returns true on success; false on any error (fail-open: the caller
+// proceeds without the chunk). The slot's prompt tokens are advanced so
+// pos_next() reflects the new length. HIGH RISK: mid-decode prefill - must be
+// validated by the offload probe before trusting.
+static bool kv_offload_refill(llama_context * ctx, server_slot & slot, const std::vector<da_refill_unit> & units, int32_t * out_last_idx,
+                              const std::function<bool()> & on_retry_idle, bool * out_safe_failopen) {
+    // No decode has run yet - a failure at this point leaves the ctx output
+    // buffer holding the main batch's rows, so the caller can fail-open.
+    // Flipped to false once the decode loop starts (see below).
+    if (out_safe_failopen) *out_safe_failopen = true;
+    if (ctx == nullptr || units.empty()) return false;
+
+    const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
+
+    // item 6: each recalled unit is wrapped INDIVIDUALLY (its own
+    // [Recalled Chunk Start]...[End of Recalled Chunk] block) so multiple units
+    // stay separated in the KV - a flat concat fused them with no boundary. The
+    // wrappers are tokenized as their own pieces: gluing them into one string
+    // lets BPE re-merge across the wrapper/text boundary, and the original toks
+    // were made with (true, true), so a plain re-tokenize of the joined string
+    // is not a round trip. When sanitize is a no-op, keep the original token
+    // boundaries exactly (also drops LLAMA_TOKEN_NULL, which a media prompt's
+    // prompt.tokens[p] can be).
+    const llama_tokens pre  = common_tokenize(ctx, "\n[Recalled Chunk Start]\n", false, true);
+    const llama_tokens post = common_tokenize(ctx, "\n[End of Recalled Chunk]\n", false, true);
+
+    // per-unit (detok, raw_text) for the R1/R3 diagnostics below; unit_diag[u]
+    // always corresponds to units[u] (empty units get empty strings).
+    struct recall_unit_diag { std::string detok; std::string raw_text; };
+    std::vector<recall_unit_diag> unit_diag;
+    unit_diag.reserve(units.size());
+    int32_t n_raw = 0;
+    llama_tokens wrapped_toks;
+    for (size_t u = 0; u < units.size(); u++) {
+        const auto & toks = units[u].toks;
+        n_raw += (int32_t) toks.size();
+        // explicit special=true: sanitize needs the control tags rendered as
+        // text to replace them (do not rely on the declaration default)
+        const std::string detok = common_detokenize(ctx, toks, true);
+        const std::string raw_text = sanitize_recalled_text(detok, recall_tag_names(vocab));
+        unit_diag.push_back({ detok, raw_text });
+        if (toks.empty()) continue;
+        wrapped_toks.insert(wrapped_toks.end(), pre.begin(), pre.end());
+        if (raw_text == detok) {
+            for (llama_token t : toks) {
+                if (t != LLAMA_TOKEN_NULL) wrapped_toks.push_back(t);
+            }
+        } else {
+            const llama_tokens body = common_tokenize(ctx, raw_text, false, true);
+            wrapped_toks.insert(wrapped_toks.end(), body.begin(), body.end());
+        }
+        wrapped_toks.insert(wrapped_toks.end(), post.begin(), post.end());
+    }
+    if (n_raw <= 0) return false;
+
+    const int32_t n = (int32_t) wrapped_toks.size();
+    // KV position, not array index: with media, prompt.tokens holds
+    // LLAMA_TOKEN_NULL placeholders so n_tokens() (array size) diverges from
+    // the next KV position, and the refill's mod_pos would overwrite existing
+    // cells. pos_next() is the true tail of the text-token stream.
+    const int32_t n_full = (int32_t) slot.prompt.tokens.pos_next();
+    const llama_seq_id seq = slot.kv_seq();
+    const int32_t n_batch = (int32_t) llama_n_batch(ctx);
+
+    if (n_batch <= 0) return false;
+
+    // L2: the refill plan - where it lands (n_full / pos_next / seq_pos_max)
+    // and whether sanitize leaked control or EOG tokens into the wrapped
+    // block (both must be 0; ctrl > 0 = a tag sanitize missed, eog > 0 = the
+    // model may stop mid-recall).
+    {
+        int n_ctrl = 0, n_eog = 0;
+        for (llama_token t : wrapped_toks) {
+            if (llama_vocab_get_attr(vocab, t) & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_USER_DEFINED)) n_ctrl++;
+            if (llama_vocab_is_eog(vocab, t)) n_eog++;
+        }
+        std::string head, tail;
+        for (size_t i = 0; i < std::min<size_t>(8, wrapped_toks.size()); i++) {
+            head += string_format("%d:'%s' ", (int) wrapped_toks[i], dbg_esc(common_token_to_piece(ctx, wrapped_toks[i], true), 24).c_str());
+        }
+        for (size_t i = wrapped_toks.size() > 8 ? wrapped_toks.size() - 8 : 0; i < wrapped_toks.size(); i++) {
+            tail += string_format("%d:'%s' ", (int) wrapped_toks[i], dbg_esc(common_token_to_piece(ctx, wrapped_toks[i], true), 24).c_str());
+        }
+        da_trace("slot=%d task=%d L2 refill plan raw=%d wrapped=%d ctrl=%d eog=%d n_full=%d pos_next=%d seq_pos_max=%d sampled=%d head=[%s] tail=[%s]\n",
+                 (int) slot.id, (int) (slot.task ? slot.task->id : -1),
+                 n_raw, n, n_ctrl, n_eog, n_full, (int) slot.prompt.tokens.pos_next(),
+                 (int) llama_memory_seq_pos_max(llama_get_memory(ctx), seq), (int) slot.sampled, head.c_str(), tail.c_str());
+        // T1-d: promote the ctrl/eog leak counters to SRV_INF so they land in
+        // the production journal. ctrl>0 = a control tag sanitize missed (H1a);
+        // eog>0 = an EOG inside the recall (the model may stop mid-recall).
+        if (n_ctrl > 0 || n_eog > 0) {
+            SRV_INF("kv_offload R2-leak: slot=%d task=%d ctrl=%d eog=%d (ctrl>0=sanitize miss, eog>0=mid-recall stop risk)\n",
+                    (int) slot.id, (int) (slot.task ? slot.task->id : -1), n_ctrl, n_eog);
+        }
+    }
+
+    // T1-a (R1): refill non-identity check (per unit). The input unit toks is
+    // the original chunk token stream; the refill re-tokenizes detokenize(toks)
+    // with (add_special=false, parse_special=true) after sanitize. If that
+    // round-trip does not reproduce `toks`, the recalled KV is NOT the
+    // original text (H1a). Compares the inner stream (no wrapper) so the
+    // wrapper's own tokens do not count as a mismatch.
+    {
+        auto head8 = [&](const llama_tokens & v) {
+            std::string s;
+            for (size_t i = 0; i < std::min<size_t>(8, v.size()); i++)
+                s += string_format("%d:'%s' ", (int) v[i], dbg_esc(common_token_to_piece(ctx, v[i], true), 24).c_str());
+            return s;
+        };
+        auto tail8 = [&](const llama_tokens & v) {
+            std::string s;
+            for (size_t i = v.size() > 8 ? v.size() - 8 : 0; i < v.size(); i++)
+                s += string_format("%d:'%s' ", (int) v[i], dbg_esc(common_token_to_piece(ctx, v[i], true), 24).c_str());
+            return s;
+        };
+        for (size_t u = 0; u < units.size(); u++) {
+            const auto & toks = units[u].toks;
+            if (toks.empty()) continue;
+            const std::string & detok = unit_diag[u].detok;
+            const std::string & raw_text = unit_diag[u].raw_text;
+            const bool sanitize_changed = (raw_text != detok);
+            llama_tokens inner_toks = common_tokenize(ctx, raw_text, false, true);
+            const int32_t n_inner = (int32_t) inner_toks.size();
+            const int32_t n_u = (int32_t) toks.size();
+            int32_t first_mismatch = -1, n_mismatch = 0;
+            for (int32_t i = 0; i < std::min(n_u, n_inner); i++) {
+                if (toks[i] != inner_toks[i]) {
+                    if (first_mismatch < 0) first_mismatch = i;
+                    n_mismatch++;
+                }
+            }
+            if (n_u != n_inner) n_mismatch += std::abs(n_u - n_inner); // length delta
+            SRV_INF("kv_offload R1: slot=%d task=%d unit=%zu n_raw=%d n_inner=%d n_mismatch=%d first_mismatch=%d sanitize_changed=%d head_raw=[%s] head_inner=[%s] tail_raw=[%s] tail_inner=[%s]\n",
+                    (int) slot.id, (int) (slot.task ? slot.task->id : -1), u,
+                    n_u, n_inner, n_mismatch, first_mismatch, (int) sanitize_changed,
+                    head8(toks).c_str(), head8(inner_toks).c_str(),
+                    tail8(toks).c_str(), tail8(inner_toks).c_str());
+        }
+    }
+
+    // T1-c (R3): tool-call structure of the recalled fragment, measured on
+    // BOTH sides of sanitize_recalled_text():
+    //   pre  = detokenize(toks)  - the original prompt span (what was evicted)
+    //   post = raw_text          - what actually gets re-prefilled into the KV
+    // Why both: if sanitize strips the tool-call tags, post is always 0/0 and a
+    // post-only check can never fire - we would learn nothing about whether the
+    // evicted span was a mid-tool-call slice. `pre` answers that; `post` answers
+    // whether the neutralization actually held. `stripped` therefore also
+    // answers V4 (does recall_tag_names cover the tool-call family?) without
+    // opening recall-sanitize.cpp.
+    //
+    // Two distinct hazards, reported separately:
+    //   headless  (close > open)          - the fragment BEGINS inside a tool
+    //                                       call: orphan closing tags injected.
+    //   ends_open (last opener after last closer) - the fragment ENDS inside a
+    //                                       tool call: the model continues it
+    //                                       and emits the closing tail as NEW
+    //                                       generation (the 66-tok closing-only
+    //                                       signature). This is the one that
+    //                                       predicts the derail, not `imbal`.
+    //
+    // Tag names are assembled from parts: literal tags do not survive
+    // editors / uploads (same idiom as the L1 block in apply_da_tag).
+    //
+    // Logged unconditionally: the negative cases are the denominator for the
+    // R3 <-> derail correlation. One line per refill (refills are rare).
+    {
+        const std::string ops[3] = {
+            std::string("<") + "tool_call>",
+            std::string("<") + "function=",
+            std::string("<") + "parameter=",
+        };
+        const std::string cls[3] = {
+            std::string("</") + "tool_call>",
+            std::string("</") + "function>",
+            std::string("</") + "parameter>",
+        };
+
+        struct tc_stat {
+            int  o[3]      = { 0, 0, 0 };
+            int  c[3]      = { 0, 0, 0 };
+            bool headless  = false;
+            bool ends_open = false;
+        };
+
+        auto scan = [&](const std::string & s) {
+            tc_stat st;
+            size_t last_o = std::string::npos;
+            size_t last_c = std::string::npos;
+            for (int k = 0; k < 3; k++) {
+                st.o[k] = dbg_count(s, ops[k], s.size());
+                st.c[k] = dbg_count(s, cls[k], s.size());
+                if (st.c[k] > st.o[k]) {
+                    st.headless = true;
+                }
+                const size_t po = s.rfind(ops[k]);
+                const size_t pc = s.rfind(cls[k]);
+                if (po != std::string::npos && (last_o == std::string::npos || po > last_o)) last_o = po;
+                if (pc != std::string::npos && (last_c == std::string::npos || pc > last_c)) last_c = pc;
+            }
+            st.ends_open = (last_o != std::string::npos) &&
+                           (last_c == std::string::npos || last_o > last_c);
+            return st;
+        };
+
+        for (size_t u = 0; u < units.size(); u++) {
+            if (units[u].toks.empty()) continue;
+            const std::string & pre = unit_diag[u].detok;         // before sanitize
+            const std::string & raw_text = unit_diag[u].raw_text; // after sanitize (goes into the KV)
+
+            const tc_stat a = scan(pre);
+            const tc_stat b = scan(raw_text);
+
+            const size_t T = raw_text.size();
+            SRV_INF("kv_offload R3: slot=%d task=%d unit=%zu "
+                    "pre tc=%d/%d fn=%d/%d pr=%d/%d headless=%d ends_open=%d | "
+                    "post tc=%d/%d fn=%d/%d pr=%d/%d headless=%d ends_open=%d "
+                    "stripped=%d n_pre=%zu n_post=%zu tail='%s'\n",
+                    (int) slot.id, (int) (slot.task ? slot.task->id : -1), u,
+                    a.o[0], a.c[0], a.o[1], a.c[1], a.o[2], a.c[2], (int) a.headless, (int) a.ends_open,
+                    b.o[0], b.c[0], b.o[1], b.c[1], b.o[2], b.c[2], (int) b.headless, (int) b.ends_open,
+                    (int) (pre != raw_text), pre.size(), T,
+                    dbg_esc(raw_text.substr(T > 120 ? T - 120 : 0), 140).c_str());
+        }
+    }
+
+    // Hoisted out of the try so the catch path can roll back the partial
+    // refill: number of tokens successfully written to the KV before the failure.
+    int32_t off = 0;
+    const int64_t t_refill_start = ggml_time_us();
+    try {
+        // Hard gate (2026-10-09 12:43 crash): reject the refill BEFORE any
+        // decode runs when the wrapped block cannot fit the physical KV. The
+        // previous warning-only check let the refill start, run out of cells
+        // mid-way (used=76304), halve the sub-batch 10x, roll back (no-op ->
+        // slot poisoned) and clear the 66k prompt cache - and the failed
+        // decodes overwrote the ctx output buffer, killing the other slot's
+        // in-flight row (the GGML_ASSERT abort). Rejecting here leaves the
+        // buffer holding the MAIN batch's rows, so the caller fails open (drops
+        // the recall, samples the closing token's row, keeps the slot + cache).
+        {
+            const int32_t n_free = llama_memory_n_free_cells(llama_get_memory(ctx));
+            // Reserve headroom for the generation tail: the model keeps
+            // generating after the refill, and if the refill consumed the last
+            // free cells the next decode would hit the buffer cap and truncate.
+            // The tradeoff is a higher recall drop rate (fail-open).
+            const int32_t n_need = n + 2048;
+            da_trace("slot=%d task=%d L2 refill free cells: n_free=%d n_wrapped=%d n_need=%d\n",
+                     (int) slot.id, (int) (slot.task ? slot.task->id : -1), n_free, n, n_need);
+            if (n_free >= 0 && n_free < n_need) {
+                SLT_WRN(slot, "kv_offload: refill rejected - not enough free cells (n_free=%d < n_wrapped=%d + 2048 tail headroom); failing open (the recalled chunk is dropped, the slot continues without it)\n", n_free, n);
+                return false; // out_safe_failopen is already true
+            }
+        }
+        // From here on the decode loop runs and overwrites the ctx output
+        // buffer - a failure can no longer fail-open (the main batch's rows are
+        // gone), so the caller must abort the slot.
+        if (out_safe_failopen) *out_safe_failopen = false;
+        // Dense forcing: the refill is a prefill and this function calls
+        // llama_decode directly (bypassing update_da_n_kv_max, which the main
+        // decode runs before each decode). A stale sparse bound from the last
+        // main decode must not persist into the refill - force n_kv_max=0
+        // (dense). The next main decode recomputes the bound via
+        // update_da_n_kv_max.
+        llama_set_n_kv_max(ctx, 0);
+        // The re-prefilled chunk can be larger than n_batch, and llama_decode
+        // asserts n_tokens <= n_batch (it does not sub-batch), so split the
+        // refill into n_batch-sized sub-batches.
+        int32_t sub_batch = n_batch;
+        while (off < n) {
+            const int32_t m = std::min(sub_batch, n - off);
+
+            // B1: the final sub-batch's last row is the only output token of
+            // the whole refill - the caller samples the next token from it
+            // (see the da_refill_out_idx use in post_decode).
+            if (out_last_idx && off + m == n) {
+                *out_last_idx = m - 1;
+            }
+
+            common_batch batch(ctx);
+
+            // common_batch::add appends to the token mirror and the underlying
+            // llama_batch_ext; the batch owns its memory (no manual free).
+            for (int32_t i = 0; i < m; i++) {
+                batch.add(wrapped_toks[off + i], n_full + off + i, seq,
+                          (off + i == n - 1));
+            }
+
+            int ret = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+
+            // Keep the draft (MTP) context in sync with the refill: a
+            // target-only decode leaves the draft KV empty over the
+            // refilled region, silently dropping draft acceptance for the
+            // rest of the session. The impls decode the draft without
+            // outputs (logits nulled), so the existing output flags (last
+            // token only) are sufficient - no n_outputs_max impact.
+            bool spec_ok = true;
+            if (ret == 0 && slot.spec != nullptr) {
+                spec_ok = common_speculative_process(slot.spec, batch);
+            }
+
+            SRV_INF("kv_offload: refill sub-batch [%d,%d) of %d token(s) ret=%d\n",
+                    off, off + m, n, ret);
+
+            if (ret != 0 || !spec_ok) {
+                // Retry (mirrors decode()): free an idle slot's cells, or
+                // halve the sub-batch. Terminal guard: sub_batch == 1 and no
+                // slot to clear -> fail-open (rollback + return false).
+                bool cleared = on_retry_idle ? on_retry_idle() : false;
+                if (cleared) {
+                    SRV_WRN("kv_offload: refill %s failed (ret=%d, tokens %d..%d of %d) - cleared idle slot, retrying\n",
+                            ret != 0 ? "decode" : "draft process", ret, off, off + m, n);
+                    continue;
+                }
+                if (sub_batch > 1) {
+                    sub_batch /= 2;
+                    SRV_WRN("kv_offload: refill %s failed (ret=%d, tokens %d..%d of %d) - halving sub_batch to %d, retrying\n",
+                            ret != 0 ? "decode" : "draft process", ret, off, off + m, n, sub_batch);
+                    continue;
+                }
+                SRV_WRN("kv_offload: refill %s failed (ret=%d, tokens %d..%d of %d, sub_batch=%d) - fail-open\n",
+                        ret != 0 ? "decode" : "draft process", ret, off, off + m, n, sub_batch);
+                kv_offload_refill_rollback(slot, n_full, off);
+                return false;
+            }
+            off += m;
+        }
+
+        // advance the slot's prompt tokens so pos_next() reflects the refill.
+        // insert() appends directly: get_tokens() asserts !has_mtmd (true on any
+        // server with mmproj loaded, even for text-only prompts) and the clear()
+        // round-trip would drop the media index map.
+        const size_t old_size = slot.prompt.tokens.size();
+        slot.prompt.tokens.insert(wrapped_toks);
+
+        // init_sampler() accepted every prompt token, but the refill bypassed
+        // it - accept the recalled tokens so the sampler state (repeat
+        // penalties, etc.) stays consistent with the context. apply_penalty =
+        // false: this is recalled context, not generated output.
+        for (llama_token t : wrapped_toks) {
+            common_sampler_accept(slot.smpl.get(), t, false);
+        }
+
+        SRV_INF("kv_offload: re-prefilled %d token(s) at [%d, %d) on seq %d prompt tokens %zu -> %zu, seq_pos_max %d, took %.0f ms\n",
+                n, n_full, n_full + n, (int) seq, old_size, old_size + (size_t) n,
+                (int) llama_memory_seq_pos_max(llama_get_memory(ctx), seq), (ggml_time_us() - t_refill_start) / 1000.0);
+
+        return true;
+    } catch (const std::exception & e) {
+        SRV_WRN("kv_offload: refill exception: %s - fail-open\n", e.what());
+        kv_offload_refill_rollback(slot, n_full, off);
+        return false;
+    }
+}
+
 //
 // server_routes
 //
@@ -5305,15 +8689,46 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             }
         }
 
+        // DA injection guard (code-level opt-out, plans/bug.md "scaffold
+        // re-reflection"): a request may opt out of ALL DA scaffold
+        // injection - via the "da_disable" JSON field (passed through by
+        // oaicompat_chat_params_parse on the chat path) or a control-
+        // character-fenced marker (U+001C FILE SEPARATOR around
+        // "DA-DISABLE") in the prompt text (injected by a client hook).
+        // The marker is stripped before tokenization so it never reaches
+        // the model. When disabled, both DA paths (marker scan +
+        // auto-chunking incl. kv-offload) are skipped for this request and
+        // it stays vanilla.
+        // NOTE: the marker must stay control-char fenced. A plain text
+        // marker self-triggers: a session that discusses this feature has
+        // the literal string in its (re-sent) history and silently loses
+        // DA for the rest of the session (observed 2026-09-24 on 123).
+        static const std::string da_disable_marker = "\x1c" "DA-DISABLE" "\x1c";
+        const json j_da_disable = json_value(data, "da_disable", json());
+        bool da_disable = !j_da_disable.is_null() && j_da_disable != false; // lenient: "true" strings count
+        json da_guard_prompt = prompt;
+        if (da_guard_prompt.is_string()) {
+            std::string s = da_guard_prompt.get<std::string>();
+            const size_t pos = s.find(da_disable_marker);
+            if (pos != std::string::npos) {
+                s.erase(pos, da_disable_marker.size());
+                da_guard_prompt = std::move(s);
+                da_disable = true;
+            }
+        }
+        if (da_disable) {
+            SRV_INF_DBG("%s", "da: injection disabled for this request (da_disable) - staying vanilla");
+        }
+
         // process prompt
         std::vector<server_tokens> inputs;
 
         if (res_type != TASK_RESPONSE_TYPE_NONE && ctx_server.mctx != nullptr) {
             // This is the case used by OAI compatible chat path with MTMD. TODO It can be moved to the path below.
-            inputs.push_back(process_mtmd_prompt(ctx_server.mctx, prompt.get<std::string>(), files, ctx_server.init_opt));
+            inputs.push_back(process_mtmd_prompt(ctx_server.mctx, da_guard_prompt.get<std::string>(), files, ctx_server.init_opt));
         } else {
             // Everything else, including multimodal completions.
-            inputs = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, prompt, true, true, ctx_server.init_opt);
+            inputs = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, da_guard_prompt, true, true, ctx_server.init_opt);
         }
 
         // tasks.reserve(inputs.size()); // TODO: this is inaccurate due to child tasks
@@ -5331,6 +8746,904 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     data);
 
             task.apply_chat_session(chat_session);
+            // sigma-strip (E1): carry the session key so the response path can
+            // calibrate the est offset (sigma_strip_note_response is a no-op
+            // for sessions that never went through sigma_strip_maybe_rewrite).
+            task.params.sigma_session = kv_offload_resolve_session(req, data);
+
+            // Both DA paths need a strict char->token mapping of the rendered
+            // prompt string. An mtmd prompt that contains media has
+            // LLAMA_TOKEN_NULL placeholders that map to no character (and
+            // get_tokens() asserts on has_mtmd) - skip DA for those. A
+            // text-only mtmd prompt (mmproj loaded, no media) tokenizes
+            // exactly like plain text, so DA applies; use the assert-free
+            // get_text_tokens() for the mapping in that case.
+            const bool da_media = task.tokens.has_mtmd &&
+                    task.tokens.find_next_media_chunk(0).first != nullptr;
+
+            // (2026-10-13) A media prompt used to skip EVERY budget gate (both
+            // DA paths below required !da_media, and the kv-offload reject gate
+            // is nested inside the P4 branch), so an over-buffer media prompt
+            // would hard-fail mid-prefill. It can now be saved by the P4
+            // evict+holes path (the P4 gate no longer excludes da_media): the
+            // evicted segments are pure text (old messages before the last
+            // user's image), so their KV is cut as holes while the image stays
+            // resident. da_media_enters_p4 is exactly the P4 gate (minus the
+            // now-removed !da_media) plus the kv-offload config that makes the
+            // evict+holes branch actually run. When it is false, no other gate
+            // will protect an over-buffer media prompt, so reject immediately
+            // (the media path has no recall; the headroom only covers the gen
+            // tail (capped) plus a fixed safety margin - smaller than the text
+            // path's 16384).
+            const bool da_media_enters_p4 = !da_disable && params.da_auto && da_guard_prompt.is_string() &&
+                    task.params.da_chunks.empty() && (int32_t) task.tokens.size() >= params.da_min_ctx &&
+                    params.kv_unified && params.kv_offload && !params.focus_memory_host.empty() &&
+                    params.kv_offload_holes;
+            if (da_media && params.kv_cache_size > 0 && !da_media_enters_p4) {
+                const int64_t n_predict_eff_m = task.params.n_predict != -1 ? task.params.n_predict : params.n_predict;
+                const int64_t gen_cost_m = n_predict_eff_m > 0 ? std::min<int64_t>(n_predict_eff_m, KV_GEN_TAIL_CAP) : 0;
+                const int64_t media_headroom = gen_cost_m + 4096;
+                const int64_t media_cap = (int64_t) params.kv_cache_size - media_headroom;
+                // No holes cut (the P4 evict+holes path is not reachable for
+                // this prompt), so every prompt cell (text + media) stays
+                // resident: the prefill peak is the full KV plus one in-flight
+                // sub-batch (same model as the holes-mode HARD tier in
+                // reject_if_over_buffer below).
+                const int64_t prefill_peak = (int64_t) task.tokens.pos_next(-1) + params.n_batch;
+                if (prefill_peak > media_cap) {
+                    SRV_WRN("kv_offload: media request rejected - prefill peak %d tokens is above buffer %d - media headroom %d (gen %d + margin 4096), no recall\n",
+                            (int) prefill_peak, params.kv_cache_size, (int) media_headroom, (int) gen_cost_m);
+                    // NOTE: message wording is constrained - the client (qwen-code) pattern-matches
+                    // the error text for context overflow ("input|prompt|message|context" + "tokens"
+                    // + "exceed" within 120 chars triggers reactive compaction with a wrong
+                    // originalTokenCount). Keep those word combinations out.
+                    res->error(format_error_response(
+                        string_format("conversation is larger than this server's KV buffer capacity: %d tokens > %d cell budget (--kv-cache-size %d minus %d media headroom). Start a new session with the image, describe it in text instead, or raise --kv-cache-size.",
+                                      (int) prefill_peak, (int) media_cap, params.kv_cache_size, (int) media_headroom),
+                        ERROR_TYPE_EXCEED_CONTEXT_SIZE));
+                    return res;
+                }
+            }
+
+            // DA prompt scan (P1): the client hook (FocusMemory) may have
+            // appended a marker block to the rendered prompt; recover the
+            // chunk layout so the tag state machine can drive the attention
+            // restriction. String prompts only (the hook renders one string);
+            // fail-open: any mismatch leaves the request vanilla.
+            if (!da_disable && params.da_prompt_scan && da_guard_prompt.is_string() && !da_media) {
+                const llama_tokens da_tokens = task.tokens.has_mtmd
+                        ? task.tokens.get_text_tokens()
+                        : task.tokens.get_tokens();
+                da_scan_prompt(ctx_server.vocab, da_guard_prompt.get<std::string>(),
+                        da_tokens, params.kv_unified, task.params);
+            }
+
+            // DA auto-chunking (P4): no client markers and the prompt is long
+            // enough - split the rendered chat prompt into magic chunks
+            // ourselves, re-tokenize, and map the layout to token ranges.
+            // Any mapping failure leaves the original tokens untouched.
+            //
+            // da-auto is only safe with the reversible B-path (--kv-unified):
+            // the A-path (seq_rm) is irreversible, so a wrong-focus permanently
+            // deletes the answer chunk with no return (the "ZEBRA" incident).
+            // Without --kv-unified, stay vanilla rather than risk that.
+            if (!da_disable && params.da_auto && da_guard_prompt.is_string() && !da_media &&
+                    task.params.da_chunks.empty() &&
+                    (int32_t) task.tokens.size() >= params.da_min_ctx &&
+                    !params.kv_unified) {
+                static std::atomic<bool> da_auto_needs_kvunified_warned{false};
+                if (!da_auto_needs_kvunified_warned.exchange(true)) {
+                    SRV_WRN_DBG("%s", "da_auto: requires --kv-unified (reversible B-path) - staying VANILLA to avoid irreversible seq_rm deletion. Add --kv-unified to enable da-auto.\n");
+                }
+            }
+            // (2026-10-13) da_media is no longer excluded: a media prompt is
+            // routed through this evict+holes path so the old text's KV is cut
+            // while the image (last user, protected) stays resident. The
+            // da_auto_chunk re-tokenization below is skipped for media (it would
+            // drop the image) - see the da_media guard on the da_auto_chunk call.
+            if (!da_disable && params.da_auto && da_guard_prompt.is_string() &&
+                    task.params.da_chunks.empty() &&
+                    (int32_t) task.tokens.size() >= params.da_min_ctx &&
+                    params.kv_unified) {
+                // kv-offload: before chunking, evict the oldest middle messages to the
+                // FocusMemory store so the reduced prompt fits the window. A failed PUT
+                // keeps its segment in the prompt (fail-open). The evicted segments
+                // become virtual chunks (M+1..M+K) exposed in the DA instruction.
+                std::string da_prompt = da_guard_prompt.get<std::string>();
+                std::vector<std::string> offloaded_hints;
+                std::vector<kv_offload_evict_segment> evicted_segs;
+                std::string kv_session;  // FocusMemory session id (set if kv_offload ran)
+                // True once the session has ANY cumulative evicted (the PUT ledger
+                // is non-empty), even on a watermark-idle turn where no new evict
+                // ran. Drives the Sigma anchor fetch (the DA scaffold must carry
+                // the state anchor while history is offloaded, not only on the
+                // turn that evicts).
+                bool kv_has_offloaded_history = false;
+                if (params.kv_offload && !params.focus_memory_host.empty()) {
+                    kv_session = kv_offload_resolve_session(req, data);
+                    // Record the session's logical (full prompt) token count for
+                    // GET /kv_state. resident is derived as logical - offloaded.
+                    // Per-session (keyed by kv_session), so parallel slots running
+                    // different sessions never mix their values.
+                    {
+                        std::lock_guard<std::mutex> lk(kv_offload.put_mutex);
+                        kv_offload.session_logical[kv_session] = (int64_t) task.tokens.size();
+                    }
+                    // 2026-10-12: the original prompt tokens, captured before the
+                    // da_auto re-tokenization below replaces task.tokens. Once the
+                    // request passes the gate it becomes the session's last-prompt
+                    // copy (kv_last_prompt_set) - the next gate computes the LCP
+                    // against it (the slot's residual prompt is queue-thread owned
+                    // and must not be read from the HTTP thread).
+                    // get_tokens() asserts on has_mtmd (true whenever an mmproj is
+                    // loaded, even for text-only prompts - the P1 DA scan above
+                    // uses the same split). A real media prompt never reaches this
+                    // block (the P4 branch requires !da_media), so
+                    // get_text_tokens() drops no placeholders here.
+                    const llama_tokens kv_orig_tokens = task.tokens.has_mtmd
+                            ? task.tokens.get_text_tokens()
+                            : task.tokens.get_tokens();
+                    // B4 task-anchor pin (2026-11-03: opt-in via --kv-pin,
+                    // default off). While disabled the first user message is a
+                    // normal evictable candidate from the start - no pin
+                    // polling, no TTL clocks. While enabled: the FocusMemory
+                    // state worker sets the session's pin_released flag when
+                    // the user cancelled or superseded the original first
+                    // task. Sticky: a cached true is never re-queried; a false
+                    // is re-queried on the next eviction plan (a local GET,
+                    // sub-millisecond). Any query failure keeps the pin
+                    // (fail-open).
+                    bool release_pin = !params.kv_pin;
+                    if (params.kv_pin) {
+                        {
+                            std::lock_guard<std::mutex> lk(kv_offload.put_mutex);
+                            release_pin = kv_offload.pin_released.count(kv_session) > 0;
+                        }
+                        if (!release_pin &&
+                                kv_offload_session_get(params.focus_memory_host, params.focus_memory_token,
+                                                       kv_session, release_pin)) {
+                            if (release_pin) {
+                                std::lock_guard<std::mutex> lk(kv_offload.put_mutex);
+                                kv_offload.pin_released.insert(kv_session);
+                                SRV_INF("kv_offload: pin released (session=%s) - first user message becomes evictable\n",
+                                        kv_session.c_str());
+                            }
+                        }
+                        // TTL backstop (2026-11-03): the release decision above
+                        // is made by the FocusMemory state worker, which is
+                        // hook-driven — on hook-less hosts it never fires and
+                        // the pin is held forever. The engine sees every
+                        // request, so it owns the only reliable idle clock: if
+                        // the pin has been held >= PIN_TTL_HOLD and this
+                        // session has not passed the gate for >= PIN_TTL_IDLE,
+                        // release it locally. (The store doc's updated_at would
+                        // fire spuriously on hook-death.)
+                        if (!release_pin) {
+                            const auto now = std::chrono::steady_clock::now();
+                            bool ttl_release = false;
+                            {
+                                std::lock_guard<std::mutex> lk(kv_offload.put_mutex);
+                                auto it = kv_offload.pin_first_seen.find(kv_session);
+                                if (it == kv_offload.pin_first_seen.end()) {
+                                    kv_offload.pin_first_seen[kv_session] = now;
+                                } else if (now - it->second >= PIN_TTL_HOLD) {
+                                    auto ait = kv_offload.last_activity.find(kv_session);
+                                    if (ait == kv_offload.last_activity.end() || now - ait->second >= PIN_TTL_IDLE) {
+                                        kv_offload.pin_released.insert(kv_session);
+                                        ttl_release = true;
+                                    }
+                                }
+                                kv_offload.last_activity[kv_session] = now;
+                            }
+                            if (ttl_release) {
+                                release_pin = true;
+                                SRV_INF("kv_offload: pin TTL backstop release (session=%s) - held >= 4h with >= 30min idle - first user message becomes evictable\n",
+                                        kv_session.c_str());
+                            }
+                        }
+                    }
+                    // task 15: clamp the evict stop target (threshold + retain) to the
+                    // physical buffer capacity minus headroom, so we never plan to keep
+                    // more cells in the KV than the buffer can hold. B = kv_cache_size
+                    // (0 = default, no clamp); headroom = 16384. The clamped target is
+                    // fed back as an effective retain (target - threshold) for
+                    // kv_offload_evict.
+                    const int32_t kv_target_unclamped = params.kv_offload_threshold + params.kv_retain_tokens;
+                    // gen budget: same expression as the reject lambda below (request
+                    // n_predict if > 0, else params.n_predict). The reserved tail is
+                    // capped at KV_GEN_TAIL_CAP - reserving the full n_predict (often
+                    // 32768) makes resident + recall + gen exceed the buffer for most
+                    // real prompts (spurious 400s). An over-long generation is ended
+                    // by the buffer-cap graceful stop (process_token) with
+                    // finish_reason=length, so the full n_predict need not be reserved.
+                    const int64_t n_predict_eff = task.params.n_predict != -1 ? task.params.n_predict : params.n_predict;
+                    const int64_t gen_cost = n_predict_eff > 0 ? std::min<int64_t>(n_predict_eff, KV_GEN_TAIL_CAP) : 0;
+                    // 10-06 fix: lower bound at the threshold (N) - when B - 16384 < N
+                    // the clamp must not push the stop target below the hot window
+                    // (evicting below the threshold would break the gate).
+                    int32_t kv_target;
+                    if (params.kv_cache_size > 0) {
+                        // 10-07 fix: the clamp must also reserve the gen tail so the
+                        // eviction target matches the reject gate's projection
+                        // (target + gen <= B - 16384); without it a prompt with
+                        // resident in (B - 16384 - gen, N + M] skipped eviction
+                        // (nothing to recall) and was then rejected.
+                        const int64_t resident_ceiling = (int64_t) params.kv_cache_size - 16384 - gen_cost;
+                        kv_target = std::max((int32_t) std::min<int64_t>(kv_target_unclamped, resident_ceiling),
+                                             params.kv_offload_threshold);
+                    } else {
+                        kv_target = kv_target_unclamped;
+                    }
+                    if (kv_target < kv_target_unclamped) {
+                        static std::atomic<bool> kv_offload_target_clamped_warned{false};
+                        if (!kv_offload_target_clamped_warned.exchange(true)) {
+                            SRV_INF("kv_offload: retain target clamped %d -> %d (buffer=%d, headroom=16384) - buffer limits KV-resident tokens\n",
+                                    kv_target_unclamped, kv_target, params.kv_cache_size);
+                        }
+                    }
+                    int32_t kv_retain_eff = kv_target - params.kv_offload_threshold;
+                    // (2026-10-10, incident 2026-10-10-kv-ledger-loss) Resident
+                    // estimate for the watermark gate: the tokens actually cut
+                    // from this session's KV, NOT the cumulative PUT total.
+                    // (2026-10-12, incident 2026-10-12) The raw cut-ledger total
+                    // is still wrong, in the other direction: the client
+                    // rewrites/compacts the history between turns, so this
+                    // request's n_past (LCP with the previous prompt) is far
+                    // below the previous prompt size, and every hole with
+                    // hi > n_past expires at task start (its KV is re-prefilled).
+                    // Projecting resident = prompt - ledger_cut then pins the
+                    // gate "idle" while the physical KV re-fills to the buffer
+                    // cap (13:35-13:54: 11x full re-prefill of 139-167k
+                    // prompts, ~55s each, then failure). Recompute the VALID
+                    // cut: LCP of the current prompt against the session's last
+                    // accepted prompt (stored copy - see kv_last_prompt), then
+                    // the shared expire rule (kv_holes_survive) with an
+                    // effective n_past below the LCP: a checkpoint restore can
+                    // land below the LCP by up to the checkpoint spacing, and
+                    // the da_auto re-tokenization can shift the chunk headers by
+                    // up to one chunk. When uncertain, bias to the evict-plan
+                    // side - over-planning is a few idempotent PUTs,
+                    // under-planning is a 55s prefill + failure.
+                    const int64_t kv_gate_margin = std::max<int64_t>(params.checkpoint_min_step, params.da_chunk_tokens);
+                    size_t kv_lcp = 0;
+                    const int64_t kv_valid_cut = ctx_server.kv_session_valid_cut(kv_session, kv_orig_tokens, kv_gate_margin, &kv_lcp);
+                    const int64_t kv_resident = (int64_t) task.tokens.size() - kv_valid_cut;
+                    // The Sigma anchor fetch below still keys off the PUT
+                    // ledger: it answers "has this session ever offloaded
+                    // text", which the cut ledger cannot express.
+                    int64_t kv_put_total = 0;
+                    {
+                        std::lock_guard<std::mutex> lk(kv_offload.put_mutex);
+                        auto it = kv_offload.uploaded.find(kv_session);
+                        if (it != kv_offload.uploaded.end()) {
+                            for (const auto & kv : it->second) kv_put_total += kv.second;
+                        }
+                    }
+                    kv_has_offloaded_history = kv_put_total > 0;
+                    // Watermark idle (holes mode only): while the resident is below
+                    // the high watermark, skip the per-turn evict plan / PUT / hole
+                    // re-apply. The already-cut holes persist in the KV (the
+                    // kv_hole_ranges ledger), so the resident stays low; recall is
+                    // still available via the Sigma anchor (offloaded-chunks note).
+                    const bool kv_watermark_idle =
+                            params.kv_offload_holes && params.kv_offload_high > 0 &&
+                            kv_resident < (int64_t) params.kv_offload_high;
+                    // Diagnostic: config state + current token count vs threshold, so
+                    // the journal shows exactly why eviction does or does not fire
+                    // (was the flag parsed? threshold reached? host set? pin released?).
+                    // task 17: gate log now carries the effective retain/target and the
+                    // physical buffer so the journal shows the full evict budget.
+                    // Watermark: resident (the KV-resident count) and high (the
+                    // trigger watermark; 0 = legacy per-turn gate).
+                    SRV_INF("kv_offload: gate - threshold=%d retain=%d target=%d buffer=%d tokens=%d resident=%d lcp=%zu margin=%d valid_cut=%d high=%d host=%s session=%s pin_released=%d\n",
+                            params.kv_offload_threshold, kv_retain_eff, kv_target, params.kv_cache_size,
+                            (int) task.tokens.size(), (int) kv_resident, kv_lcp, (int) kv_gate_margin, (int) kv_valid_cut,
+                            params.kv_offload_high,
+                            params.focus_memory_host.c_str(),
+                            kv_session.c_str(), (int) release_pin);
+                    // Returns true if the request was rejected (res already holds the error).
+                    // Two tiers (10-07):
+                    //  - HARD: the prefill peak (the maximum number of KV cells LIVE at
+                    //    any moment during the prompt prefill) cannot fit the physical
+                    //    buffer. No eviction plan can fix it, so reject before it
+                    //    hard-fails in find_slot mid-stream (slot abort + KV clear,
+                    //    worse than a clean 400). The peak is a live-cell count, not a
+                    //    physical-memory figure (the cell pool is fixed at B; seq_rm
+                    //    only recycles slots, it never shrinks the pool).
+                    //    * Option C (default): the evicted text is removed from the
+                    //      prompt, so the peak is the resident (prompt - evicted).
+                    //    * Holes mode (Option B): the evicted text stays in the prompt,
+                    //      but the progressive cut (kv_holes_progressive_apply) cuts
+                    //      each hole's KV as the prefill head passes it, so the live
+                    //      count never reaches the raw prompt length - the peak is the
+                    //      final resident plus at most one in-flight sub-batch. The old
+                    //      "peak = full prompt" model predated the progressive cut
+                    //      (9a06c0385) and rejected every request whose prompt crossed
+                    //      B - 16384 even though the live cells stayed near the evict
+                    //      target (2026-10-07: prompt 69287 / evicted 23485 / actual
+                    //      peak ~46.8k vs cap 68920 - spurious 400 loop, see
+                    //      plans/2026-10-07-kv-400-incident.md).
+                    //  - SOFT: the steady-state projection (resident + largest evicted
+                    //    segment + gen tail) exceeds the cap, but the prefill fits.
+                    //    Proceed - every runtime overflow is graceful: generation stops
+                    //    at the buffer cap (finish_reason=length, process_token), a
+                    //    recall whose refill cannot fit rolls back (kv_offload_refill),
+                    //    and a store GET failure fails open (get-on-focus). A 400 here
+                    //    only interrupted the client turn (and pre-301cf5abc drove the
+                    //    qwen-code compaction loop). The store-down case (PUT failed,
+                    //    segment kept resident) degrades the same way: no recall for the
+                    //    failed segments, generation capped by the buffer-cap stop.
+                    auto reject_if_over_buffer = [&](int64_t evicted_tokens, int32_t planned_tokens, bool put_failed) -> bool {
+                        if (params.kv_cache_size <= 0) return false;
+                        const int64_t cap = (int64_t) params.kv_cache_size - 16384;
+                        // (2026-10-13) media: the prompt's KV footprint is the KV
+                        // position count (pos_next(-1)), not the array size - media
+                        // chunks occupy more KV cells than array tokens. The evicted
+                        // segments are pure text (their KV == their token count), so
+                        // resident = KV - evicted_tokens is the post-hole resident.
+                        const int64_t prompt = da_media ? (int64_t) task.tokens.pos_next(-1) : (int64_t) task.tokens.size();
+                        const int64_t resident = prompt - evicted_tokens;
+                        // Holes mode: progressive cut keeps the live-cell peak at the
+                        // final resident + one in-flight sub-batch (NOT the raw prompt).
+                        // Option C: the evicted text is gone, so the peak is the resident.
+                        const int64_t prefill_peak = params.kv_offload_holes ? resident + params.n_batch : resident;
+                        if (prefill_peak > cap) {
+                            SRV_WRN("kv_offload: rejecting request - prefill peak %d tokens is above buffer %d - headroom 16384 (holes=%d, evicted %d of planned %d, put_failed=%d, session=%s)\n",
+                                    (int) prefill_peak, params.kv_cache_size, (int) params.kv_offload_holes,
+                                    (int) evicted_tokens, (int) planned_tokens, (int) put_failed, kv_session.c_str());
+                            // 2026-10-12: text path = 503 (retryable), NOT 400
+                            // (fail-fast). The message intentionally matches the
+                            // client's context-overflow patterns and carries the
+                            // real token counts (parseTokenCounts): reactive
+                            // compaction is the recovery path - the client shrinks
+                            // the prompt and retries, and the retry fits. The
+                            // 400 (ERROR_TYPE_EXCEED_CONTEXT_SIZE) stays reserved
+                            // for the media path, where a retry cannot fix the
+                            // prompt size.
+                            if (da_media) {
+                                // media: a retry (compaction) cannot fix a prompt
+                                // that still exceeds the cap after evict+holes -
+                                // fail fast with 400. The message avoids the
+                                // client's context-overflow trigger words (which
+                                // would loop a useless compaction).
+                                res->error(format_error_response(
+                                    string_format("conversation is larger than this server's KV buffer capacity: %d tokens > %d cell budget (--kv-cache-size %d). Start a new session with the image, describe it in text instead, or raise --kv-cache-size.",
+                                                  (int) prefill_peak, (int) cap, params.kv_cache_size),
+                                    ERROR_TYPE_EXCEED_CONTEXT_SIZE));
+                            } else {
+                                res->error(format_error_response(
+                                    string_format("Context length exceeded: %d tokens > %d limit",
+                                                  (int) prefill_peak, (int) cap),
+                                    ERROR_TYPE_UNAVAILABLE));
+                            }
+                            return true;
+                        }
+                        int64_t recall_cost = 0;
+                        for (const auto & seg : evicted_segs) {
+                            if (seg.tokens > recall_cost) recall_cost = seg.tokens;
+                        }
+                        // n_predict_eff / gen_cost are the hoisted clamp-scope values
+                        // (single source of truth shared with the eviction clamp).
+                        // resident is defined above (shared with the HARD peak).
+                        const int64_t projected = resident + recall_cost + gen_cost;
+                        if (projected > cap) {
+                            SRV_INF("kv_offload: projected demand %d (resident %d + max recall %d + gen %d) above buffer cap %d - proceeding (buffer-cap stop + refill rollback + get fail-open are the runtime safety nets; evicted %d of planned %d, put_failed=%d, session=%s)\n",
+                                    (int) projected, (int) resident, (int) recall_cost, (int) gen_cost,
+                                    (int) cap, (int) evicted_tokens, (int) planned_tokens,
+                                    (int) put_failed, kv_session.c_str());
+                        }
+                        return false;
+                    };
+                    std::vector<kv_offload_evict_segment> evict_segs;
+                    // Optimistic pre-PUT projection (all planned segments evicted).
+                    // The authoritative capacity check after the evict if/else uses
+                    // the actually-evicted count instead, so a failed PUT (segment
+                    // kept in the prompt, fail-open) is reflected in the judgment.
+                    int32_t plan_tokens = 0;
+                    if (kv_watermark_idle) {
+                        // Watermark idle (holes mode): the resident is below the high
+                        // watermark, so no eviction this turn. The already-cut holes
+                        // persist in the KV (kv_hole_ranges ledger), keeping the
+                        // resident low; recall stays available via the Sigma anchor.
+                        // Run the capacity check with the actual resident (the
+                        // cumulative evicted) so a store-down / pin overflow is
+                        // still caught.
+                        SRV_INF("kv_offload: watermark idle - resident=%d < high=%d (low=%d) - no eviction this turn (holes persist, session=%s)\n",
+                                (int) kv_resident, params.kv_offload_high, params.kv_offload_threshold, kv_session.c_str());
+                        if (reject_if_over_buffer(kv_valid_cut, 0, false)) {
+                            return res;
+                        }
+                    } else if (kv_offload_evict(ctx_server.vocab, da_prompt, (int32_t) task.tokens.size(),
+                                         params.kv_offload_threshold, evict_segs, release_pin,
+                                         kv_retain_eff)) {
+                        // Diagnostic: the eviction plan (n segments, tokens each).
+                        for (auto & seg : evict_segs) plan_tokens += seg.tokens;
+                        // 10-07 fix (2nd 400, session 051dfdf9): the clamp above
+                        // reserves the gen tail but not the max recall segment -
+                        // focus recall re-prefills the largest evicted message on
+                        // top of the resident KV, so the reject gate's projection
+                        // (resident + max_seg + gen) can exceed B - 16384 even when
+                        // the evict target (<= B - 16384 - gen) was met. Observed:
+                        // B=75304, resident 42442 + max_seg 8381 + gen 8192 =
+                        // 59015 > 58920 (short by 95). Re-plan with a target that
+                        // also reserves the largest planned segment. Each pass
+                        // evicts a superset (the target strictly decreases), so
+                        // max_seg only grows and the loop converges in 1-2 passes
+                        // (cap: 3). If the hot window (threshold) alone cannot
+                        // carry the projection, the gate rejects below.
+                        if (params.kv_cache_size > 0) {
+                            for (int pass = 0; pass < 3 && !evict_segs.empty(); ++pass) {
+                                int64_t max_seg = 0;
+                                for (const auto & seg : evict_segs) max_seg = std::max<int64_t>(max_seg, seg.tokens);
+                                const int64_t resident_after = (int64_t) task.tokens.size() - plan_tokens;
+                                if (resident_after + max_seg + gen_cost <= (int64_t) params.kv_cache_size - 16384) break;
+                                const int64_t deeper_ceiling = (int64_t) params.kv_cache_size - 16384 - gen_cost - max_seg;
+                                const int32_t kv_target2 = std::max((int32_t) std::min<int64_t>(kv_target, deeper_ceiling),
+                                                                    params.kv_offload_threshold);
+                                if (kv_target2 >= kv_target) break;  // infeasible at the hot window - the gate rejects
+                                SRV_INF("kv_offload: evict re-plan pass %d - target %d -> %d (resident %d + max recall %d + gen %d > buffer %d - headroom 16384)\n",
+                                        pass + 1, kv_target, kv_target2, (int) resident_after, (int) max_seg,
+                                        (int) gen_cost, params.kv_cache_size);
+                                kv_target = kv_target2;
+                                std::vector<kv_offload_evict_segment> replan_segs;
+                                if (!kv_offload_evict(ctx_server.vocab, da_prompt, (int32_t) task.tokens.size(),
+                                                      params.kv_offload_threshold, replan_segs, release_pin,
+                                                      kv_target2 - params.kv_offload_threshold)) break;
+                                evict_segs = std::move(replan_segs);
+                                plan_tokens = 0;
+                                for (auto & seg : evict_segs) plan_tokens += seg.tokens;
+                            }
+                        }
+                        SRV_INF("kv_offload: evict plan - %zu segment(s), ~%d token(s) to offload\n",
+                                evict_segs.size(), plan_tokens);
+                        std::vector<std::pair<size_t, size_t>> evicted_ranges;
+                        // Per-session uploaded-key cache (Option B re-PUT elimination):
+                        // the PUT is idempotent (key = FNV-1a content hash of the segment
+                        // text), so a key already uploaded for this session is a cache hit -
+                        // skip the network call and count it as evicted. The lock is not
+                        // held across the network call: a concurrent miss on the same key
+                        // just re-PUTs once, which is safe (idempotent).
+                        for (auto & seg : evict_segs) {
+                            bool put_ok = false;
+                            bool was_cached = false;
+                            {
+                                std::lock_guard<std::mutex> lk(kv_offload.put_mutex);
+                                auto it = kv_offload.uploaded.find(kv_session);
+                                if (it != kv_offload.uploaded.end() && it->second.count(seg.key) > 0) {
+                                    was_cached = true;
+                                }
+                            }
+                            if (was_cached) {
+                                put_ok = true;
+                                //SRV_INF("kv_offload: PUT skip (cached) key=%s tokens=%d (%s)\n",
+                                //        seg.key.c_str(), seg.tokens, seg.hint.c_str());
+                            } else {
+                                put_ok = kv_offload_put(params.focus_memory_host, params.focus_memory_token,
+                                                        kv_session, seg.key, seg.text, seg.tokens);
+                                if (put_ok) {
+                                    std::lock_guard<std::mutex> lk(kv_offload.put_mutex);
+                                    auto & keys = kv_offload.uploaded[kv_session];
+                                    // Memory ceiling: bound the per-session key map. Evict
+                                    // the lexicographically smallest key (std::map is
+                                    // ordered by key) - worst case that key is re-PUT
+                                    // later (idempotent).
+                                    if (keys.size() >= 4096) keys.erase(keys.begin());
+                                    keys[seg.key] = seg.tokens;
+                                    // FOCUS_SPARSE_DEBUG-gated: fires on every segment PUT.
+                                    SRV_INF_DBG("kv_offload: PUT ok key=%s tokens=%d (%s)\n",
+                                                seg.key.c_str(), seg.tokens, seg.hint.c_str());
+                                }
+                            }
+                            if (put_ok) {
+                                evicted_ranges.push_back({ seg.range_lo, seg.range_hi });
+                                // Option B keeps the evicted text in the prompt (as a
+                                // real chunk), so no virtual-chunk hint is exposed.
+                                if (!params.kv_offload_holes) {
+                                    offloaded_hints.push_back(seg.hint);
+                                }
+                                evicted_segs.push_back(seg);
+                            } else {
+                                SRV_WRN("kv_offload: PUT failed for key=%s - keeping segment in prompt\n", seg.key.c_str());
+                                // 3a (10-06): store-down + decoupled buffer - the
+                                // failed segment stays in the prompt (fail-open), so
+                                // the full prompt must fit the physical buffer B.
+                                // With B < n_ctx a long prompt hard-fails in
+                                // find_slot: the store is a hard dependency in
+                                // decoupled mode. One-shot warning.
+                                if (params.kv_cache_size > 0) {
+                                    static std::atomic<bool> kv_offload_store_down_warned{false};
+                                    if (!kv_offload_store_down_warned.exchange(true)) {
+                                        SRV_WRN("kv_offload: store down with a decoupled buffer (B=%d) - failed segments stay in the prompt and the full prompt must fit B (find_slot failure risk); FocusMemory store is a hard dependency in decoupled mode\n", params.kv_cache_size);
+                                    }
+                                }
+                            }
+                        }
+                        // Authoritative post-PUT capacity check (replaces the
+                        // optimistic pre-PUT projection): only the segments whose
+                        // PUT succeeded (or were cached) are actually evicted; a
+                        // failed PUT keeps its segment in the prompt (fail-open),
+                        // so the projected KV-resident count is larger than the
+                        // plan assumed. If it exceeds the buffer minus the 16k
+                        // headroom, the request cannot fit the decoupled KV
+                        // buffer - reject now with a clear error instead of dying
+                        // later in find_slot ("no slot available"). Covers both
+                        // the store-down case (PUTs fail, full prompt must fit B)
+                        // and the pin+hot+delta > B case (nothing evictable is
+                        // enough).
+                        int64_t evicted_tokens = 0;
+                        for (auto & seg : evicted_segs) evicted_tokens += seg.tokens;
+                        // Temporary diagnostic: verify evicted_segs is cumulative (cache-hit
+                        // keys re-planned each request must be counted) - planned == evicted
+                        // in normal sessions. Remove once confirmed.
+                        SRV_INF("kv_offload: evict result - planned=%d evicted=%d segs=%zu/%zu\n",
+                                (int) plan_tokens, (int) evicted_tokens, evicted_segs.size(), evict_segs.size());
+                        if (reject_if_over_buffer(evicted_tokens, plan_tokens, evicted_tokens < plan_tokens)) {
+                            return res;
+                        }
+                        if (!evicted_ranges.empty()) {
+                            if (params.kv_offload_holes) {
+                                // Option B: keep the evicted text in the prompt. The
+                                // holes are cut from the KV at the next request's
+                                // n_past check (not from the text), so the client can
+                                // keep sending the full prompt and re-match at
+                                // n_past=full (1-token re-prefill instead of the
+                                // evicted tail).
+                                SRV_INF("kv_offload-holes: %zu segment(s) evicted to FocusMemory (session=%s), prompt text kept (%zu chars) - holes will be cut from KV\n",
+                                        evicted_ranges.size(), kv_session.c_str(), da_prompt.size());
+                            } else {
+                                // Option C: remove the evicted text from the prompt
+                                std::sort(evicted_ranges.begin(), evicted_ranges.end(),
+                                          [](const auto & a, const auto & b) { return a.first > b.first; });
+                                const size_t before_chars = da_prompt.size();
+                                std::string reduced = da_prompt;
+                                for (auto & [lo, hi] : evicted_ranges) {
+                                    reduced.erase(lo, hi - lo);
+                                }
+                                da_prompt = std::move(reduced);
+                                SRV_INF("kv_offload: evicted %zu segment(s) to FocusMemory (session=%s), prompt %zu->%zu chars\n",
+                                        evicted_ranges.size(), kv_session.c_str(), before_chars, da_prompt.size());
+                            }
+                        }
+                    } else {
+                        // Diagnostic: considered but nothing planned (under threshold,
+                        // or no evictable middle messages) - the common steady state.
+                        SRV_INF("kv_offload: no eviction planned (tokens=%d, threshold=%d)\n",
+                                (int) task.tokens.size(), params.kv_offload_threshold);
+                        // Nothing evicted: everything stays resident (pin / last turn
+                        // alone may exceed B) - run the same capacity check.
+                        if (reject_if_over_buffer(0, 0, false)) {
+                            return res;
+                        }
+                    }
+                    // 2026-10-12: the request passed the gate - record its original
+                    // prompt as the session's last accepted prompt (the next gate's
+                    // LCP reference). A rejected request never reaches here (its KV
+                    // state did not change, so the reference must not move either).
+                    ctx_server.kv_last_prompt_set(kv_session, kv_orig_tokens);
+                } else {
+                    // Diagnostic (one-time): kv-offload configured off - the flag was
+                    // not parsed (was the old --kv-offload collision) or the host is
+                    // empty, so eviction can never fire.
+                    static std::atomic<bool> kv_offload_disabled_warned{false};
+                    if (!kv_offload_disabled_warned.exchange(true)) {
+                        SRV_WRN("kv_offload: disabled (flag=%d, host_empty=%d) - add --fm-offload and --focus-memory-host to enable eviction\n",
+                                (int) params.kv_offload, (int) params.focus_memory_host.empty());
+                    }
+                }
+                // (2026-10-13) media: the evicted segments are pure text (old
+                // messages before the last user's image). Cut their KV as holes
+                // (kv_hole_pending), keeping the prompt (and the image) intact.
+                // No DA scaffold (no magic headers) - the progressive hole cut
+                // (kv_holes_progressive_apply) does the cutting as the prefill
+                // head passes. The image (last user) is protected by
+                // kv_offload_evict, so its KV is never holed. The char ranges
+                // are in the original da_prompt text space; the evicted messages
+                // precede the last user's media marker, so their positions are
+                // unchanged by the marker. text_toks (get_text_tokens) drops the
+                // NULL media placeholders; text_to_arr recovers each text token's
+                // array index, and pos_next maps it to a KV position (media
+                // chunks occupy more KV cells than array tokens).
+                if (da_media && params.kv_offload_holes && !evicted_segs.empty()) {
+                    const llama_tokens text_toks = task.tokens.get_text_tokens();
+                    std::vector<int64_t> text_to_arr(text_toks.size());
+                    int64_t t = 0;
+                    for (size_t a = 0; a < task.tokens.size() && t < (int64_t) text_toks.size(); a++) {
+                        if (task.tokens[a] != LLAMA_TOKEN_NULL) text_to_arr[t++] = (int64_t) a;
+                    }
+                    const std::vector<size_t> offs = da_token_offsets_lenient(ctx_server.vocab, da_prompt, text_toks);
+                    if (offs.empty() || (size_t) t != text_toks.size()) {
+                        // Fail-closed: without holes the full prompt (text + media)
+                        // would exceed the buffer mid-prefill. A retry cannot fix a
+                        // media prompt, so reject with 400 (the message avoids the
+                        // client's context-overflow trigger words).
+                        SRV_WRN("kv_offload-holes(media): char->token mapping failed (drift) - rejecting, no holes to cut (session=%s)\n", kv_session.c_str());
+                        res->error(format_error_response(
+                            string_format("conversation is larger than this server's KV buffer capacity: %d tokens > %d cell budget (--kv-cache-size %d). Start a new session with the image, describe it in text instead, or raise --kv-cache-size.",
+                                          (int) task.tokens.pos_next(-1), (int) (params.kv_cache_size - 16384), params.kv_cache_size),
+                            ERROR_TYPE_EXCEED_CONTEXT_SIZE));
+                        return res;
+                    }
+                    for (auto & seg : evicted_segs) {
+                        const int32_t t_lo = da_char_to_token_nearest(offs, seg.range_lo);
+                        const int32_t t_hi = da_char_to_token_nearest(offs, seg.range_hi);
+                        if (t_lo < 0 || t_hi < 0 || t_hi <= t_lo ||
+                                t_lo >= (int32_t) text_to_arr.size() || t_hi >= (int32_t) text_to_arr.size()) {
+                            SRV_WRN("kv_offload-holes(media): failed to map evicted segment %s to a token range - skipping its hole\n", seg.key.c_str());
+                            continue;
+                        }
+                        const int32_t kv_lo = (int32_t) task.tokens.pos_next(text_to_arr[t_lo]);
+                        const int32_t kv_hi = (int32_t) task.tokens.pos_next(text_to_arr[t_hi]);
+                        task.params.kv_hole_pending.push_back({ kv_lo, kv_hi });
+                        SRV_INF("kv_offload-holes(media): pending hole %s -> kv [%d, %d) (%d)\n",
+                                seg.key.c_str(), kv_lo, kv_hi, kv_hi - kv_lo);
+                    }
+                    // The slot learns its kv_session from this (the cut ledger is
+                    // keyed by it); host/token/vocab are needed for PUT/recall.
+                    task.params.kv_offload_session = kv_session;
+                    task.params.kv_offload_host    = params.focus_memory_host;
+                    task.params.kv_offload_token   = params.focus_memory_token;
+                    task.params.kv_offload_vocab   = ctx_server.vocab;
+                }
+                // Option B (--kv-offload-holes): pass the evicted messages' char
+                // ranges + hints so da_auto_chunk gives each evicted message its
+                // own chunk (the hole boundary then coincides with the chunk
+                // boundary) and exposes the holed chunk numbers in the DA
+                // instruction. Empty otherwise - the packing is unchanged.
+                std::vector<da_evict_bound> evict_bounds;
+                if (params.kv_offload_holes) {
+                    evict_bounds.reserve(evicted_segs.size());
+                    for (const auto & seg : evicted_segs) {
+                        evict_bounds.push_back({ seg.range_lo, seg.range_hi, seg.hint });
+                    }
+                }
+                // kv-offload (mid-turn Σ, 2026-10-09): while history is
+                // offloaded the offloaded-chunks note is non-empty — fetch the
+                // session's state anchor (200ms cap, fail-open) and append it
+                // to the DA scaffold so a long autonomous turn keeps its
+                // ground. Nothing offloaded → the full history is in the KV →
+                // no anchor needed (no fetch, no cost).
+                std::string sigma_anchor;
+                // (2026-10-13) media skips the DA scaffold (no magic chunks), so
+                // the sigma anchor (appended to the scaffold) is not needed.
+                // (2026-11-01) --sigma-fetch gate (default off): the fetch
+                // returns the last async extraction, which is stale right after
+                // an offload - injecting it as "current-task (… defines the
+                // work)" re-latched the model onto a finished task. See
+                // incidents/2026-11-01-stale-sigma-anchor-contamination.md.
+                if (params.kv_sigma_fetch &&
+                        !da_media && (kv_has_offloaded_history || !offloaded_hints.empty() || !evict_bounds.empty()) &&
+                        params.kv_offload && !params.focus_memory_host.empty() && !kv_session.empty()) {
+                    if (kv_offload_get_sigma(params.focus_memory_host, params.focus_memory_token, kv_session, sigma_anchor)) {
+                        SRV_INF("kv_offload: sigma anchor for DA scaffold (%zu chars, session=%s)\n",
+                                sigma_anchor.size(), kv_session.c_str());
+                    }
+                }
+                // (2026-10-13) media: skip da_auto_chunk - its common_tokenize
+                // re-tokenization is pure text and would drop the image. The
+                // default-constructed layout has ok=false, so the tokenize /
+                // set-tokens path below is skipped and the original mtmd
+                // task.tokens (with the image) is kept.
+                const da_auto_layout layout =
+                        da_media ? da_auto_layout()
+                                 : da_auto_chunk(ctx_server.vocab, da_prompt, params.da_chunk_tokens, offloaded_hints, evict_bounds, sigma_anchor, params.da_scaffold_file);
+                if (layout.ok) {
+                    const llama_tokens  toks = common_tokenize(ctx_server.vocab, layout.modified, true, true);
+                    const std::vector<size_t> offs = da_token_offsets_lenient(ctx_server.vocab, layout.modified, toks);
+                    bool ok = !offs.empty();
+
+                    // chunk c = [header_c, header_{c+1}) ; last = [header_last, tail)
+                    // header_pos_mod (modified-text coordinates) - header_pos is
+                    // original-text and would drift left by the earlier headers'
+                    // lengths as c grows.
+                    std::vector<std::pair<int32_t, int32_t>> chunks;
+                    if (ok) {
+                        chunks.reserve(layout.header_pos_mod.size());
+                        for (size_t c = 0; c < layout.header_pos_mod.size(); c++) {
+                            const size_t next = c + 1 < layout.header_pos_mod.size() ? layout.header_pos_mod[c + 1] : layout.tail_pos;
+                            const int32_t lo = da_char_to_token_nearest(offs, layout.header_pos_mod[c]);
+                            const int32_t hi = da_char_to_token_nearest(offs, next);
+                            if (lo < 0 || hi < 0 || hi <= lo) {
+                                ok = false;
+                                break;
+                            }
+                            // (start, end) token range, per the da_chunks contract
+                            // (server-task.h) and the P1 hook path: apply_da_b/
+                            // apply_da_rm consume these as [lo, hi) removal ranges.
+                            chunks.push_back({ lo, hi });
+                        }
+                    }
+                    // Diagnostic (guards the header_pos_mod coordinate fix):
+                    // each chunk's token range must start at its [Magic Chunk N]
+                    // header. The nearest-boundary snap can shift the start by a
+                    // token or two, so the check is "the header appears within
+                    // the first 20 detokenized tokens of the chunk", not an
+                    // exact prefix match.
+                    if (ok) {
+                        size_t n_mismatch = 0;
+                        size_t first_mismatch = 0;  // 1-based chunk number, 0 = none
+                        size_t n_logged = 0;
+                        for (size_t c = 0; c < chunks.size(); c++) {
+                            const int32_t lo = chunks[c].first;
+                            std::string piece;
+                            for (int32_t t = lo; t < lo + 20 && t < (int32_t) toks.size(); t++) {
+                                piece += common_token_to_piece(ctx_server.vocab, toks[t], true);
+                            }
+                            // first 24 chars, backed off to a UTF-8 boundary
+                            size_t n = piece.size() < 24 ? piece.size() : 24;
+                            while (n > 0 && n < piece.size() && ((unsigned char) piece[n] & 0xC0) == 0x80) {
+                                n--;
+                            }
+                            std::string head = piece.substr(0, n);
+                            for (char & ch : head) {
+                                if ((unsigned char) ch < 0x20 || ch == 0x7F) ch = ' ';
+                            }
+                            const std::string expected = "[Magic Chunk " + std::to_string(c + 1) + "]";
+                            if (piece.find(expected) == std::string::npos) {
+                                n_mismatch++;
+                                if (first_mismatch == 0) first_mismatch = c + 1;
+                                if (n_logged < 5) {
+                                    SRV_INF("da_auto: chunk %zu header mismatch head='%s' lo=%d\n",
+                                            c + 1, head.c_str(), lo);
+                                    n_logged++;
+                                }
+                            }
+                        }
+                        SRV_INF("da_auto: chunk header check - n_chunks=%zu mismatch=%zu first_mismatch=%zu\n",
+                                chunks.size(), n_mismatch, first_mismatch);
+                    }
+                    std::pair<int32_t, int32_t> filler = { -1, -1 };
+                    if (ok && layout.filler.second > layout.filler.first) {
+                        const int32_t lo = da_char_to_token_nearest(offs, layout.filler.first);
+                        const int32_t hi = da_char_to_token_nearest(offs, layout.filler.second);
+                        if (lo < 0 || hi < 0 || hi <= lo) {
+                            ok = false;
+                        } else {
+                            filler = { lo, hi };
+                        }
+                    }
+                    std::pair<int32_t, int32_t> sigma = { -1, -1 };
+                    if (ok && layout.sigma.second > layout.sigma.first) {
+                        const int32_t lo = da_char_to_token_nearest(offs, layout.sigma.first);
+                        const int32_t hi = da_char_to_token_nearest(offs, layout.sigma.second);
+                        if (lo < 0 || hi < 0 || hi <= lo) {
+                            // A sigma mapping failure must not disable DA for
+                            // the whole request (keeping vanilla): drop the
+                            // sigma protection ({-1,-1}) and continue with the
+                            // rest of the layout.
+                            SRV_WRN_DBG("%s", "da_auto: sigma range does not map to token boundaries - continuing without sigma protection\n");
+                        } else {
+                            sigma = { lo, hi };
+                        }
+                    }
+                    if (!ok) {
+                        SRV_WRN_DBG("%s", "da_auto: layout does not map to token boundaries - keeping vanilla\n");
+                    } else {
+                        task.tokens  = server_tokens(toks, false);
+                        task.params.da_chunks = std::move(chunks);
+                        task.params.da_filler = filler;
+                        task.params.da_sigma  = sigma;
+                        task.params.da_b      = params.kv_unified;
+                        // kv-offload (Option C): assign the virtual chunk numbers to
+                        // the evicted segments (M+1..M+K) so get-on-focus can look
+                        // them up. Option B keeps the evicted text as real magic
+                        // chunks (in the prompt), so no virtual chunk IDs are
+                        // assigned and get-on-focus re-prefill is not needed for them.
+                        if (!params.kv_offload_holes) {
+                            const int32_t n_active = (int32_t) task.params.da_chunks.size();
+                            for (size_t i = 0; i < evicted_segs.size(); i++) {
+                                task.params.da_offloaded.push_back(
+                                        { evicted_segs[i].key, evicted_segs[i].hint,
+                                          task.params.da_chunk_base + n_active + (int32_t) i });
+                            }
+                        }
+                        // (2026-10-10, incident 2026-10-10-kv-ledger-loss) Always
+                        // tag the task with its session id, not only on evicting
+                        // turns: the slot learns its kv_session from this (the
+                        // cut ledger is keyed by it), and a watermark-idle turn
+                        // is exactly when the slot keeps running. host/token/
+                        // vocab are only needed when there is something to PUT.
+                        if (!kv_session.empty()) {
+                            task.params.kv_offload_session = kv_session;
+                            if (!evicted_segs.empty()) {
+                                task.params.kv_offload_host    = params.focus_memory_host;
+                                task.params.kv_offload_token   = params.focus_memory_token;
+                                task.params.kv_offload_vocab   = ctx_server.vocab;
+                            }
+                        }
+                        // Option B (--kv-offload-holes): map each evicted segment's
+                        // char range (original text space) to a token range (final
+                        // space) and record it as a pending KV hole. The range must
+                        // be shifted by the [Magic Chunk N] headers that
+                        // da_auto_chunk inserted into layout.modified: a header at
+                        // original position h shifts every position p >= h right by
+                        // the header length. A header can sit inside an evicted
+                        // segment (at the segment's content start), so range_lo and
+                        // range_hi get different shifts. The holes are applied at
+                        // the next request's n_past check, once the prompt KV is
+                        // known to exist.
+                        if (params.kv_offload_holes && !evicted_segs.empty()) {
+                            auto header_len = [](int32_t num) -> size_t {
+                                return (size_t) (15 + (int) std::to_string(num).size()); // "[Magic Chunk N]\n"
+                            };
+                            // header_pos is in modified space (final char offset after
+                            // all header insertions, da-layout.cpp). seg.range_lo/hi is
+                            // in original space (kv_offload_evict on the unmodified
+                            // prompt). Comparing the two directly misses headers: a
+                            // header at original h_i sits at modified H_i = h_i +
+                            // sum_{j<i} len_j >= h_i, so H_i <= p skips a header that
+                            // h_i <= p would count -> under-shift -> hole lo drifts
+                            // early. Convert each header back to original space first
+                            // (the i-th header's modified offset minus the lengths of
+                            // the i-1 headers before it), then compare in original space.
+                            std::vector<size_t> header_orig(layout.header_pos.size());
+                            {
+                                size_t acc = 0;
+                                for (size_t i = 0; i < layout.header_pos.size(); i++) {
+                                    header_orig[i] = layout.header_pos[i] - acc;
+                                    acc += header_len((int32_t) (i + 1));
+                                }
+                            }
+                            auto mod_pos = [&](size_t p) -> size_t {
+                                size_t shift = 0;
+                                for (size_t i = 0; i < layout.header_pos.size(); i++) {
+                                    if (layout.header_pos[i] <= p) shift += header_len((int32_t) (i + 1));
+                                }
+                                return p + shift;
+                            };
+                            for (auto & seg : evicted_segs) {
+                                const int32_t lo = da_char_to_token_nearest(offs, mod_pos(seg.range_lo));
+                                const int32_t hi = da_char_to_token_nearest(offs, mod_pos(seg.range_hi));
+                                if (lo < 0 || hi < 0 || hi <= lo) {
+                                    SRV_WRN_DBG("kv-offload-holes: failed to map evicted segment %s to a token range - skipping its hole\n", seg.key.c_str());
+                                    continue;
+                                }
+                                task.params.kv_hole_pending.push_back({ lo, hi });
+                                SRV_INF_DBG("kv-offload-holes: pending hole %s -> tokens [%d, %d) (%d tokens)\n",
+                                        seg.key.c_str(), lo, hi, hi - lo);
+                                // T1-b (R2): validate the hole coordinate mapping.
+                                // Detokenize the token span [lo,hi) (modified
+                                // space) and compare with the segment's original
+                                // text. A match (or edge-only diff from token
+                                // snapping) => the mapping is correct and the
+                                // plan's §1 coordinate hypothesis is discarded;
+                                // a mid-span difference => a real cut.
+                                {
+                                    const std::vector<llama_token> & all_toks = toks;
+                                    const int32_t lo_c = std::max(0, lo);
+                                    const int32_t hi_c = std::min((int32_t) all_toks.size(), hi);
+                                    if (hi_c > lo_c) {
+                                        std::vector<llama_token> sub(all_toks.begin() + lo_c, all_toks.begin() + hi_c);
+                                        const std::string detok = tokens_to_str(ctx_server.vocab, sub);
+                                        const std::string & st = seg.text;
+                                        int32_t first_diff = -1;
+                                        const size_t m = std::min(detok.size(), st.size());
+                                        for (size_t i = 0; i < m; i++) { if (detok[i] != st[i]) { first_diff = (int32_t) i; break; } }
+                                        if (first_diff < 0 && detok.size() != st.size()) first_diff = (int32_t) m;
+                                        auto hd = [](const std::string & s) { return dbg_esc(s.substr(0, 16), 16); };
+                                        auto tl = [](const std::string & s) { return dbg_esc(s.substr(s.size() > 16 ? s.size() - 16 : 0), 16); };
+                                        SRV_INF("kv-offload R2: seg=%s tokens[%d,%d) n_segtext=%zu n_detok=%zu first_diff=%d head_seg=[%s] head_detok=[%s] tail_seg=[%s] tail_detok=[%s]\n",
+                                                seg.key.c_str(), lo, hi, st.size(), detok.size(), first_diff,
+                                                hd(st).c_str(), hd(detok).c_str(), tl(st).c_str(), tl(detok).c_str());
+                                    }
+                                }
+                            }
+                        }
+                        SRV_INF_DBG("da_auto: %zu chunk(s) from %zu source message(s), %zu token(s) - %s path%s%s\n",
+                                task.params.da_chunks.size(), layout.n_source_msgs,
+                                task.tokens.get_tokens().size(),
+                                task.params.da_b ? "B" : "A",
+                                task.params.da_offloaded.empty() ? "" : " + kv-offload",
+                                params.kv_offload_holes && !task.params.kv_hole_pending.empty()
+                                    ? string_format(" + %zu kv-hole(s)", task.params.kv_hole_pending.size()).c_str() : "");
+                    }
+                }
+            }
+
+            // message_spans is set by apply_chat_session() above from the
+            // session's message_delimiters (b12412 session model). Re-parsing
+            // data["message_delimiters"] here is a no-op on b12412 (the field is
+            // no longer populated into the request JSON) and would overwrite the
+            // correct spans with empty ones, dropping user-start checkpoints.
 
             task.id_slot = json_value(data, "id_slot", -1);
             sse_ping_interval = task.params.sse_ping_interval;
@@ -5821,6 +10134,33 @@ void server_routes::init_routes() {
         return res;
     };
 
+    this->get_kv_state = [this](const server_http_req & req) {
+        // Per-session KV state for the FocusMemory client. Reads in-memory
+        // state only (no model / task queue), so it works during sleep too.
+        auto res = create_response(true);
+        const std::string session = req.get_param("session");
+        std::lock_guard<std::mutex> lk(kv_offload.put_mutex);
+        if (session.empty()) {
+            // No session: return the state of every known session.
+            json sessions = json::object();
+            std::set<std::string> all;
+            for (const auto & kv : kv_offload.uploaded) all.insert(kv.first);
+            for (const auto & kv : kv_offload.session_logical)  all.insert(kv.first);
+            for (const auto & s : all) {
+                sessions[s] = kv_offload_build_state_json(kv_offload, s, (int64_t) params.kv_cache_size);
+            }
+            res->ok(sessions);
+            return res;
+        }
+        json state = kv_offload_build_state_json(kv_offload, session, (int64_t) params.kv_cache_size);
+        if (state.is_null()) {
+            res->error(format_error_response("kv_state: session not found: " + session, ERROR_TYPE_NOT_FOUND));
+            return res;
+        }
+        res->ok(state);
+        return res;
+    };
+
     this->post_slots = [this](const server_http_req & req) {
         auto res = create_response();
         if (params.slot_save_path.empty()) {
@@ -5985,6 +10325,20 @@ void server_routes::init_routes() {
         std::vector<raw_buffer> files;
         json body = json::parse(req.body);
         common_chat_session session;
+        // Sigma-strip (direction B, plans/2026-11-03-compressfast-auto-
+        // trigger.md): server-side prompt compression at the messages-JSON
+        // stage, before oaicompat_chat_params_parse tokenizes. "off" (default)
+        // is skipped entirely (zero overhead); "shadow" computes + logs only
+        // (body untouched); "on" rewrites body["messages"] in place. The
+        // function is fail-open: any anomaly leaves the request untouched.
+        if (params.sigma_strip_mode != "off") {
+            sigma_strip_maybe_rewrite(
+                ctx_server.vocab,
+                params,
+                req,
+                body,
+                params.sigma_strip_mode == "on");
+        }
         json body_parsed = oaicompat_chat_params_parse(
             ctx_server.vocab,
             body,

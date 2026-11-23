@@ -16,6 +16,7 @@
 #include <condition_variable>
 #include <cinttypes>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <functional>
 #include <mutex>
@@ -39,6 +40,26 @@ using json = common_json;
 #define SRV_WRN(fmt, ...) LOG_WRN("srv  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define SRV_ERR(fmt, ...) LOG_ERR("srv  %12.*s: " fmt, 12, __func__, __VA_ARGS__)
 #define SRV_CNT(fmt, ...) LOG_CNT(""              fmt,               __VA_ARGS__)
+
+// FOCUS_SPARSE_DEBUG: the DA/sparse-attention debug journal flag (fattn.cu's
+// gate journal uses the same one). Only the literal value "1" enables the
+// gated lines (kv-offload-holes / kv-probe / da:); unset or any other value
+// ("0") keeps them silent. Without the gate the kv-probe / kv-offload-holes
+// progress lines fire once per prompt sub-batch and flood the log on a large
+// prefill.
+static inline bool focus_sparse_debug() {
+    static const bool enabled = [] {
+        const char * v = getenv("FOCUS_SPARSE_DEBUG");
+        return v != nullptr && v[0] == '1' && v[1] == '\0';
+    }();
+    return enabled;
+}
+
+#define SLT_INF_DBG(slot, fmt, ...) do { if (focus_sparse_debug()) { SLT_INF(slot, fmt, ##__VA_ARGS__); } } while (0)
+#define SLT_WRN_DBG(slot, fmt, ...) do { if (focus_sparse_debug()) { SLT_WRN(slot, fmt, ##__VA_ARGS__); } } while (0)
+#define SRV_INF_DBG(fmt, ...)       do { if (focus_sparse_debug()) { SRV_INF(fmt, ##__VA_ARGS__); } } while (0)
+#define SRV_WRN_DBG(fmt, ...)       do { if (focus_sparse_debug()) { SRV_WRN(fmt, ##__VA_ARGS__); } } while (0)
+#define SRV_ERR_DBG(fmt, ...)       do { if (focus_sparse_debug()) { SRV_ERR(fmt, ##__VA_ARGS__); } } while (0)
 
 using raw_buffer = std::vector<uint8_t>;
 
@@ -447,6 +468,24 @@ struct server_slot_stats {
     uint64_t n_draft_tokens      = 0;
     uint64_t n_draft_accepted    = 0;
     uint64_t n_draft_verif_steps = 0;
+
+    // DA (Declarative Attention) instrumentation - logical attended tokens,
+    // not measured bytes: decode steps that ran with a restricted read set
+    // and the sum of those logical read sets. da_removed_a distinguishes the
+    // A path (seq_rm holes) from the B path (second sequence).
+    uint64_t n_da_restricted_steps = 0;
+    uint64_t n_da_attended_tokens  = 0;
+    bool     da_removed_a          = false;
+
+    // DA 2-pass overhead: how much the model "re-thinks" on top of the KV
+    // reduction. da_n_transitions counts every da_mode change (global<->focus
+    // <->local); the da_tokens_* fields accumulate generated tokens while in
+    // each mode, so the global share is the "find where the answer is" search
+    // phase and focus is the "re-reason on that chunk" phase.
+    uint64_t da_n_transitions  = 0;
+    uint64_t da_tokens_global  = 0;
+    uint64_t da_tokens_focus   = 0;
+    uint64_t da_tokens_local   = 0;
 
     // these are absolute timestamps (in us)
     // note: must be signed - they are subtracted before the later ones are set

@@ -5,6 +5,7 @@
 #include "server-cors-proxy.h"
 #include "server-stream.h"
 #include "server-tools.h"
+#include "sigma-strip.h"
 
 #include "arg.h"
 #include "build-info.h"
@@ -133,6 +134,14 @@ static bool server_prepare_params(common_params & params, server_role_type role_
             params.n_parallel = 4;
             params.kv_unified = true;
         }
+
+        // sigma-strip: reject floors that make the K advance unusable
+        // (floor >= threshold); a thin margin is warned inside the check
+        const std::string sigma_strip_err = sigma_strip_config_check(params);
+        if (!sigma_strip_err.empty()) {
+            SRV_ERR("%s\n", sigma_strip_err.c_str());
+            return 1;
+        }
     }
 
     // size the KV pool from --kv-unified-per-slot, unless the user pinned it with -c
@@ -218,6 +227,8 @@ static void server_register_routes(server_http_context & ctx_http, server_routes
     // Save & load slots
     ctx_http.get ("/slots",                    ex_wrapper(routes.get_slots));
     ctx_http.post("/slots/:id_slot",           ex_wrapper(routes.post_slots));
+    // Per-session KV state (FocusMemory client)
+    ctx_http.get ("/kv_state",                 ex_wrapper(routes.get_kv_state));
 
     // Google Cloud Platform (Vertex AI) compat
     ctx_http.register_gcp_compat();
@@ -881,6 +892,10 @@ int llama_server(int argc, char ** argv) {
     }
 
     SRV_INF("%s", "initializing ...\n");
+
+    // sparse FA gate threshold: bridge CLI -> env before the first gate call
+    // (the lazy static in ggml-cuda reads it on first use)
+    common_set_env("FOCUS_SPARSE_GATE_THRESHOLD", std::to_string(params.sparse_gate_threshold));
 
     llama_backend_init();
     llama_numa_init(params.numa);

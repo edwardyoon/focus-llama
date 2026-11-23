@@ -1,3 +1,6 @@
+#include <chrono>
+#include <cstdlib>
+
 #include "common.cuh"
 #include "fattn-common.cuh"
 #include "fattn-mma-f16.cuh"
@@ -127,11 +130,169 @@ void ggml_cuda_flash_attn_ext_compact_mask(
 #endif // !defined(GGML_USE_MUSA)
 }
 
-bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_tensor * dst, const int ncols1, const int ncols2) {
-#ifdef GGML_USE_MUSA
-    GGML_UNUSED_VARS(cc, dst, ncols1, ncols2);
-    return false;
-#else
+// DA (declarative attention) journal for the n_kv_max sparse gate: proves in
+// the log whether the physical KV read reduction is actually active. The gate
+// is evaluated per flash-attn op (per layer, per step); all layers of a step
+// share the decision inputs, so the journal dedups on them and logs:
+//   SPARSE : 'SPARSE - gather bound X of Y (Z%)' - the reduction is active,
+//            re-logged as KV grows (the read ratio drifts under a fixed bound)
+//   DENSE  : 'DENSE - bound X, KV Y - <failed condition>' - the fallback with
+//            its reason (vanilla n_kv_max=0, the KV gate K < min_kv, multi-
+//            token verify batch, ...); journaled only with FOCUS_SPARSE_DEBUG=1
+//   WINDOW : 'window 5.0s - SPARSE N, DENSE M (bound B, KV K - <reason>)' -
+//            the per-path duty cycle over a rolling 5s window (one summary
+//            line per window), logged only when sparse was used or a DA bound
+//            was active, so a vanilla (n_kv_max=0) deployment stays quiet
+// FOCUS_SPARSE_DEBUG=1 is the only mode that journals DENSE decisions; it
+// also bypasses the dedup so the live decision is logged on every evaluation,
+// throttled to one line per path per second (the gate runs per layer, per
+// step: thousands of evaluations per second on a 27B).
+// The bound is the 512-bucketed upper bound on the gather list; the finite
+// rows read are <= bound.
+void ggml_cuda_fattn_sparse_gate_log(const char * path, bool use_sparse, ggml_tensor * dst, const char * fail) {
+    const ggml_tensor * K = dst->src[1];
+    const int32_t n_kv_max = ggml_get_op_params_i32(dst, 4);
+    const int64_t kv_rows  = K->ne[1];
+    if (!fail) {
+        fail = "gate"; // e.g. dense on a non-NVIDIA device: all conditions pass, the gate still fails
+    }
+
+    // FOCUS_SPARSE_DEBUG=1 is the only mode that journals any da_sparse line
+    // (SPARSE/DENSE decisions + the window summary); unset or "0" keeps the
+    // gate completely silent.
+    static const bool debug = [] {
+        const char * v = getenv("FOCUS_SPARSE_DEBUG");
+        return v != nullptr && v[0] == '1' && v[1] == '\0';
+    }();
+    if (!debug) {
+        return;
+    }
+
+    // Per-path dedup state: VEC and MMA both call this function, so a single
+    // global state would let each path clobber the other's last-log and re-log
+    // every step. Two slots, one per path.
+    struct GateLogState {
+        bool    valid  = false;
+        bool    active = false;
+        int32_t nkvmax = -1;
+        int64_t kvrows = -1;
+        char    fail[64] = {0};
+    };
+    static GateLogState st[2]; // [0]=VEC, [1]=MMA
+    const int slot = strncmp(path, "MMA", 3) == 0 ? 1 : 0;
+    GateLogState & s = st[slot];
+
+    // Windowed counter: the gate runs per flash-attn op (per layer, per step),
+    // thousands of evaluations per second on a 27B, so per-evaluation logging
+    // floods the journal and adds hot-path overhead. Instead, count the
+    // SPARSE/DENSE decisions per path over a rolling 5s window and log one
+    // summary line per window - the sparse read reduction's actual duty cycle
+    // (how often the gate chose sparse) as a single number. The window only
+    // logs when sparse was used or a DA bound was active, so a vanilla
+    // deployment (n_kv_max=0) stays quiet. The current eval is counted AFTER
+    // the window closes, so it belongs to the new window.
+    struct GateCounter {
+        bool     active     = false;
+        std::chrono::steady_clock::time_point t0{};
+        uint64_t n_sparse   = 0;
+        uint64_t n_dense    = 0;
+        int32_t  max_bound  = 0;
+        int32_t  last_bound = 0;
+        int64_t  last_kv    = 0;
+        char     dense_fail[64] = {0};
+    };
+    static GateCounter cnt[2]; // [0]=VEC, [1]=MMA
+    GateCounter & c = cnt[slot];
+    {
+        const auto now = std::chrono::steady_clock::now();
+        if (c.active && now - c.t0 >= std::chrono::seconds(5) &&
+            (c.n_sparse > 0 || c.max_bound > 0)) {
+            const double secs = std::chrono::duration<double>(now - c.t0).count();
+            GGML_LOG("da_sparse[%s]: window %.1fs - SPARSE %llu, DENSE %llu (bound %d, KV %lld%s%s)\n",
+                     path, secs,
+                     (unsigned long long) c.n_sparse,
+                     (unsigned long long) c.n_dense,
+                     c.last_bound, (long long) c.last_kv,
+                     c.n_dense > 0 ? " - " : "",
+                     c.n_dense > 0 ? c.dense_fail : "");
+            c.n_sparse  = 0;
+            c.n_dense   = 0;
+            c.max_bound = 0;
+            c.t0 = now;
+        }
+        if (n_kv_max > c.max_bound) {
+            c.max_bound = n_kv_max;
+        }
+        c.last_bound = n_kv_max;
+        c.last_kv    = kv_rows;
+        if (use_sparse) {
+            c.n_sparse++;
+        } else {
+            c.n_dense++;
+            snprintf(c.dense_fail, sizeof(c.dense_fail), "%s", fail);
+        }
+        if (!c.active) {
+            c.active = true;
+            c.t0 = now;
+        }
+    }
+
+    // Debug mode (FOCUS_SPARSE_DEBUG=1, checked at the top of the function):
+    // the live decision is visible on every evaluation. The gate runs per
+    // flash-attn op (per layer, per step) - thousands of evaluations per second
+    // on a 27B - so the journal is throttled to one line per path per second;
+    // a DENSE/SPARSE flip is still visible within the interval.
+    {
+        static std::chrono::steady_clock::time_point last_log[2];
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last_log[slot] < std::chrono::seconds(1)) {
+            return;
+        }
+        last_log[slot] = now;
+    }
+    s.valid  = true;
+    s.active = use_sparse;
+    s.nkvmax = n_kv_max;
+    s.kvrows = kv_rows;
+    snprintf(s.fail, sizeof(s.fail), "%s", fail ? fail : "");
+
+    if (use_sparse) {
+        GGML_LOG("da_sparse[%s]: SPARSE - gather bound %d of %lld KV rows (%.1f%% of KV)\n",
+                 path, n_kv_max, (long long) kv_rows,
+                 100.0 * (double) n_kv_max / (double) kv_rows);
+    } else {
+        // The 5s window summary above already counts DENSE decisions (n_dense +
+        // last reason); this per-evaluation line runs in debug mode only
+        // (FOCUS_SPARSE_DEBUG=1 gates the whole journal above).
+        GGML_LOG("da_sparse[%s]: DENSE - bound %d, KV %lld - %s\n",
+                 path, n_kv_max, (long long) kv_rows, fail ? fail : "gate");
+    }
+}
+
+// Sparse-gate threshold as a percentage of KV rows (clamped 1..100, default 50):
+// gathering the finite KV cells only pays off when it reads at most this fraction
+// of the cache. The server sets FOCUS_SPARSE_GATE_THRESHOLD from
+// --sparse-gate-threshold at startup. Lazy static init matches the getenv house
+// style in ggml-cuda.
+static int sparse_gate_threshold_pct() {
+    static const int pct = [] {
+        const char * env = getenv("FOCUS_SPARSE_GATE_THRESHOLD");
+        const int v = env ? std::atoi(env) : 50;
+        return v < 1 ? 1 : (v > 100 ? 100 : v);
+    }();
+    return pct;
+}
+
+// Minimum total KV rows for which gathering only the n_kv_max finite cells reads at
+// most pct% of the cache; the dense path is used below this bound. At the default
+// pct=50 this is exactly 2*n (bit-identical to the original hardcoded 50% gate).
+static int64_t kv_min_rows(int64_t n_kv_max, int pct) {
+    return (100LL * n_kv_max + pct - 1) / pct;
+}
+
+// First failed condition of the MMA f16 sparse gate (nullptr = all pass).
+// Shared by the gate and the journal so the dense fallback carries its reason.
+const char * ggml_cuda_flash_attn_ext_mma_f16_sparse_fail(const int cc, const ggml_tensor * dst, const int ncols1, const int ncols2) {
     const ggml_tensor * Q    = dst->src[0];
     const ggml_tensor * K    = dst->src[1];
     const ggml_tensor * V    = dst->src[2];
@@ -144,7 +305,7 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_
 
     // On CDNA only the DKQ=576 kernel variant with ncols2=16 is compiled with sparse support.
     if (amd_mfma_available(cc) && !ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(int(Q->ne[0]), int(V->ne[0]), 1, 16)) {
-        return false;
+        return "no CDNA sparse kernel for this shape";
     }
 
     const int32_t n_kv_max = ggml_get_op_params_i32(dst, 4);
@@ -152,11 +313,125 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_
     // the dense kernel handles up to 64/ncols2 queries per K/V pass, the single-query gather has to beat that
     const int64_t n_gather = (ncols1 == 1 ? std::min<int64_t>(Q->ne[1], 64/ncols2) : ncols1) * (int64_t) n_kv_max;
 
-    return ((GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc)) || amd_mfma_available(cc)) && dst->src[5] == nullptr &&
-        mask != nullptr && n_kv_max > 0 && max_bias == 0.0f && logit_softcap == 0.0f &&
-        mask->ne[0] == K->ne[1] && mask->ne[1] >= Q->ne[1] && mask->ne[2] == 1 &&
-        K->ne[1] >= std::max<int64_t>(4096, GGML_CUDA_CC_IS_NVIDIA(cc) ? 2*n_gather : 2LL*n_kv_max);
+    if (n_kv_max <= 0) {
+        return "n_kv_max=0";
+    }
+    if (!((GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc)) || amd_mfma_available(cc))) {
+        return "no NVIDIA tensor cores";
+    }
+    if (dst->src[5] != nullptr) {
+        return "kv_rows";
+    }
+    if (mask == nullptr) {
+        return "no mask";
+    }
+    if (max_bias != 0.0f) {
+        return "max_bias!=0";
+    }
+    if (logit_softcap != 0.0f) {
+        return "logit_softcap!=0";
+    }
+    if (mask->ne[0] != K->ne[1]) {
+        return "mask->ne[0]!=K->ne[1]";
+    }
+    if (mask->ne[1] < Q->ne[1]) {
+        return "mask->ne[1]<Q->ne[1]";
+    }
+    if (mask->ne[2] != 1) {
+        return "mask->ne[2]!=1";
+    }
+    const int     kv_pct = sparse_gate_threshold_pct();
+    const int64_t n_thr  = GGML_CUDA_CC_IS_NVIDIA(cc) ? n_gather : n_kv_max;
+    const int64_t kv_min = kv_min_rows(n_thr, kv_pct);
+    if (K->ne[1] < std::max<int64_t>(4096, kv_min)) {
+        static thread_local char buf[128];
+        // Omit the live K->ne[1] (it grows per step, which would defeat the
+        // journal's reason-based dedup); it is already in the DENSE log prefix.
+        snprintf(buf, sizeof(buf), "KV < max(4096, min_kv(%lld,%d%%)=%lld)",
+                 (long long) n_thr, kv_pct, (long long) kv_min);
+        return buf;
+    }
+    return nullptr;
+}
+
+bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_tensor * dst, const int ncols1, const int ncols2) {
+#ifdef GGML_USE_MUSA
+    GGML_UNUSED_VARS(cc, dst, ncols1, ncols2);
+    return false;
+#else
+    return ggml_cuda_flash_attn_ext_mma_f16_sparse_fail(cc, dst, ncols1, ncols2) == nullptr;
 #endif // !defined(GGML_USE_MUSA)
+}
+
+// First failed condition of the VEC sparse gate (nullptr = all pass).
+// Shared by the gate and the journal so the dense fallback carries its reason.
+const char * ggml_cuda_flash_attn_ext_vec_sparse_fail(const ggml_tensor * dst) {
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * K    = dst->src[1];
+    const ggml_tensor * mask = dst->src[3];
+
+    float max_bias = 0.0f;
+    float logit_softcap = 0.0f;
+    memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+
+    const int32_t n_kv_max = ggml_get_op_params_i32(dst, 4);
+
+    if (n_kv_max <= 0) {
+        return "n_kv_max=0";
+    }
+    if (mask == nullptr) {
+        return "no mask";
+    }
+    if (max_bias != 0.0f) {
+        return "max_bias!=0";
+    }
+    if (logit_softcap != 0.0f) {
+        return "logit_softcap!=0";
+    }
+    if (Q->ne[1] != 1) {
+        static thread_local char buf[128];
+        snprintf(buf, sizeof(buf), "Q->ne[1]=%lld (multi-token batch)", (long long) Q->ne[1]);
+        return buf;
+    }
+    if (Q->ne[3] != 1) {
+        return "Q->ne[3]!=1";
+    }
+    if (mask->ne[0] != K->ne[1]) {
+        return "mask->ne[0]!=K->ne[1]";
+    }
+    if (mask->ne[1] < Q->ne[1]) {
+        return "mask->ne[1]<Q->ne[1]";
+    }
+    if (mask->ne[2] != 1) {
+        return "mask->ne[2]!=1";
+    }
+    const int     kv_pct = sparse_gate_threshold_pct();
+    const int64_t kv_min = kv_min_rows(n_kv_max, kv_pct);
+    if (K->ne[1] < kv_min) {
+        static thread_local char buf[128];
+        // Omit the live K->ne[1] (it grows per step, which would defeat the
+        // journal's reason-based dedup); it is already in the DENSE log prefix.
+        snprintf(buf, sizeof(buf), "KV < min_kv(%d,%d%%)=%lld",
+                 n_kv_max, kv_pct, (long long) kv_min);
+        return buf;
+    }
+    return nullptr;
+}
+
+// Vector-kernel sparse gate (n_kv_max): single-token decode gathers the compact finite KV
+// rows instead of scanning the whole cache. Unlike the MMA path it needs no tensor cores, so
+// only NVIDIA (for the compact_mask kernel) is required. Sparse is only worth it when we read
+// at most sparse_gate_threshold_pct% of the KV (default 50, tunable via --sparse-gate-threshold);
+// the VEC kernel otherwise has no extra gather overhead.
+bool ggml_cuda_flash_attn_ext_vec_shall_use_sparse(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED_VARS(ctx, dst);
+    return false;
+#else
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    return GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_flash_attn_ext_vec_sparse_fail(dst) == nullptr;
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 }
 
 template <int DKQ, int DV, int ncols2>
@@ -297,6 +572,119 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
     }
 }
 
+// TEMP experiment: batch size range for the MMA kernel with on-the-fly K/V dequantization
+static int ggml_cuda_fattn_mma_q_nb_min() {
+    static const int nb_min = getenv("FA_Q_MMA_MIN") ? atoi(getenv("FA_Q_MMA_MIN")) : 1;
+    return nb_min;
+}
+
+static int ggml_cuda_fattn_mma_q_nb_max() {
+    static const int nb_max = getenv("FA_Q_MMA") ? std::min(atoi(getenv("FA_Q_MMA")), 8) : 8;
+    return nb_max;
+}
+
+// quantized K/V that the MMA kernel can dequantize on the fly instead of converting all of K/V to f16 first
+static bool ggml_cuda_fattn_mma_use_q(const int cc, const ggml_tensor * dst) {
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+
+    if (!GGML_CUDA_CC_IS_NVIDIA(cc) || !ampere_mma_available(cc)) {
+        return false;
+    }
+    if (K->type != V->type || (K->type != GGML_TYPE_Q4_0 && K->type != GGML_TYPE_Q8_0)) {
+        return false;
+    }
+    if (K->ne[0] != V->ne[0] || (K->ne[0] != 128 && K->ne[0] != 256 && K->ne[0] != 512)) {
+        return false;
+    }
+    return Q->ne[1] >= ggml_cuda_fattn_mma_q_nb_min() && Q->ne[1] <= ggml_cuda_fattn_mma_q_nb_max();
+}
+
+template <int D, ggml_type type_KV>
+static void ggml_cuda_flash_attn_ext_mma_q_switch_ncols(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int ncols2) {
+    const int64_t nb = dst->src[0]->ne[1];
+    GGML_ASSERT(nb <= 8);
+
+    switch (ncols2) {
+        case 1:
+            if constexpr (D <= 256) {
+                ggml_cuda_flash_attn_ext_mma_f16_case<D, D, 8, 1, type_KV>(ctx, dst);
+                return;
+            }
+            break;
+        case 2:
+            if (nb <= 4) {
+                ggml_cuda_flash_attn_ext_mma_f16_case<D, D, 4, 2, type_KV>(ctx, dst);
+            } else {
+                ggml_cuda_flash_attn_ext_mma_f16_case<D, D, 8, 2, type_KV>(ctx, dst);
+            }
+            return;
+        case 4:
+            if (nb <= 2) {
+                ggml_cuda_flash_attn_ext_mma_f16_case<D, D, 2, 4, type_KV>(ctx, dst);
+            } else if (nb <= 4) {
+                ggml_cuda_flash_attn_ext_mma_f16_case<D, D, 4, 4, type_KV>(ctx, dst);
+            } else {
+                ggml_cuda_flash_attn_ext_mma_f16_case<D, D, 8, 4, type_KV>(ctx, dst);
+            }
+            return;
+        case 8:
+            if (nb <= 1) {
+                ggml_cuda_flash_attn_ext_mma_f16_case<D, D, 1, 8, type_KV>(ctx, dst);
+            } else if (nb <= 2) {
+                ggml_cuda_flash_attn_ext_mma_f16_case<D, D, 2, 8, type_KV>(ctx, dst);
+            } else if (nb <= 4) {
+                ggml_cuda_flash_attn_ext_mma_f16_case<D, D, 4, 8, type_KV>(ctx, dst);
+            } else {
+                ggml_cuda_flash_attn_ext_mma_f16_case<D, D, 8, 8, type_KV>(ctx, dst);
+            }
+            return;
+        default:
+            break;
+    }
+    GGML_ABORT("fatal error");
+}
+
+template <ggml_type type_KV>
+static void ggml_cuda_flash_attn_ext_mma_q_switch_D(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const int ncols2) {
+    switch (dst->src[0]->ne[0]) {
+        case 128: ggml_cuda_flash_attn_ext_mma_q_switch_ncols<128, type_KV>(ctx, dst, ncols2); break;
+        case 256: ggml_cuda_flash_attn_ext_mma_q_switch_ncols<256, type_KV>(ctx, dst, ncols2); break;
+        case 512: ggml_cuda_flash_attn_ext_mma_q_switch_ncols<512, type_KV>(ctx, dst, ncols2); break;
+        default: GGML_ABORT("fatal error");
+    }
+}
+
+static void ggml_cuda_flash_attn_ext_mma_q(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * K    = dst->src[1];
+    const ggml_tensor * mask = dst->src[3];
+
+    float max_bias = 0.0f;
+    memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
+
+    // same GQA selection as ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2
+    bool use_gqa_opt = mask && max_bias == 0.0f && K->ne[1] % FATTN_KQ_STRIDE == 0;
+    for (const ggml_tensor * t : {Q, mask}) {
+        for (size_t i = 1; t && i < GGML_MAX_DIMS; ++i) {
+            if (t->nb[i] % 16 != 0) {
+                use_gqa_opt = false;
+                break;
+            }
+        }
+    }
+    const int gqa_ratio = Q->ne[2] / K->ne[2];
+    const int ncols2 = !use_gqa_opt ? 1 : (gqa_ratio > 4 ? 8 : (gqa_ratio > 2 ? 4 : (gqa_ratio > 1 ? 2 : 1)));
+
+    if (K->type == GGML_TYPE_Q8_0) {
+        ggml_cuda_flash_attn_ext_mma_q_switch_D<GGML_TYPE_Q8_0>(ctx, dst, ncols2);
+    } else {
+        GGML_ASSERT(K->type == GGML_TYPE_Q4_0);
+        ggml_cuda_flash_attn_ext_mma_q_switch_D<GGML_TYPE_Q4_0>(ctx, dst, ncols2);
+    }
+}
+
 static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const ggml_tensor * KQV  = dst;
@@ -304,6 +692,11 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
     const ggml_tensor * K    = dst->src[1];
     const ggml_tensor * V    = dst->src[2];
     const ggml_tensor * mask = dst->src[3];
+
+    if (ggml_cuda_fattn_mma_use_q(cc, dst)) {
+        ggml_cuda_flash_attn_ext_mma_q(ctx, dst);
+        return;
+    }
 
     switch (Q->ne[0]) {
         case 40:
@@ -694,6 +1087,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc)) {
+        if (ggml_cuda_fattn_mma_use_q(cc, dst)) {
+            return BEST_FATTN_KERNEL_MMA_F16;
+        }
         if (can_use_vector_kernel) {
             if (!ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {
                 // the sparse gather exists only in the MMA kernel: (DKQ, DV, 1, 8) with GQA > 4
@@ -799,9 +1195,12 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
     switch (kernel) {
         case BEST_FATTN_KERNEL_TILE:
-        case BEST_FATTN_KERNEL_MMA_F16:
             need_f16_K = true;
             need_f16_V = true;
+            break;
+        case BEST_FATTN_KERNEL_MMA_F16:
+            need_f16_K = !ggml_cuda_fattn_mma_use_q(ggml_cuda_info().devices[device].cc, dst);
+            need_f16_V = need_f16_K;
             break;
         case BEST_FATTN_KERNEL_VEC: {
             const bool f16_fallback = ggml_cuda_get_fattn_vec_case(Q->ne[0], K->type, V->type) == nullptr;

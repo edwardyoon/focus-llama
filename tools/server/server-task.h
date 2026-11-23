@@ -7,6 +7,7 @@
 #include <unordered_set>
 #include <list>
 #include <map>
+#include <utility>
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
@@ -90,6 +91,80 @@ struct task_params {
     int32_t n_cmpl    =  1; // number of completions to generate from this prompt
 
     int32_t n_cache_reuse = 0; // min chunk size to attempt reusing from the cache via KV shifting (0 = disabled)
+
+    // Declarative Attention (DA): prompt token ranges [lo, hi) to remove from the
+    // KV cache via llama_memory_seq_rm. Applied once prefill crosses da_rm_at
+    // (>= 0, the remaining prompt is then prefilled without the removed ranges),
+    // or after the full prompt is prefilled (da_rm_at < 0)
+    std::vector<std::pair<int32_t, int32_t>> da_rm;
+    int32_t da_rm_at = -1;
+
+    // Declarative Attention 2-stream (B): with da_rm non-empty, apply the
+    // removals by copying the KEEP ranges (the complement of da_rm in
+    // [0, bound)) to a fresh sequence via llama_memory_seq_cp and switching
+    // the slot's decode to that sequence, instead of seq_rm on the slot's own
+    // sequence. The original sequence stays intact (rollback/reference).
+    // Requires a unified KV pool (partial-range seq_cp aborts otherwise) and
+    // speculative decoding is disabled for the slot.
+    bool da_b = false;
+
+    // Declarative Attention tag parser: the client-side chunk layout as
+    // explicit prompt token ranges, one per chunk (da_chunks[N-1] = [lo, hi)
+    // of chunk N, 1-based). When non-empty, the server scans the model's own
+    // generated text for the first complete <focus ... magic_chunks="N" ...>
+    // tag and, at tag close, removes every chunk except N plus da_filler -
+    // the model's tag (not a client-supplied da_rm range) drives the
+    // attention restriction. Applied exactly once, mid-decode, via apply_da_b
+    // (when da_b is set) or apply_da_rm. Supersedes da_rm: when da_chunks is
+    // set the static da_rm removals are not applied.
+    std::vector<std::pair<int32_t, int32_t>> da_chunks;
+    // Filler segment range [lo, hi), removed together with the non-kept
+    // chunks. {-1, -1} when the layout has no filler.
+    std::pair<int32_t, int32_t> da_filler = { -1, -1 };
+    // Σ anchor range [lo, hi) (the FocusMemory session-state record appended
+    // after the filler). Explicitly unioned into the keep set in apply_da_b /
+    // apply_da_rm so it survives a B switch regardless of the layout scan's
+    // classification of the region after the filler. {-1, -1} when absent.
+    std::pair<int32_t, int32_t> da_sigma = { -1, -1 };
+    // First chunk number of the scanned layout block (the FocusMemory hook
+    // numbers chunks monotonically per session, so a later turn's block may
+    // start at k > 1). The tag state machine maps magic_chunks="N" to
+    // da_chunks[N - da_chunk_base]. 1 for single-block prompts.
+    int32_t da_chunk_base = 1;
+
+    // kv-offload (auto-compact replacement): segments evicted to the
+    // FocusMemory store this request. Each is a virtual chunk (chunk_id =
+    // da_chunk_base + active_count + i) whose text is NOT in the prompt;
+    // get-on-focus re-prefills it on demand. The text was PUT during task
+    // construction; only the key/hint/chunk_id travel with the task.
+    struct kv_offload_segment {
+        std::string key;          // FocusMemory stable key (content hash)
+        std::string hint;         // one-line hint shown in the DA instruction
+        int32_t     chunk_id = 0; // virtual chunk number
+    };
+    std::vector<kv_offload_segment> da_offloaded;
+    // kv-offload: FocusMemory connection for get-on-focus (set when segments were
+    // evicted this request; empty when nothing was offloaded). Carried on the task
+    // so apply_da_tag (mid-decode) can reach them without the request JSON. The
+    // vocab pointer (owned by the model, outlives the task) is used to re-tokenize
+    // fetched chunk text during the mid-decode re-prefill.
+    std::string kv_offload_session;
+    std::string kv_offload_host;
+    std::string kv_offload_token;
+    const llama_vocab * kv_offload_vocab = nullptr;
+    // kv-offload Option B (--kv-offload-holes): hole ranges [lo, hi) in the
+    // FINAL token space (post da_auto_chunk re-tokenization) to cut out of the
+    // slot's main sequence via llama_memory_seq_rm. Set by the eviction gate
+    // this request; applied at the NEXT request's n_past check (the KV must
+    // exist first). Empty in Option C (prompt text reduction).
+    std::vector<std::pair<int32_t, int32_t>> kv_hole_pending;
+
+    // sigma-strip (E1): session key carried from the request so the response
+    // path (send_final_response) can calibrate the session's est offset via
+    // sigma_strip_note_response. Resolved with kv_offload_resolve_session
+    // (same X-Session-Id / user fallback). note_response is a no-op for
+    // sessions that never went through sigma_strip_maybe_rewrite.
+    std::string sigma_session;
 
     int64_t t_max_prompt_ms  = -1; // TODO: implement
     int64_t t_max_predict_ms = -1; // if positive, limit the generation phase to this time limit

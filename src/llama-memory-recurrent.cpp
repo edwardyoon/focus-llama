@@ -129,6 +129,13 @@ llama_memory_recurrent::llama_memory_recurrent(
         }
     }
 
+    if (is_empty()) {
+        if (n_rs_seq > 0) {
+            n_rs_seq = 0;
+            LLAMA_LOG_INFO("%s: disabling rollback snapshots because the memory module is empty\n", __func__);
+        }
+    }
+
     {
         const size_t memory_size_r = size_r_bytes();
         const size_t memory_size_s = size_s_bytes();
@@ -214,6 +221,10 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
                     cell.pos = p0 - 1;
                     return true;
                 }
+                // cannot roll back beyond the available snapshots - the caller has to
+                // restore a checkpoint or reprocess the sequence
+                LLAMA_LOG_DEBUG("%s: cannot roll back recurrent state of seq %d by %d tokens (n_rs_seq = %u)\n",
+                        __func__, (int) seq_id, (int) rollback, n_rs_seq);
                 return false;
             }
             // invalidate tails which will be cleared

@@ -381,6 +381,12 @@ static __host__ bool ggml_cuda_mmq_needs_fallback(const int64_t nrows_x) {
     return nrows_x % 128 != 0;
 }
 
+// Whether one CUDA block per tile (tiling) fills the SMs well enough that stream-k is not needed.
+static __host__ bool ggml_cuda_mmq_tiling_is_efficient(const int64_t ntiles, const int nsm) {
+    const int64_t nwaves = (ntiles + nsm - 1) / nsm;
+    return 100*ntiles / (nsm*nwaves) >= 90;
+}
+
 static constexpr __device__ int ggml_cuda_mmq_get_rows_per_warp(ggml_type type, int J, bool fallback, ggml_prec prec_src1) {
     return ggml_cuda_mmq_get_config(type, J, fallback, prec_src1).rows_per_warp();
 }
@@ -437,8 +443,7 @@ static __host__ int ggml_cuda_mmq_get_nbytes_shared_x(const ggml_cuda_mmq_config
 
 // Weight types with a fused gate/up/GLU path (see ggml_cuda_mmq_get_util_funcs).
 static constexpr __host__ __device__ bool ggml_cuda_mmq_fusion_supported(const ggml_type type) {
-    return type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K || type == GGML_TYPE_Q8_0 || type == GGML_TYPE_IQ4_XS ||
-        type == GGML_TYPE_NVFP4;
+    return type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K || type == GGML_TYPE_Q8_0 || type == GGML_TYPE_IQ4_XS;
 }
 
 // Fused gate/up/GLU: the weight tile alternates chunks of this many up and gate rows, so rows r and r + 8 of an MMA tile (same thread) pair up.
@@ -758,9 +763,9 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
             if (prec_src1 == GGML_PREC_Q4) {
                 return ggml_cuda_mmq_util_funcs(
                     -1,
-                    ggml_cuda_mmq_load_tiles_nvfp4_nvfp4<type, J, fallback, has_fusion>,
+                    ggml_cuda_mmq_load_tiles_nvfp4_nvfp4<type, J, fallback, false>,
                     ggml_cuda_mmq_vec_dot_fp4_fp4_mma<type, J, fallback>,
-                    ggml_cuda_mmq_write_back_mma<type, J, fallback, prec_src1, has_fusion>);
+                    ggml_cuda_mmq_write_back_mma<type, J, fallback, prec_src1, false>);
             }
             break;
         default:
@@ -903,9 +908,9 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
         case GGML_TYPE_NVFP4:
             return ggml_cuda_mmq_util_funcs(
                 -1,
-                ggml_cuda_mmq_load_tiles_nvfp4<type, J, fallback, prec_src1, has_fusion>,
+                ggml_cuda_mmq_load_tiles_nvfp4<type, J, fallback, prec_src1, false>,
                 ggml_cuda_mmq_vec_dot_q8_0_16_q8_1_mma<type, J, fallback, prec_src1>,
-                ggml_cuda_mmq_write_back_mma<type, J, fallback, prec_src1, has_fusion>);
+                ggml_cuda_mmq_write_back_mma<type, J, fallback, prec_src1, false>);
         default:
             return ggml_cuda_mmq_util_funcs(1, nullptr, nullptr, nullptr);
     }

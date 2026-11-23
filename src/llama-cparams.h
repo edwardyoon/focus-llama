@@ -10,6 +10,7 @@
 struct llama_cparams {
     uint32_t n_ctx;           // context size used during inference
     uint32_t n_ctx_seq;       // context for a single sequence
+    uint32_t kv_cache_size = 0; // physical KV buffer size in cells (0 = default: n_ctx_seq); decoupled from logical position range
     uint32_t n_batch;
     uint32_t n_ubatch;
     uint32_t n_seq_max;

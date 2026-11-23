@@ -198,6 +198,10 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-server-component.cpp  LABEL behavior)
     target_include_directories(test-server-component PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     target_link_libraries(test-server-component PRIVATE server-context)
+    llama_build_and_test(test-sigma-strip.cpp)
+    target_include_directories(test-sigma-strip PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+    target_link_libraries(test-sigma-strip PRIVATE server-context)
+    target_compile_definitions(test-sigma-strip PRIVATE SIGMA_STRIP_TESTS)
     llama_build_and_test(test-json-schema-to-grammar.cpp  LABEL behavior)
 
     if (NOT GGML_BACKEND_DL)
@@ -350,6 +354,7 @@ llama_build_and_test(test-thread-safety.cpp  LABEL "main backend"  ARGS -m "${MO
 set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-download-model)
 
 llama_build_and_test(test-arg-parser.cpp  LABEL behavior)
+llama_build_and_test(test-speculative-adaptive.cpp  LABEL behavior)
 llama_build_and_test(test-model-resolution.cpp  LABEL behavior)
 # the test serves its repos from an httplib server, and the library links it privately
 target_link_libraries(test-model-resolution PRIVATE cpp-httplib)

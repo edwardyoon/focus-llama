@@ -178,6 +178,7 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE,   // standalone draft model speculative decoding
     COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3,   // Eagle3 speculative decoding
     COMMON_SPECULATIVE_TYPE_DRAFT_MTP,      // Multi-token prediction
+    COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE, // MTP with adaptive draft depth
     COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH,   // DFlash speculative decoding
     COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK,   // DSpark speculative decoding (DFlash + Markov head)
     COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH2,  // DFlash2 speculative decoding (DFlash + selector)
@@ -344,6 +345,7 @@ struct common_params_model {
 struct common_params_speculative_draft {
     int32_t n_max = 3; // maximum number of tokens to draft during speculative decoding
     int32_t n_min = 0; // minimum number of draft tokens to use for speculative decoding
+    int32_t n_min_adaptive = 3; // minimum adaptive MTP draft depth (also the starting depth)
 
     float p_split = 0.1f; // speculative decoding split probability
     float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
@@ -410,17 +412,22 @@ struct common_params_speculative {
         return !draft.mparams.empty();
     }
 
+    bool has_mtp() const {
+        return std::any_of(types.begin(), types.end(), [](auto t) {
+            return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP_ADAPTIVE;
+        });
+    }
+
     bool has_synth() const {
         return synth_len != -1.0 || !synth_rates.empty();
     }
 
     uint32_t need_n_rs_seq() const {
-        bool needs_rs_seq = std::any_of(types.begin(), types.end(), [&](auto t) {
-            return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP     ||
-                   t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3  ||
-                   t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH  ||
-                   t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK  ||
-                   t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH2 ||
+        bool needs_rs_seq = has_mtp() || std::any_of(types.begin(), types.end(), [](auto t) {
+            return t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3       ||
+                   t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH       ||
+                   t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK       ||
+                   t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH2      ||
                    t == COMMON_SPECULATIVE_TYPE_DRAFT_LILICORR;
         });
 
@@ -668,6 +675,130 @@ struct common_params {
     bool        server_connect      = false;
     std::string server_connect_code = "";
 
+    // Declarative Attention (DA) server options
+    bool    da_prompt_scan      = false; // scan the rendered prompt for <da:N>/<da:filler>/<da:layout:N> layout markers
+    bool    da_auto             = false; // auto-chunk long marker-less prompts by message boundaries
+    int32_t da_min_ctx          = 0;     // da_auto: only chunk when the prompt is at least this many tokens
+    int32_t da_chunk_tokens     = 2048;  // da_auto: target size (tokens) of a split long message
+    bool    da_measure_only     = false; // run the DA tag state machine + logging but skip all KV removals (apply_da_rm/apply_da_b) - output stays vanilla, for measuring g (tag position) and emission rate without touching the KV
+    int32_t da_tail_keep        = 8192;  // DA tail floor: the most recent N tokens before the removal boundary are always kept (union of the tag selection, the Sigma anchor and the tail); 0 = legacy behavior (no floor)
+    int32_t da_b_min_remove     = 0;     // da_b: skip the B switch when fewer than N tokens would be removed (the switch cost outweighs a tiny removal); 0 = always switch (legacy)
+    std::string da_scaffold_file = "";   // da_auto: read the DA instruction text from this file (mtime hot-reload, {n_total} placeholder); empty = built-in instruction
+
+    // kv-offload (auto-compact replacement): evict the oldest magic chunks to the
+    // FocusMemory store once the prompt exceeds the threshold; get-on-focus re-
+    // prefills them on demand. focus_memory_host empty = feature off (fail-open).
+    bool        kv_offload           = false;
+    int32_t     kv_offload_threshold = 150000; // evict oldest chunks at this prompt length (tokens)
+    int32_t     kv_cache_size        = 0;      // physical KV buffer budget in cells (0 = default: n_ctx_seq); decoupled from the logical position range
+    int32_t     kv_retain_tokens     = 0;      // kv_offload: minimum recent tokens kept beyond the evict threshold (0 = unlimited, current behavior)
+    std::string focus_memory_host    = "";     // FocusMemory base URL (e.g. http://127.0.0.1:3900)
+    std::string focus_memory_token   = "";     // FocusMemory Bearer token for evict/recall (empty = no auth header)
+    // Option B (seq_rm hole kv offload): when set with --fm-offload, the evicted
+    // segments are NOT removed from the prompt text; instead the server cuts
+    // their KV out of the main sequence (seq_rm holes) so the client can keep
+    // sending the full prompt and the next request re-matches at n_past=full
+    // (1-token re-prefill instead of the ~64s full-tail re-prefill). Off =
+    // Option C (prompt text reduction, the default).
+    bool        kv_offload_holes     = false;
+    // B4 task-anchor pin (2026-11-03: opt-in, default off). While enabled the
+    // session's first user message (the original task spec) is kept KV-resident
+    // - eviction starts after it - until the FocusMemory store releases it
+    // (pin_released) or the engine TTL backstop (4h hold + 30min idle) fires.
+    // Disabled = the first user message is a normal evictable candidate from
+    // the start (no pin polling, no TTL clocks).
+    bool        kv_pin               = false;
+    // High/low watermark (hysteresis) for the holes-mode eviction gate. When > 0,
+    // eviction is triggered only when the session's KV-resident count (the full
+    // logical prompt minus the cumulative evicted) reaches this high watermark,
+    // and it then drains to the low watermark (kv_offload_threshold) in one shot.
+    // While low < resident < high the gate is idle (no per-turn evict plan / PUT /
+    // hole re-apply; the already-cut holes persist in the KV). 0 = legacy
+    // per-turn behavior (evict every request over the threshold). Holes mode only
+    // (Option C needs the evict plan every request to reduce the prompt text, so
+    // the watermark is ignored there). Must satisfy high >= threshold and
+    // high + n_batch + gen_tail <= kv_cache_size - 16384 (validated at startup).
+    int32_t     kv_offload_high      = 0;
+    // Mid-turn Σ anchor fetch gate (2026-11-01, see incidents/2026-11-01-stale-
+    // sigma-anchor-contamination.md): when disabled (the default) the engine
+    // skips the offload-time fetch of the session state anchor
+    // (kv_offload_get_sigma) entirely. The fetch returns the last async
+    // extraction, which is stale right after an offload - injected as
+    // "current-task (… defines the work)" it re-latched the model onto an
+    // already-finished task. Enable with --sigma-fetch to restore the anchor
+    // injection.
+    bool        kv_sigma_fetch       = false;
+    // Sigma-strip (direction B, plans/2026-11-03-compressfast-auto-trigger.md):
+    // server-side prompt compression at the messages-JSON stage. "off"
+    // (default) = no-op, "shadow" = compute + log only (body untouched),
+    // "on" = rewrite body["messages"] in place (refresh/Σ wiring is step 3).
+    std::string sigma_strip_mode = "off";
+    // Usage (estimated prompt tokens / sigma_strip_window_tokens) at or above
+    // which the session's K boundary advances in one big jump.
+    double      sigma_strip_threshold      = 0.70;
+    // Stripped-usage target: K advances until the stripped prompt reaches this
+    // fraction of the window in the same request (one big jump, not gradual).
+    double      sigma_strip_target         = 0.35;
+    // Token floor: K never advances the stripped prompt below this many
+    // tokens, even if the target would go further (effective goal =
+    // max(target x window, min_keep); 0 = off).
+    int32_t     sigma_strip_min_keep_tokens  = 0;
+    // Protection floor: the last N assistant tool rounds (tool_calls + their
+    // results) are kept verbatim - K never crosses their start.
+    int32_t     sigma_strip_keep_recent      = 1;
+    // Client context-window size in tokens (the usage denominator). 0
+    // (default) = the -c context window; the feature stays inactive when
+    // -c is also unset.
+    int32_t     sigma_strip_window_tokens  = 0;
+    // Futility guard (plans/appendix.md spec #2): suppress an advance whose
+    // expected token savings are below this fraction of the window (0 = off,
+    // default: 0.05). Applies to both the stage-1 K advance and the stage-2
+    // K_sum advance.
+    double      sigma_strip_min_gain       = 0.05;
+    // Futility guard (plans/appendix.md spec #2): rearm deadband - suppress
+    // an advance while usage is still within this fraction of the window of
+    // the usage recorded after the last committed advance (0 = off, default:
+    // 0.05). Prevents the chain re-prefill when usage lingers near the
+    // threshold after a small advance.
+    double      sigma_strip_rearm_delta    = 0.05;
+    // Futility guard hard-limit bypass (plans/appendix-bug.md P0-3): when the
+    // pre-advance usage reaches this fraction of the window, the min-gain and
+    // rearm gates are bypassed (advance allowed) — a small-gain re-prefill
+    // (tens of seconds) is always better than letting usage ride to 1.0 and
+    // trigger the multi-minute native compact. 0 = no bypass (default: 0.90).
+    double      sigma_strip_futility_bypass_usage = 0.90;
+    // Sigma-strip stage 2 (plans/sigma_strip_compaction.md): whole-message
+    // removal of the older region [0,K_sum) replaced by a frozen Σ block.
+    // "off" (default) = stage 2 disabled (stage 1 only); "rule" = the server
+    // generates the block deterministically from the removed messages (no
+    // focus-memory); "llm" = fetch the block from focus-memory (step 4).
+    std::string sigma_sum_mode = "off";
+    // Token budget for the Σ block (stage 2). 0 = a sensible default is used.
+    int32_t     sigma_sum_max_tokens = 0;
+    // focus-memory /sigma/refresh timeout in ms (stage 2 "llm" mode).
+    int32_t     sigma_sum_timeout_ms = 10000;
+    // Cooldown in ms after a failed focus-memory /sigma/refresh before the
+    // next attempt (stage 2 "llm" mode). 0 = retry on the next request.
+    int32_t     sigma_sum_fetch_cooldown_ms = 5000;
+    // Option A (incidents/2026-11-06-sigma-partial-block-not-completed.md):
+    // after a PARTIAL Σ block is committed (llm mode), a background thread
+    // drains the remainder of the removed region (wait:false /sigma/refresh
+    // passes, one 30k-char chunk each) and refreshes the committed block to the
+    // complete Σ when the server answers partial:false. false = leave the
+    // partial block as-is (the next K_sum advance re-fetches a fuller block).
+    bool        sigma_sum_drain = true;
+    // Delay in ms between drain passes — spaces the 27B extraction calls so
+    // live chat can interleave on the shared (parallel=1) slot.
+    int32_t     sigma_sum_drain_delay_ms = 5000;
+    // Drain-only /sigma/refresh timeout in ms (the background drain's fast
+    // path, which routes to the lightweight SUMMARY_LLM). 0 = fall back to
+    // sigma_sum_timeout_ms. Kept separate from the general stage-2 timeout so
+    // the slow 27B wait:true fetch and the fast drain pass can be tuned apart.
+    int32_t     sigma_sum_drain_timeout_ms = 120000;
+    // sparse FA gate (DA n_kv_max): the CUDA/Metal sparse (gather) path is used
+    // only while the finite KV rows are at most this % of the cache; dense
+    // below. Bridged to FOCUS_SPARSE_GATE_THRESHOLD in the server main (1-100).
+    int32_t     sparse_gate_threshold = 50;
     std::string public_path   = "";                                                                         // NOLINT
     std::string api_prefix    = "";                                                                         // NOLINT
     std::string chat_template = "";                                                                         // NOLINT
@@ -1101,6 +1232,9 @@ struct common_memory {
 
     // aborts execution on failure
     void seq_rm (llama_seq_id seq_id, llama_pos p0, llama_pos p1) const;
+    // like seq_rm, but returns false instead of aborting when the range is not removable
+    // (e.g. the cells were already removed) - for idempotent re-apply paths
+    bool seq_rm_checked(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const;
     void seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos delta) const;
     void seq_cp (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) const;
 };

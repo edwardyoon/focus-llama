@@ -1640,6 +1640,11 @@ static void common_context_seq_rm(llama_context * ctx, llama_seq_id seq_id, llam
     }
 }
 
+static bool common_context_seq_rm_checked(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    auto * mem = llama_get_memory(ctx);
+    return llama_memory_seq_rm(mem, seq_id, p0, p1);
+}
+
 static void common_context_seq_cp(llama_context * ctx, llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
     auto * mem = llama_get_memory(ctx);
     llama_memory_seq_cp(mem, seq_id_src, seq_id_dst, p0, p1);
@@ -1660,6 +1665,18 @@ void common_memory::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) cons
     if (ctx_dft) {
         common_context_seq_rm(ctx_dft, seq_id, p0, p1);
     }
+}
+
+bool common_memory::seq_rm_checked(llama_seq_id seq_id, llama_pos p0, llama_pos p1) const {
+    if (!common_context_seq_rm_checked(ctx_tgt, seq_id, p0, p1)) {
+        return false;
+    }
+    if (ctx_dft) {
+        if (!common_context_seq_rm_checked(ctx_dft, seq_id, p0, p1)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 void common_memory::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) const {
@@ -1722,7 +1739,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.progress_callback           = params.load_progress_callback;
     mparams.progress_callback_user_data = params.load_progress_callback_user_data;
     mparams.no_alloc                    = params.no_alloc;
-    mparams.load_mtp                    = params.load_mtp || std::find(params.speculative.types.begin(), params.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+    mparams.load_mtp                    = params.load_mtp || params.speculative.has_mtp();
 
     return mparams;
 }
@@ -1772,6 +1789,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.op_offload        = !params.no_op_offload;
     cparams.swa_full          = params.swa_full;
     cparams.kv_unified        = params.kv_unified;
+    cparams.kv_cache_size     = params.kv_cache_size;
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;

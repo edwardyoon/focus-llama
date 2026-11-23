@@ -214,6 +214,7 @@ llama_context::llama_context(
     cparams.pooling_type      = params.pooling_type;
 
     cparams.n_ctx            = params.n_ctx           == 0    ? hparams.n_ctx_train           : params.n_ctx;
+    cparams.kv_cache_size    = params.kv_cache_size;
     cparams.rope_freq_base   = params.rope_freq_base  == 0.0f ? hparams.rope_freq_base_train  : params.rope_freq_base;
     cparams.rope_freq_scale  = params.rope_freq_scale == 0.0f ? hparams.rope_freq_scale_train : params.rope_freq_scale;
 
@@ -1692,6 +1693,20 @@ bool llama_context::get_causal_attn() const {
     return cparams.causal_attn;
 }
 
+void llama_context::set_n_kv_max(int64_t value) {
+    LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, (int) value);
+
+    if (n_kv_max == value) {
+        return;
+    }
+
+    n_kv_max = value;
+
+    // no sched_reserve() here: the value is baked into the flash-attn nodes, so a
+    // different bound is picked up by llm_graph_params::allow_reuse and the cached
+    // graph is rebuilt in place (at the current ubatch size) on the next ubatch
+}
+
 bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     if (!sampler && sampling.samplers.count(seq_id) == 0) {
         return true;
@@ -3069,6 +3084,7 @@ llm_graph_params llama_context::graph_params(
         /*.h_nextn_src   =*/ supports_state_row() ? cparams.ctx_state_src->get_h_nextn_dev() : nullptr,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
+        /*.n_kv_max    =*/ n_kv_max,
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
     };
@@ -4428,6 +4444,7 @@ llama_context_params llama_context_default_params() {
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
+        /*.kv_cache_size               =*/ 0,
     };
 
     return result;
@@ -4607,6 +4624,10 @@ uint32_t llama_n_rs_seq(const llama_context * ctx) {
     return ctx->get_cparams().n_rs_seq;
 }
 
+bool llama_kv_unified(const llama_context * ctx) {
+    return ctx->get_cparams().kv_unified;
+}
+
 const llama_model * llama_get_model(const llama_context * ctx) {
     return &ctx->get_model();
 }
@@ -4652,6 +4673,10 @@ void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {
 
 bool llama_get_causal_attn(const llama_context * ctx) {
     return ctx->get_causal_attn();
+}
+
+void llama_set_n_kv_max(llama_context * ctx, int64_t n_kv_max) {
+    ctx->set_n_kv_max(n_kv_max);
 }
 
 void llama_synchronize(llama_context * ctx) {
@@ -4936,6 +4961,35 @@ llama_pos llama_memory_seq_pos_max(
     }
 
     return mem->seq_pos_max(seq_id);
+}
+
+llama_pos llama_memory_seq_pos_max_recr(
+        llama_memory_t mem,
+          llama_seq_id seq_id) {
+    if (!mem) {
+        return -1;
+    }
+
+    return mem->seq_pos_max_recr(seq_id);
+}
+
+llama_pos llama_memory_seq_pos_max_partial(
+        llama_memory_t mem,
+          llama_seq_id seq_id) {
+    if (!mem) {
+        return -1;
+    }
+
+    return mem->seq_pos_max_partial(seq_id);
+}
+
+int32_t llama_memory_n_free_cells(
+        llama_memory_t mem) {
+    if (!mem) {
+        return -1;
+    }
+
+    return mem->n_free_cells();
 }
 
 bool llama_memory_can_shift(llama_memory_t mem) {

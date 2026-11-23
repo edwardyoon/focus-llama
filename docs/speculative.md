@@ -273,7 +273,7 @@ Use exactly one of these options:
 ### General Speculative Parameters
 
 ```
---spec-type [none|draft-simple|draft-eagle3|draft-dflash|draft-dflash2|draft-dspark|draft-lilicorr|draft-mtp|ngram-cache|ngram-simple|ngram-map-k|ngram-map-k4v|ngram-mod]
+--spec-type [none|draft-simple|draft-eagle3|draft-dflash|draft-dflash2|draft-dspark|draft-lilicorr|draft-mtp|draft-mtp-adaptive|ngram-cache|ngram-simple|ngram-map-k|ngram-map-k4v|ngram-mod]
                                         comma-separated list of types of speculative decoding to use
                                         (default: none)
                                         (env: LLAMA_ARG_SPEC_TYPE)
@@ -296,6 +296,9 @@ Use exactly one of these options:
 --spec-draft-n-min                      N
                                         minimum number of draft tokens to use for speculative decoding (default: 0)
                                         (env: LLAMA_ARG_SPEC_DRAFT_N_MIN)
+--spec-draft-n-min-adaptive                     N
+                                        minimum adaptive MTP draft depth; the depth starts here and never drops below it (default: 3)
+                                        (env: LLAMA_ARG_SPEC_DRAFT_N_MIN_ADAPTIVE)
 --spec-draft-n-ubatch                   N
                                         physical maximum batch size of the draft context, use a smaller value to spare VRAM (default: 0 - same as --n-ubatch)
                                         (env: LLAMA_ARG_SPEC_DRAFT_N_UBATCH)
@@ -421,6 +424,7 @@ Specifies a comma-separated list of speculative decoding types to use.
 | `draft-dspark` | Use a DSpark draft model (DFlash backbone + semi-autoregressive Markov head) |
 | `draft-lilicorr` | Use a LiliCorr draft model (DFlash + candidate scorer conditioned on the target's hidden state) |
 | `draft-mtp` | Use Multi Token Prediction (MTP) heads from the main model |
+| `draft-mtp-adaptive` | Use MTP heads from the main model with an adaptive draft depth that tracks the current acceptance rate |
 | `ngram-cache` | Use n-gram cache lookup |
 | `ngram-simple` | Use simple n-gram pattern matching |
 | `ngram-map-k` | Use n-gram pattern matching with n-gram-keys |

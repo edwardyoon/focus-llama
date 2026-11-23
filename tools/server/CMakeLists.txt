@@ -15,6 +15,17 @@ add_library(${TARGET} STATIC
     server-common.h
     server-decision.cpp
     server-decision.h
+    da-trace.h
+    da-tag.cpp
+    da-tag.h
+    kv-offload.cpp
+    kv-offload.h
+    sigma-strip.cpp
+    sigma-strip.h
+    da-layout.cpp
+    da-layout.h
+    recall-sanitize.cpp
+    recall-sanitize.h
     server-context.cpp
     server-context.h
     server-realtime.cpp
@@ -39,6 +50,12 @@ target_include_directories(${TARGET} PRIVATE ../mtmd)
 target_include_directories(${TARGET} PRIVATE ${PROJECT_SOURCE_DIR})
 target_link_libraries(${TARGET} PUBLIC llama-common mtmd ${CMAKE_THREAD_LIBS_INIT})
 target_link_libraries(${TARGET} PRIVATE vendor::hash)
+# server-context.cpp instantiates httplib::Client (common/http.h). Its layout
+# depends on CPPHTTPLIB_SSL_ENABLED (derived from CPPHTTPLIB_OPENSSL_SUPPORT),
+# which only the cpp-httplib target defines. Without it, Client is 8 bytes in
+# this TU vs 16 in libcpp-httplib.a -> ODR violation, stack canary corruption
+# in kv_offload_session_get (2026-09-28).
+target_link_libraries(${TARGET} PRIVATE cpp-httplib)
 
 # llama-server-impl: server logic, reusable by app
 

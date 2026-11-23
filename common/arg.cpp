@@ -341,9 +341,7 @@ common_models_handler common_models_handler_init(const common_params & params, l
     common_download_hf_plan plan_spec;
     common_download_opts opts;
 
-    const bool spec_type_draft_mtp = std::find(params.speculative.types.begin(),
-                                        params.speculative.types.end(),
-                                        COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+    const bool spec_type_draft_mtp = params.speculative.has_mtp();
 
     const bool spec_type_draft_dflash = std::find(params.speculative.types.begin(),
                                            params.speculative.types.end(),
@@ -1704,6 +1702,322 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.cache_ram_explicit = true;
         }
     ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--da-prompt-scan"},
+        {"--no-da-prompt-scan"},
+        "scan the rendered prompt for Declarative Attention layout markers ([[da:N]] or <da:N>, [[da:filler]] or <da:filler>, [[da:layout:N]] or <da:layout:N>) and let the model's <focus magic_chunks=\"N\"> tags restrict attention (default: disabled, fail-open to vanilla on any mismatch)",
+        [](common_params & params, bool value) {
+            params.da_prompt_scan = value;
+        }
+    ).set_env("LLAMA_ARG_DA_PROMPT_SCAN").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        {"--da-auto"},
+        {"--no-da-auto"},
+        "Declarative Attention auto-chunking: when the rendered prompt has no layout markers and is at least --da-min-ctx tokens, chunk it by message boundaries (\"Magic Chunk N\" labels) so the model's <focus magic_chunks=\"N\"> tags can restrict attention (default: disabled)",
+        [](common_params & params, bool value) {
+            params.da_auto = value;
+        }
+    ).set_env("LLAMA_ARG_DA_AUTO").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        {"--da-min-ctx"}, "N",
+        "da_auto: minimum prompt length (tokens) before auto-chunking kicks in (default: 0)",
+        [](common_params & params, int value) {
+            params.da_min_ctx = value;
+        }
+    ).set_env("LLAMA_ARG_DA_MIN_CTX").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        {"--da-chunk-tokens"}, "N",
+        "da_auto: target size (tokens) when splitting a long message into chunks (default: 2048)",
+        [](common_params & params, int value) {
+            params.da_chunk_tokens = value;
+        }
+    ).set_env("LLAMA_ARG_DA_CHUNK_TOKENS").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        {"--da-measure-only"},
+        {"--no-da-measure-only"},
+        "Declarative Attention measure-only mode: run the DA tag state machine and logging but skip all KV removals (apply_da_rm/apply_da_b), so the output stays vanilla. Used to measure the tag position (g) and emission rate on real traffic without touching the KV cache (default: disabled)",
+        [](common_params & params, bool value) {
+            params.da_measure_only = value;
+        }
+    ).set_env("LLAMA_ARG_DA_MEASURE_ONLY").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        {"--da-tail-keep"}, "N",
+        "Declarative Attention tail floor: the most recent N tokens before the removal boundary are always kept in the DA keep set (the union of the tag selection, the Sigma anchor and the tail), so the work in progress survives a B switch even when no magic_chunks tag covers it. 0 = legacy behavior (no floor) (default: 8192)",
+        [](common_params & params, int value) {
+            params.da_tail_keep = value;
+        }
+    ).set_env("LLAMA_ARG_DA_TAIL_KEEP").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        {"--da-b-min-remove"}, "N",
+        "Declarative Attention 2-stream (B): skip the B switch when fewer than N tokens would be removed (the switch cost - seq_cp, a second sequence id, the restore copy at release - outweighs a tiny removal; the output stays vanilla). 0 = always switch (default: 0)",
+        [](common_params & params, int value) {
+            params.da_b_min_remove = value;
+        }
+    ).set_env("LLAMA_ARG_DA_B_MIN_REMOVE").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        {"--da-scaffold-file"}, "PATH",
+        "da_auto: read the DA instruction text from this file instead of the built-in (mtime hot-reload: edits take effect on the next request; {n_total} is replaced with the total chunk count; a missing/unreadable file falls back to the built-in). Default: disabled (built-in instruction)",
+        [](common_params & params, const std::string & value) {
+            params.da_scaffold_file = value;
+        }
+    ).set_env("LLAMA_ARG_DA_SCAFFOLD_FILE").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    // NOTE: named --fm-offload (not --kv-offload): the standard llama.cpp
+    // -kvo/--kv-offload flag (KV cache offloading) already owns that name and
+    // the LLAMA_ARG_KV_OFFLOAD env var, so a --kv-offload here was silently
+    // consumed by the standard flag and params.kv_offload never parsed.
+    add_opt(common_arg(
+        {"--fm-offload"},
+        {"--no-fm-offload"},
+        "evict the oldest magic chunks to the FocusMemory store once the prompt exceeds --kv-offload-threshold (get-on-focus re-prefills them on demand) - replaces auto-compact (default: disabled)",
+        [](common_params & params, bool value) {
+            params.kv_offload = value;
+        }
+    ).set_env("LLAMA_ARG_FM_OFFLOAD").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        {"--kv-offload-threshold"}, "N",
+        "kv_offload: evict oldest chunks when the prompt reaches this many tokens (default: 150000)",
+        [](common_params & params, int value) {
+            params.kv_offload_threshold = value;
+        }
+    ).set_env("LLAMA_ARG_KV_OFFLOAD_THRESHOLD").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        {"--kv-cache-size"}, "N",
+        "physical KV buffer size in cells for the attention cache (0 = default: n_ctx_seq); decoupled from the logical position range - cells wrap while positions extend to -c",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("error: --kv-cache-size must be >= 0 (got " + std::to_string(value) + ")");
+            }
+            params.kv_cache_size = value;
+        }
+    ).set_env("LLAMA_ARG_KV_CACHE_SIZE").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        {"--kv-retain-tokens"}, "N",
+        "kv_offload: minimum number of recent tokens to keep in the KV cache beyond --kv-offload-threshold when evicting (0 = current behavior: evict down to the threshold only; default: 0)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("error: --kv-retain-tokens must be >= 0 (got " + std::to_string(value) + ")");
+            }
+            params.kv_retain_tokens = value;
+        }
+    ).set_env("LLAMA_ARG_KV_RETAIN_TOKENS").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        {"--kv-offload-holes"},
+        {"--no-kv-offload-holes"},
+        "kv_offload Option B: keep the evicted segments in the prompt and cut their KV out of the main sequence (seq_rm holes) instead of reducing the prompt text - the client keeps sending the full prompt and the next request re-prefills 1 token instead of the evicted tail (default: disabled)",
+        [](common_params & params, bool value) {
+            params.kv_offload_holes = value;
+        }
+    ).set_env("LLAMA_ARG_KV_OFFLOAD_HOLES").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        {"--kv-pin"},
+        {"--no-kv-pin"},
+        "kv_offload B4: pin the session's first user message (the original task spec) in the KV - eviction starts after it until the FocusMemory store releases the pin or the 4h+30min TTL backstop fires; off = the first user message is a normal evictable candidate (default: disabled)",
+        [](common_params & params, bool value) {
+            params.kv_pin = value;
+        }
+    ).set_env("LLAMA_ARG_KV_PIN").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        {"--kv-offload-high"}, "N",
+        "kv_offload holes-mode high watermark: with --kv-offload-holes, evict only when the session KV-resident (full prompt minus cumulative evicted) reaches N, then drain to --kv-offload-threshold in one shot; while threshold < resident < N the gate is idle (no per-turn evict/PUT/hole work). 0 = legacy per-turn behavior (default: 0)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("error: --kv-offload-high must be >= 0 (got " + std::to_string(value) + ")");
+            }
+            params.kv_offload_high = value;
+        }
+    ).set_env("LLAMA_ARG_KV_OFFLOAD_HIGH").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        {"--sigma-fetch"},
+        {"--no-sigma-fetch"},
+        "kv_offload: fetch the FocusMemory session state anchor (Σ) at offload time and append it to the DA scaffold (default: disabled - the offload-time snapshot is the last async extraction, which is stale right after an offload and can re-latch the model onto a finished task; enable to restore the anchor injection)",
+        [](common_params & params, bool value) {
+            params.kv_sigma_fetch = value;
+        }
+    ).set_env("LLAMA_ARG_SIGMA_FETCH").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        {"--sigma-strip"}, "MODE",
+        "sigma-strip (direction B): server-side prompt compression at the messages-JSON stage - off (default, no-op) | shadow (compute + log only, request body untouched) | on (rewrite the request's messages in place; the refresh/snapshot wiring is a later step)",
+        [](common_params & params, const std::string & value) {
+            if (value != "off" && value != "shadow" && value != "on") {
+                throw std::invalid_argument("error: --sigma-strip must be off, shadow or on (got '" + value + "')");
+            }
+            params.sigma_strip_mode = value;
+        }
+    ).set_env("LLAMA_ARG_SIGMA_STRIP").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        {"--sigma-strip-threshold"}, "FRAC",
+        "sigma-strip: advance the session's K boundary (and stub the older tool results) once usage (prompt tokens / --sigma-strip-window-tokens) reaches this fraction of the window (0-1, default: 0.70)",
+        [](common_params & params, const std::string & value) {
+            const double frac = std::stod(value);
+            if (frac <= 0.0 || frac >= 1.0) {
+                throw std::invalid_argument("error: --sigma-strip-threshold must be in (0,1) (got " + value + ")");
+            }
+            params.sigma_strip_threshold = frac;
+        }
+    ).set_env("LLAMA_ARG_SIGMA_STRIP_THRESHOLD").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        {"--sigma-strip-target"}, "FRAC",
+        "sigma-strip: K advances in one big jump until the stripped prompt reaches this fraction of the window (0-1, default: 0.35)",
+        [](common_params & params, const std::string & value) {
+            const double frac = std::stod(value);
+            if (frac <= 0.0 || frac >= 1.0) {
+                throw std::invalid_argument("error: --sigma-strip-target must be in (0,1) (got " + value + ")");
+            }
+            params.sigma_strip_target = frac;
+        }
+    ).set_env("LLAMA_ARG_SIGMA_STRIP_TARGET").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        {"--sigma-strip-min-keep-tokens"}, "N",
+        "sigma-strip: token floor - K never advances the stripped prompt below this many tokens (effective goal = max(--sigma-strip-target x window, N); 0 = off, default: 0)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("error: --sigma-strip-min-keep-tokens must be >= 0 (got " + std::to_string(value) + ")");
+            }
+            params.sigma_strip_min_keep_tokens = value;
+        }
+    ).set_env("LLAMA_ARG_SIGMA_STRIP_MIN_KEEP_TOKENS").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        {"--sigma-strip-keep-recent"}, "N",
+        "sigma-strip: keep the last N assistant tool rounds (tool_calls + their results) verbatim - K never crosses their start (default: 1)",
+        [](common_params & params, int value) {
+            if (value < 1) {
+                throw std::invalid_argument("error: --sigma-strip-keep-recent must be >= 1 (got " + std::to_string(value) + ")");
+            }
+            params.sigma_strip_keep_recent = value;
+        }
+    ).set_env("LLAMA_ARG_SIGMA_STRIP_KEEP_RECENT").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        {"--sigma-strip-window-tokens"}, "N",
+        "sigma-strip: the client context-window size in tokens (the usage denominator); 0 (default) = the -c context window (the feature stays inactive when -c is also unset)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("error: --sigma-strip-window-tokens must be >= 0 (got " + std::to_string(value) + ")");
+            }
+            params.sigma_strip_window_tokens = value;
+        }
+    ).set_env("LLAMA_ARG_SIGMA_STRIP_WINDOW_TOKENS").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        {"--sigma-strip-min-gain"}, "FRAC",
+        "sigma-strip: futility guard - do not advance K (or K_sum) when the expected token savings of the advance are below this fraction of the window (0 = off, 0-1, default: 0.05)",
+        [](common_params & params, const std::string & value) {
+            const double frac = std::stod(value);
+            if (frac < 0.0 || frac > 1.0) {
+                throw std::invalid_argument("error: --sigma-strip-min-gain must be in [0,1] (got " + value + ")");
+            }
+            params.sigma_strip_min_gain = frac;
+        }
+    ).set_env("LLAMA_ARG_SIGMA_STRIP_MIN_GAIN").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        {"--sigma-strip-rearm-delta"}, "FRAC",
+        "sigma-strip: futility guard - rearm deadband - do not advance K (or K_sum) while usage is still within this fraction of the window of the usage recorded after the last committed advance (0 = off, 0-1, default: 0.05)",
+        [](common_params & params, const std::string & value) {
+            const double frac = std::stod(value);
+            if (frac < 0.0 || frac > 1.0) {
+                throw std::invalid_argument("error: --sigma-strip-rearm-delta must be in [0,1] (got " + value + ")");
+            }
+            params.sigma_strip_rearm_delta = frac;
+        }
+    ).set_env("LLAMA_ARG_SIGMA_STRIP_REARM_DELTA").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        {"--sigma-strip-futility-bypass-usage"}, "FRAC",
+        "sigma-strip: futility guard hard-limit bypass - when the pre-advance usage reaches this fraction of the window, the min-gain and rearm gates are bypassed and the advance is allowed (a small-gain re-prefill is always cheaper than riding usage to 1.0 and the multi-minute native compact; 0 = no bypass, 0-1, default: 0.90)",
+        [](common_params & params, const std::string & value) {
+            const double frac = std::stod(value);
+            if (frac < 0.0 || frac > 1.0) {
+                throw std::invalid_argument("error: --sigma-strip-futility-bypass-usage must be in [0,1] (got " + value + ")");
+            }
+            params.sigma_strip_futility_bypass_usage = frac;
+        }
+    ).set_env("LLAMA_ARG_SIGMA_STRIP_FUTILITY_BYPASS_USAGE").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        {"--sigma-sum"}, "MODE",
+        "sigma-strip stage 2: whole-message removal of the older region replaced by a frozen summary block - off (default, stage 2 disabled) | rule (server generates the block from the removed messages, no focus-memory) | llm (fetch the block from focus-memory /sigma/refresh; rule fallback after repeated failures)",
+        [](common_params & params, const std::string & value) {
+            if (value != "off" && value != "rule" && value != "llm") {
+                throw std::invalid_argument("error: --sigma-sum must be off, rule or llm (got '" + value + "')");
+            }
+            params.sigma_sum_mode = value;
+        }
+    ).set_env("LLAMA_ARG_SIGMA_SUM").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        {"--sigma-sum-max-tokens"}, "N",
+        "sigma-strip stage 2: token budget for the summary block (0 = a sensible default is used, default: 0)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("error: --sigma-sum-max-tokens must be >= 0 (got " + std::to_string(value) + ")");
+            }
+            params.sigma_sum_max_tokens = value;
+        }
+    ).set_env("LLAMA_ARG_SIGMA_SUM_MAX_TOKENS").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        {"--sigma-sum-timeout-ms"}, "N",
+        "sigma-strip stage 2: focus-memory /sigma/refresh timeout in ms (llm mode, default: 10000)",
+        [](common_params & params, int value) {
+            if (value <= 0) {
+                throw std::invalid_argument("error: --sigma-sum-timeout-ms must be > 0 (got " + std::to_string(value) + ")");
+            }
+            params.sigma_sum_timeout_ms = value;
+        }
+    ).set_env("LLAMA_ARG_SIGMA_SUM_TIMEOUT_MS").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        {"--sigma-sum-fetch-cooldown-ms"}, "N",
+        "sigma-strip stage 2: cooldown in ms after a failed focus-memory /sigma/refresh before the next attempt (llm mode, default: 5000; 0 = retry every request)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("error: --sigma-sum-fetch-cooldown-ms must be >= 0 (got " + std::to_string(value) + ")");
+            }
+            params.sigma_sum_fetch_cooldown_ms = value;
+        }
+    ).set_env("LLAMA_ARG_SIGMA_SUM_FETCH_COOLDOWN_MS").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        {"--sigma-sum-drain"},
+        {"--no-sigma-sum-drain"},
+        "sigma-strip stage 2: after a PARTIAL Σ block is committed (llm mode), a background thread drains the remainder of the removed region (wait:false /sigma/refresh passes) and refreshes the block to the complete Σ (default: enabled)",
+        [](common_params & params, bool value) {
+            params.sigma_sum_drain = value;
+        }
+    ).set_env("LLAMA_ARG_SIGMA_SUM_DRAIN").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        {"--sigma-sum-drain-delay-ms"}, "N",
+        "sigma-strip stage 2: delay in ms between background Σ drain passes — spaces the 27B extraction calls so live chat can interleave on the shared (parallel=1) slot (default: 5000)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("error: --sigma-sum-drain-delay-ms must be >= 0 (got " + std::to_string(value) + ")");
+            }
+            params.sigma_sum_drain_delay_ms = value;
+        }
+    ).set_env("LLAMA_ARG_SIGMA_SUM_DRAIN_DELAY_MS").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        {"--sigma-sum-drain-timeout-ms"}, "N",
+        "sigma-strip stage 2: drain-only focus-memory /sigma/refresh timeout in ms (background Σ drain's fast path; 0 = fall back to --sigma-sum-timeout-ms, default: 120000)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("error: --sigma-sum-drain-timeout-ms must be >= 0 (got " + std::to_string(value) + ")");
+            }
+            params.sigma_sum_drain_timeout_ms = value;
+        }
+    ).set_env("LLAMA_ARG_SIGMA_SUM_DRAIN_TIMEOUT_MS").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        {"--sparse-gate-threshold"}, "PCT",
+        "DA sparse FA gate: use the sparse (gather) path only while the finite KV rows are at most PCT% of the cache, dense below that (1-100, default: 50)",
+        [](common_params & params, int value) {
+            params.sparse_gate_threshold = value;
+        }
+    ).set_env("LLAMA_ARG_SPARSE_GATE_THRESHOLD").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        {"--focus-memory-host"}, "URL",
+        "kv_offload: FocusMemory base URL for evict/recall (e.g. http://127.0.0.1:3900); empty disables the feature (default: empty)",
+        [](common_params & params, const std::string & value) {
+            params.focus_memory_host = value;
+        }
+    ).set_env("LLAMA_ARG_FOCUS_MEMORY_HOST").set_examples({ LLAMA_EXAMPLE_SERVER }));
+    add_opt(common_arg(
+        {"--focus-memory-token"}, "TOKEN",
+        "kv_offload: Bearer token for the FocusMemory evict/recall API (default: empty = no auth header)",
+        [](common_params & params, const std::string & value) {
+            params.focus_memory_token = value;
+        }
+    ).set_env("LLAMA_ARG_FOCUS_MEMORY_TOKEN").set_examples({ LLAMA_EXAMPLE_SERVER }));
     add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
@@ -4216,6 +4530,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft.n_min = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MIN"));
+    add_opt(common_arg(
+        {"--spec-draft-n-min-adaptive"}, "N",
+        string_format("minimum adaptive MTP draft depth; the depth starts here and never drops below it (default: %d)", params.speculative.draft.n_min_adaptive),
+        [](common_params & params, int value) {
+            if (value < 1) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.speculative.draft.n_min_adaptive = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MIN_ADAPTIVE"));
     add_opt(common_arg(
         {"--spec-draft-n-ubatch"}, "N",
         string_format("physical maximum batch size of the draft context, use a smaller value to spare VRAM (default: %d - same as --n-ubatch)", params.speculative.draft.n_ubatch),

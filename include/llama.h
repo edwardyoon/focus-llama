@@ -436,6 +436,11 @@ extern "C" {
         // a source/target/parent context
         // can be utilized in various ways, for example by sharing results or llama_memory between 2 contexts
         struct llama_context * ctx_other;
+
+        // physical KV buffer size in cells for the attention cache (0 = default: n_ctx_seq).
+        // decoupled from the logical position range: the buffer is allocated at this size and
+        // cells wrap around while positions may extend up to n_ctx
+        uint32_t kv_cache_size;
     };
 
     struct llama_model_tensor_override {
@@ -579,6 +584,7 @@ extern "C" {
     LLAMA_API uint32_t llama_n_ubatch   (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_seq_max  (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_rs_seq   (const struct llama_context * ctx);
+    LLAMA_API bool     llama_kv_unified (const struct llama_context * ctx);
 
     LLAMA_API const struct llama_model * llama_get_model   (const struct llama_context * ctx);
     LLAMA_API           llama_memory_t   llama_get_memory  (const struct llama_context * ctx);
@@ -834,6 +840,30 @@ extern "C" {
     LLAMA_API llama_pos llama_memory_seq_pos_max(
             llama_memory_t mem,
               llama_seq_id seq_id);
+
+    // Returns the largest position of the recurrent (stateful) side of a hybrid memory
+    // For a checkpoint that serializes only the recurrent state, the position label
+    // must match this value for the checkpoint to be resumable at that position
+    // Return -1 if the memory has no recurrent component, or the sequence is empty
+    LLAMA_API llama_pos llama_memory_seq_pos_max_recr(
+            llama_memory_t mem,
+              llama_seq_id seq_id);
+
+    // Returns the position at which a PARTIAL_ONLY state snapshot of the
+    // specified sequence can be resumed - the label a context checkpoint of the
+    // partial state must record. For memory whose partial snapshot covers only
+    // the recurrent state, this is the recurrent position, which can be higher
+    // than llama_memory_seq_pos_max() (min of attention and recurrent) when the
+    // attention side is hole-cut or otherwise truncated.
+    // Return -1 if the sequence is empty
+    LLAMA_API llama_pos llama_memory_seq_pos_max_partial(
+            llama_memory_t mem,
+              llama_seq_id seq_id);
+
+    // Returns the number of free cells in the memory
+    // Return -1 if the memory does not track cell occupancy
+    LLAMA_API int32_t llama_memory_n_free_cells(
+            llama_memory_t mem);
 
     // Check if the memory supports shifting
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
@@ -1124,6 +1154,14 @@ extern "C" {
 
     // Returns whether the context is currently using causal attention
     LLAMA_API bool llama_get_causal_attn(const struct llama_context * ctx);
+
+    // Set a runtime upper bound on the number of finite (attended) KV cells per attention
+    // mask row. Backends with a sparse flash-attention path (CUDA MMA_F16, Metal, Vulkan)
+    // gather only those cells instead of reading the whole KV cache; 0 (the default) keeps
+    // the dense behavior. The value must be >= the actual number of finite cells per row,
+    // otherwise the excess cells are silently dropped from the attention.
+    // Changing the value invalidates the cached compute graphs (rebuilt on the next batch).
+    LLAMA_API void llama_set_n_kv_max(struct llama_context * ctx, int64_t n_kv_max);
 
     // Set abort callback
     LLAMA_API void llama_set_abort_callback(struct llama_context * ctx, ggml_abort_callback abort_callback, void * abort_callback_data);
