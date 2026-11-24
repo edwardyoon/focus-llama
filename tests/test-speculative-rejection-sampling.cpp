@@ -5,6 +5,7 @@
 #include "log.h"
 
 #include <cmath>
+#include <clocale>
 #include <cstdlib>
 #include <cstring>
 #include <optional>
