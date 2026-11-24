@@ -196,9 +196,8 @@ bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_po
 }
 
 void llama_memory_hybrid_idx::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
-    // only whole sequences are copied: the recurrent state ignores the range, and a shared cell holds a single pool grouping
-    GGML_ASSERT(p0 <= 0 && p1 < 0 && "partial seq_cp is not supported");
-
+    // partial copies (the DA B switch keep-range) leave a removed range in the destination;
+    // the gap-aware kpool_layout_update regroups the destination around that range
     llama_memory_hybrid::seq_cp(seq_id_src, seq_id_dst, p0, p1);
 
     if (mem_idx) {
@@ -338,6 +337,13 @@ struct llama_memory_hybrid_idx::kpool_layout {
         std::vector<std::pair<llama_pos, uint32_t>> cells; // Position and stream local cell pairs, sorted by position.
         std::vector<uint32_t> pools;
 
+        // List indices where the positionally-contiguous runs start; front() is 0 while cells
+        // is non-empty. A removed range (the DA B switch partial seq_cp) breaks the contiguity:
+        // a pool chunk never crosses a run boundary, so the pool index, the by_order pool count
+        // and the tail below are computed within the token's own run.
+        std::vector<uint32_t> run_starts;
+        uint32_t n_runs_logged = 0; // last logged run count, diagnostic only
+
         // Where the pool scan stopped, so an append resumes instead of starting over.
         size_t j_next = 0;
     };
@@ -418,9 +424,11 @@ const llama_memory_hybrid_idx::kpool_layout & llama_memory_hybrid_idx::kpool_lay
         // speculative decoding edits the end of the sequence on each rejected draft, a full rebuild there costs O(n_ctx) per step
         const llama_pos stale = mem_idx_stale[s];
         bool keep = !sq.cells.empty() && !sp.empty() && sq.pos_min == sp.begin()->first && stale > sq.pos_min;
+        size_t cut_idx = 0;
         if (keep) {
             if (stale != POS_CLEAN) {
                 const auto cut = std::lower_bound(sq.cells.begin(), sq.cells.end(), std::make_pair(stale, uint32_t(0)));
+                cut_idx = cut - sq.cells.begin();
                 sq.cells.erase(cut, sq.cells.end());
                 while (!sq.pools.empty() && sq.pools.back() + kpool > sq.cells.size()) {
                     sq.pools.pop_back();
@@ -442,20 +450,38 @@ const llama_memory_hybrid_idx::kpool_layout & llama_memory_hybrid_idx::kpool_lay
             sq.pos_min = sp.empty() ? 0 : sp.begin()->first;
         }
 
+        // track the run starts (see run_starts): a plain append extends the last run in place,
+        // a partial regroup keeps the unchanged prefix's runs and re-scans from the cut, a full
+        // regroup scans everything
+        if (!(keep && stale == POS_CLEAN)) {
+            if (cut_idx > 0) {
+                // the prefix [0, cut) is unchanged: its run starts survive, except those at or
+                // after the cut, whose run is re-scanned below
+                while (sq.run_starts.size() > 1 && sq.run_starts.back() >= cut_idx) {
+                    sq.run_starts.pop_back();
+                }
+            } else {
+                sq.run_starts = { 0 };
+            }
+            if (!sq.cells.empty()) {
+                for (size_t i = cut_idx > 0 ? cut_idx : 1; i < sq.cells.size(); ++i) {
+                    if (sq.cells[i].first != sq.cells[i - 1].first + 1) {
+                        sq.run_starts.push_back((uint32_t) i);
+                    }
+                }
+            } else {
+                sq.run_starts.clear();
+            }
+        }
+
         // Pools start at the first valid token
         size_t j = sq.j_next;
         if (hparams_idx.indexer_kpool_by_order) {
-            // consecutive cells in sequence order, whatever their positions
-            for (; j + kpool <= sq.cells.size(); j += kpool) {
-                sq.pools.push_back((uint32_t) j);
-            }
-        } else {
+            // consecutive cells in sequence order; a removed range (a gap) breaks the run, so no
+            // pool mixes two ranges: the partial run before a gap is not pooled, the regroup
+            // resumes at the first kept cell after it
             while (j + kpool <= sq.cells.size()) {
                 const llama_pos p0 = sq.cells[j].first;
-                if ((p0 - sq.pos_min) % (llama_pos) kpool != 0) {
-                    ++j;
-                    continue;
-                }
                 bool ok = true;
                 for (uint32_t k = 1; k < kpool; ++k) {
                     if (sq.cells[j + k].first != p0 + (llama_pos) k) {
@@ -470,8 +496,55 @@ const llama_memory_hybrid_idx::kpool_layout & llama_memory_hybrid_idx::kpool_lay
                     ++j;
                 }
             }
+        } else {
+            // position-aligned chunks; a removed range (a gap) drops the partial chunk and
+            // realigns the grid at the first kept position after it, so the chunks of the
+            // following run stay kpool consecutive positions
+            llama_pos align = sq.pos_min;
+            while (j + kpool <= sq.cells.size()) {
+                const llama_pos p0 = sq.cells[j].first;
+                if (p0 % (llama_pos) kpool != align % (llama_pos) kpool) {
+                    align = p0;
+                    continue;
+                }
+                bool ok = true;
+                uint32_t k0 = 0;
+                for (uint32_t k = 1; k < kpool; ++k) {
+                    if (sq.cells[j + k].first != p0 + (llama_pos) k) {
+                        ok = false;
+                        k0 = k;
+                        break;
+                    }
+                }
+                if (ok) {
+                    sq.pools.push_back((uint32_t) j);
+                    j += kpool;
+                } else {
+                    // cells j..j+k0-1 are the partial chunk before the gap: not pooled
+                    align = sq.cells[j + k0].first;
+                    j += k0;
+                }
+            }
         }
         sq.j_next = j;
+
+        // diagnostic: fires once per gap-state change (B switch creates the runs, release drops them),
+        // so the journal shows the exact QSA layout right where a gapped sequence appears or leaves
+        const uint32_t n_runs = (uint32_t) sq.run_starts.size();
+        if (n_runs != sq.n_runs_logged) {
+            if (n_runs > 1) {
+                std::string starts;
+                for (uint32_t i = 0; i < n_runs; ++i) {
+                    starts += std::to_string(sq.run_starts[i]);
+                    if (i + 1 < n_runs) {
+                        starts += ",";
+                    }
+                }
+                LLAMA_LOG_WARN("hybrid_idx: seq %d kpool gap: %u run(s) [starts %s], %zu cell(s), %zu pool(s), kpool %u\n",
+                        s, n_runs, starts.c_str(), sq.cells.size(), sq.pools.size(), kpool);
+            }
+            sq.n_runs_logged = n_runs;
+        }
 
         lay.n_pool_real += (uint32_t) sq.pools.size();
     }
@@ -709,8 +782,17 @@ void llama_memory_hybrid_idx_context::kpool_build_state(const llama_ubatch & uba
             if (by_order) {
                 const int64_t r = kpool_rank(sq.cells, p, sinfo->idxs[i / n_tps][i % n_tps]);
                 GGML_ASSERT(r >= 0);
-                if ((size_t) r / kpool < sq.pools.size()) {
-                    mark(s, (size_t) r / kpool);
+                // the pool containing the token: the pools of the earlier runs plus the chunk
+                // within its own run (a run regroups from its own start, not at a multiple of kpool)
+                const auto & rs = sq.run_starts;
+                const size_t rk = std::upper_bound(rs.begin(), rs.end(), (uint32_t) r) - rs.begin();
+                size_t pi = 0;
+                for (size_t i2 = 1; i2 < rk; ++i2) {
+                    pi += (rs[i2] - rs[i2 - 1]) / kpool;
+                }
+                pi += (size_t) ((r - (int64_t) rs[rk - 1]) / kpool);
+                if (pi < sq.pools.size()) {
+                    mark(s, pi);
                 }
                 continue;
             }
@@ -949,8 +1031,22 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
 
             const uint32_t p0 = seq_pool_start[s];
             const uint32_t p1 = p0 + (uint32_t) lay.seqs[s].pools.size();
-            const uint32_t nv = by_order ? std::min(p1 - p0, (uint32_t) ((rank[i] + 1)/kpool)) :
-                (uint32_t) (std::upper_bound(pool_end.begin() + p0, pool_end.begin() + p1, p) - (pool_end.begin() + p0));
+            uint32_t nv;
+            if (by_order) {
+                // visible pools: the pools of the runs before the token's own run plus the
+                // complete chunks of that run at or before the token (a run regroups from its
+                // own start, not from the sequence start)
+                const auto & sqm = lay.seqs[s];
+                const auto & rs  = sqm.run_starts;
+                const size_t rk  = std::upper_bound(rs.begin(), rs.end(), (uint32_t) rank[i]) - rs.begin();
+                uint32_t before  = 0;
+                for (size_t i2 = 1; i2 < rk; ++i2) {
+                    before += (uint32_t) ((rs[i2] - rs[i2 - 1]) / kpool);
+                }
+                nv = std::min<uint32_t>(p1 - p0, before + (uint32_t) ((rank[i] - (int64_t) rs[rk - 1] + 1) / kpool));
+            } else {
+                nv = (uint32_t) (std::upper_bound(pool_end.begin() + p0, pool_end.begin() + p1, p) - (pool_end.begin() + p0));
+            }
             std::fill(row + p0, row + p0 + nv, keep);
 
             // Finite visible pools occupy the first min(nv, n_top) ranked slots.
@@ -974,9 +1070,15 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
         const llama_pos    p = ubatch->pos[i];
         const auto & sq = lay.seqs[s];
 
-        const uint32_t n_tail = by_order ?
-            (uint32_t) ((rank[i] + 1) % kpool) :
-            (uint32_t) ((p - sq.pos_min + 1) % (llama_pos) kpool);
+        // the tail covers the chunk of the token's own run: a run regroups from its own start,
+        // so the mod counts from the run's first cell, not the sequence start. With a single
+        // run this reduces to the original formulas in both modes
+        const int64_t r = by_order ? rank[i] :
+            (int64_t) (std::lower_bound(sq.cells.begin(), sq.cells.end(), std::make_pair(p, 0u)) - sq.cells.begin());
+        const auto & rs = sq.run_starts;
+        const size_t rk = std::upper_bound(rs.begin(), rs.end(), (uint32_t) r) - rs.begin();
+        const uint32_t n_tail = rs.empty() ? 0 :
+            (uint32_t) ((r - (int64_t) rs[rk - 1] + 1) % (int64_t) kpool);
 
         for (uint32_t k = 0; k < kpool - 1; ++k) {
             int32_t cell = sentinel;
