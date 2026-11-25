@@ -5,10 +5,35 @@ bool da_tag_start_allowed(const std::string & text, size_t lt, da_mode_t mode) {
     if (lt == 0) {
         return true;
     }
-    // 기존: return (unsigned char) text[lt - 1] == '\n';
-    
-    // 수정: 직전 문자가 영문/숫자(단어의 일부)가 아니기만 하면 허용 (공백, 구두점, 다른 태그 등 허용)
-    return !std::isalnum((unsigned char) text[lt - 1]);
+    const unsigned char prev = (unsigned char) text[lt - 1];
+
+    // never inside code (mention, not control)
+    if (da_in_code_span(text, lt)) {
+        return false;
+    }
+
+    // line start: the original rule
+    if (prev == '\n') {
+        return true;
+    }
+
+    // directly after text without a newline, e.g. "...확인하겠습니다.<focus ...>":
+    //  - non-ASCII byte (end of a UTF-8 character, i.e. Korean text)
+    //  - sentence terminator
+    if (prev >= 0x80) {
+        return true;
+    }
+    switch (prev) {
+        case '.': case '!': case '?': case ':': case ';':
+        case '>':   // right after another tag, e.g. "</think><focus"
+            return true;
+        default:
+            break;
+    }
+
+    // everything else (alnum, space, quotes, brackets, '=', '(' ...) is
+    // treated as a mention inside prose: "use <focus magic_chunks=..>"
+    return false;
 }
 
 namespace {

@@ -3312,28 +3312,10 @@ private:
                     const size_t len = cl.size();
                     g.erase(i, len);
                     if (slot.n_sent_text > i)
-                        slot.n_sent_text = (slot.n_sent_text >= i+len) ? slot.n_sent_text-len : i;
+                        slot.n_sent_text = (slot.n_sent_text >= i + len) ? slot.n_sent_text - len : i;
                     continue;
                 }
                 i++;
-            }
-            // [신규] orphan opener: 열린 것들 제거 (파서가 인식 못해 content로 누수된 것)
-            // tool_calls 파싱이 끝난 후 최종 scrub에서 실행되어야 하므로
-            // send_final_response 직전에 별도 호출이 필요할 수 있음
-            if (bal > 0) {
-                // 끝까지 닫히지 않은 opener들을 뒤에서부터 제거
-                size_t pos = g.size();
-                while (bal > 0) {
-                    pos = g.rfind(op, pos - 1);
-                    if (pos == std::string::npos) break;
-                    // 해당 opener부터 끝까지가 orphan
-                    // 정확히는 해당 opener의 끝 위치부터 파일 끝까지
-                    size_t op_end = pos + op.size();
-                    g.erase(pos, g.size() - pos);
-                    if (slot.n_sent_text > pos)
-                        slot.n_sent_text = pos;
-                    bal--;
-                }
             }
         }
     }
