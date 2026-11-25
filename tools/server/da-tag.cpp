@@ -1,5 +1,33 @@
 #include "da-tag.h"
 
+// A tag the model writes inside code is a mention, not a control signal.
+// true if the '<' at `lt` sits inside an open fenced block (odd number of ```
+// before it) or an open inline span (odd number of backticks on the current
+// line before it).
+static bool da_in_code_span(const std::string & text, size_t lt) {
+    size_t fences = 0;
+    for (size_t i = 0; i + 2 < lt; ) {
+        if (text[i] == '`' && text[i + 1] == '`' && text[i + 2] == '`') {
+            fences++;
+            i += 3;
+        } else {
+            i++;
+        }
+    }
+    if (fences % 2 == 1) {
+        return true;
+    }
+    size_t ls = text.rfind('\n', lt == 0 ? 0 : lt - 1);
+    ls = (ls == std::string::npos || ls >= lt) ? 0 : ls + 1;
+    size_t ticks = 0;
+    for (size_t i = ls; i < lt; i++) {
+        if (text[i] == '`') {
+            ticks++;
+        }
+    }
+    return ticks % 2 == 1;
+}
+
 bool da_tag_start_allowed(const std::string & text, size_t lt, da_mode_t mode) {
     (void) mode;
     if (lt == 0) {
