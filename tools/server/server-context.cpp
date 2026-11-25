@@ -9001,6 +9001,13 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             const bool da_media = task.tokens.has_mtmd &&
                     task.tokens.find_next_media_chunk(0).first != nullptr;
 
+            // hybrid/recurrent: DA restriction is gated off (recurrent tail), so the
+            // [Magic Chunk N] headers only break prefix reuse - skip the chunking,
+            // keep kv-offload eviction + holes (same path as media prompts)
+            const bool da_hybrid_skip = llama_model_is_hybrid(ctx_server.model_tgt) ||
+                                        llama_model_is_recurrent(ctx_server.model_tgt);
+            const bool da_nochunk = da_media || (da_hybrid_skip && params.kv_offload_holes);
+
             // (2026-10-13) A media prompt used to skip EVERY budget gate (both
             // DA paths below required !da_media, and the kv-offload reject gate
             // is nested inside the P4 branch), so an over-buffer media prompt
@@ -9583,19 +9590,23 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                 // NULL media placeholders; text_to_arr recovers each text token's
                 // array index, and pos_next maps it to a KV position (media
                 // chunks occupy more KV cells than array tokens).
-                if (da_media && params.kv_offload_holes && !evicted_segs.empty()) {
-                    const llama_tokens text_toks = task.tokens.get_text_tokens();
+                if (da_nochunk && params.kv_offload_holes && !evicted_segs.empty()) {
+                    // has_mtmd is true whenever an mmproj is loaded, so use the same
+                    // split as the P1 scan: get_tokens() asserts on has_mtmd
+                    const llama_tokens text_toks = task.tokens.has_mtmd
+                            ? task.tokens.get_text_tokens()
+                            : task.tokens.get_tokens();
                     std::vector<int64_t> text_to_arr(text_toks.size());
                     int64_t t = 0;
                     for (size_t a = 0; a < task.tokens.size() && t < (int64_t) text_toks.size(); a++) {
                         if (task.tokens[a] != LLAMA_TOKEN_NULL) text_to_arr[t++] = (int64_t) a;
                     }
                     const std::vector<size_t> offs = da_token_offsets_lenient(ctx_server.vocab, da_prompt, text_toks);
-                    if (offs.empty() || (size_t) t != text_toks.size()) {
-                        // Fail-closed: without holes the full prompt (text + media)
-                        // would exceed the buffer mid-prefill. A retry cannot fix a
-                        // media prompt, so reject with 400 (the message avoids the
-                        // client's context-overflow trigger words).
+                    const bool map_ok = !offs.empty() && (size_t) t == text_toks.size();
+
+                    if (!map_ok && da_media) {
+                        // media: without holes the full prompt (text + media) would exceed
+                        // the buffer mid-prefill and a retry cannot fix it -> 400 as before
                         SRV_WRN("kv_offload-holes(media): char->token mapping failed (drift) - rejecting, no holes to cut (session=%s)\n", kv_session.c_str());
                         res->error(format_error_response(
                             string_format("conversation is larger than this server's KV buffer capacity: %d tokens > %d cell budget (--kv-cache-size %d). Start a new session with the image, describe it in text instead, or raise --kv-cache-size.",
@@ -9603,21 +9614,28 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                             ERROR_TYPE_EXCEED_CONTEXT_SIZE));
                         return res;
                     }
-                    for (auto & seg : evicted_segs) {
-                        const int32_t t_lo = da_char_to_token_nearest(offs, seg.range_lo);
-                        const int32_t t_hi = da_char_to_token_nearest(offs, seg.range_hi);
-                        if (t_lo < 0 || t_hi < 0 || t_hi <= t_lo ||
-                                t_lo >= (int32_t) text_to_arr.size() || t_hi >= (int32_t) text_to_arr.size()) {
-                            SRV_WRN("kv_offload-holes(media): failed to map evicted segment %s to a token range - skipping its hole\n", seg.key.c_str());
-                            continue;
-                        }
-                        const int32_t kv_lo = (int32_t) task.tokens.pos_next(text_to_arr[t_lo]);
-                        const int32_t kv_hi = (int32_t) task.tokens.pos_next(text_to_arr[t_hi]);
-                        task.params.kv_hole_pending.push_back({ kv_lo, kv_hi });
-                        SRV_INF("kv_offload-holes(media): pending hole %s -> kv [%d, %d) (%d)\n",
-                                seg.key.c_str(), kv_lo, kv_hi, kv_hi - kv_lo);
+                    if (!map_ok) {
+                        // hybrid text: fail-open. No holes this turn; the task-start
+                        // prefill-peak guard (503, retryable) still protects the buffer.
+                        SRV_WRN("kv_offload-holes(hybrid): char->token mapping failed (drift) - no holes this turn (session=%s)\n", kv_session.c_str());
                     }
-                    // The slot learns its kv_session from this (the cut ledger is
+                    if (map_ok) {
+                        for (auto & seg : evicted_segs) {
+                            const int32_t t_lo = da_char_to_token_nearest(offs, seg.range_lo);
+                            const int32_t t_hi = da_char_to_token_nearest(offs, seg.range_hi);
+                            if (t_lo < 0 || t_hi < 0 || t_hi <= t_lo ||
+                                    t_lo >= (int32_t) text_to_arr.size() || t_hi >= (int32_t) text_to_arr.size()) {
+                                SRV_WRN("kv_offload-holes(media): failed to map evicted segment %s to a token range - skipping its hole\n", seg.key.c_str());
+                                continue;
+                            }
+                            const int32_t kv_lo = (int32_t) task.tokens.pos_next(text_to_arr[t_lo]);
+                            const int32_t kv_hi = (int32_t) task.tokens.pos_next(text_to_arr[t_hi]);
+                            task.params.kv_hole_pending.push_back({ kv_lo, kv_hi });
+                            SRV_INF("kv_offload-holes(media): pending hole %s -> kv [%d, %d) (%d)\n",
+                                    seg.key.c_str(), kv_lo, kv_hi, kv_hi - kv_lo);
+                        }
+                    }
+                    // the slot learns its kv_session from this (the cut ledger is
                     // keyed by it); host/token/vocab are needed for PUT/recall.
                     task.params.kv_offload_session = kv_session;
                     task.params.kv_offload_host    = params.focus_memory_host;
@@ -9664,7 +9682,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                 // set-tokens path below is skipped and the original mtmd
                 // task.tokens (with the image) is kept.
                 const da_auto_layout layout =
-                        da_media ? da_auto_layout()
+                        da_nochunk ? da_auto_layout()
                                  : da_auto_chunk(ctx_server.vocab, da_prompt, params.da_chunk_tokens, offloaded_hints, evict_bounds, sigma_anchor, params.da_scaffold_file);
                 if (layout.ok) {
                     const llama_tokens  toks = common_tokenize(ctx_server.vocab, layout.modified, true, true);
