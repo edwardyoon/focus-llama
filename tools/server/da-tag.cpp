@@ -1,11 +1,14 @@
 #include "da-tag.h"
 
 bool da_tag_start_allowed(const std::string & text, size_t lt, da_mode_t mode) {
-    (void) mode;  // the start rule no longer depends on the mode (S1-CLOSE)
+    (void) mode;
     if (lt == 0) {
         return true;
     }
-    return (unsigned char) text[lt - 1] == '\n';
+    // 기존: return (unsigned char) text[lt - 1] == '\n';
+    
+    // 수정: 직전 문자가 영문/숫자(단어의 일부)가 아니기만 하면 허용 (공백, 구두점, 다른 태그 등 허용)
+    return !std::isalnum((unsigned char) text[lt - 1]);
 }
 
 namespace {

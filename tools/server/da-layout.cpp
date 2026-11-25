@@ -913,6 +913,7 @@ da_auto_layout da_auto_chunk(const llama_vocab * vocab, const std::string & text
         }
     }
     out.tail_pos = msgs[last_user].start + total_header_len;
+    out.evict_chunk_span = std::move(evict_chunk_span);
     out.ok       = true;
     return out;
 }

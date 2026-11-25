@@ -495,6 +495,12 @@ struct server_slot {
     // A holes are baked into the cached sequence (clear), a B slot that
     // returned to the original sequence mid-decode keeps its cache.
     bool da_removed_a = false;
+    // kv-offload-holes x DA B switch: keep tokens apply_da_b excluded from the
+    // da_seq copy because their KV cells are physically holed (seq_cp copies
+    // tagged cells only). >0 at request end means the FOCUS read set was
+    // smaller than the tag-derived keep set. Re-measured at every B switch
+    // (holds the last switch's value).
+    size_t da_keep_holed = 0;
     // kv-offload Option B (--kv-offload-holes): holes cut into this slot's MAIN
     // sequence at eviction time (the evicted segments' KV is removed via
     // llama_memory_seq_rm, positions are NOT re-based). They persist across
@@ -2865,6 +2871,20 @@ private:
         return true;
     }
 
+    static size_t tool_opening_hold(const std::string & s) {
+        static const std::string ops[] = {"<tool_call>", "<function=", "<parameter="};
+        static const std::string cls[] = {"</tool_call>", "</function>", "</parameter>"};
+        size_t hold = 0;
+        for (size_t i = 0; i < 3; ++i) {
+            const size_t po = s.rfind(ops[i]);
+            if (po == std::string::npos) continue;
+            const size_t pc = s.rfind(cls[i]);
+            if (pc != std::string::npos && pc > po) continue; // 이미 닫힘
+            hold = std::max(hold, s.size() - po);
+        }
+        return hold;
+    }
+
     static size_t tool_closing_hold(const std::string & s) {
         static const std::string cls[] = {"</tool_call>","</function>","</parameter>"};
         for (const auto & c : cls)
@@ -2940,11 +2960,43 @@ private:
                 size_t da_hold = 0;
                 if (!slot.task->params.da_chunks.empty()) {
                     da_hold = da_tag_hold_len(unsent, slot.da_mode);
+                    // Inside an open tool call a DA tag is data, not a control
+                    // signal (same judgment as the in_tool gate in apply_da_tag):
+                    // holding it back withers the call text at the wire
+                    // (2026-11-25 mcp__focus truncation).
+                    const std::string & g = slot.generated.text;
+                    const std::string tc_o = std::string("<")  + "tool_call>";
+                    const std::string tc_c = std::string("</") + "tool_call>";
+                    const size_t po = g.rfind(tc_o);
+                    const size_t pc = g.rfind(tc_c);
+                    if (po != std::string::npos && (pc == std::string::npos || pc < po)) {
+                        da_hold = 0;   // tool call 안에서는 DA 태그가 데이터
+                    }
                 }
                 // tool-call 닫힘 홀드백: DA 활성 여부와 무관하게 항상 적용
-                const size_t hold = std::max(da_hold, tool_closing_hold(unsent));
+                const size_t hold = std::max({da_hold, tool_closing_hold(unsent), tool_opening_hold(unsent)});
+
+                if (hold > 0) {
+                    SLT_INF(slot, "da_wire: HOLD da=%zu tc=%zu tail='%s'\n", da_hold, tool_closing_hold(unsent),
+                            dbg_esc(unsent.substr(unsent.size() > 40 ? unsent.size() - 40 : 0), 60).c_str());
+                }
                 if (da_eog && hold > 0) {
-                    slot.generated.text.resize(slot.generated.text.size() - hold);
+                    // Drop the held fragment only when it is a DA tag prefix:
+                    // at EOG it can no longer grow into anything else and a
+                    // partial tag must not leak to the client. Any other held
+                    // text is kept and flushed with this token - losing
+                    // generated content is worse than a dangling closing-tag
+                    // prefix at the tail.
+                    const std::string held = slot.generated.text.substr(slot.generated.text.size() - hold);
+                    const bool is_da_prefix =
+                        held.rfind("<focus", 0) == 0 || held.rfind("<local", 0) == 0 ||
+                        held.rfind("</focus", 0) == 0 || held.rfind("</local", 0) == 0 ||
+                        held.rfind("<global", 0) == 0 || held.rfind("</global", 0) == 0;
+                    if (is_da_prefix) {
+                        slot.generated.text.resize(slot.generated.text.size() - hold);
+                    } else {
+                        SLT_WRN(slot, "da_wire: keeping held tail on EOG: '%s'\n", dbg_esc(held, 80).c_str());
+                    }
                 }
                 const size_t send_end = slot.generated.text.size() - (da_eog ? 0 : hold);
 
@@ -3236,24 +3288,52 @@ private:
     // headless tool-call closing scrubber (DA erase와 동일 패턴)
     static void scrub_headless_tool_closings(server_slot & slot) {
         static const std::pair<std::string,std::string> fam[] = {
-            {"<tool_call>", "</tool_call>"},
-            {"<function=",  "</function>"},
-            {"<parameter=", "</parameter>"},
+            {"<tool_call>",  "</tool_call>"},
+            {"<function=",   "</function>"},
+            {"<parameter=",  "</parameter>"},
         };
         std::string & g = slot.generated.text;
         for (const auto & [op, cl] : fam) {
-            int bal = 0; size_t i = 0;
+            int bal = 0;
+            size_t i = 0;
             while (i < g.size()) {
-                if (g.compare(i, op.size(), op) == 0) { bal++; i += op.size(); continue; }
+                if (g.compare(i, op.size(), op) == 0) {
+                    bal++;
+                    i += op.size();
+                    continue;
+                }
                 if (g.compare(i, cl.size(), cl) == 0) {
-                    if (bal > 0) { bal--; i += cl.size(); continue; }  // 정상 닫힘
+                    if (bal > 0) {
+                        bal--;
+                        i += cl.size();
+                        continue;   // 정상 닫힘
+                    }
+                    // headless closing: opener 없이 닫힌 것 제거
                     const size_t len = cl.size();
-                    g.erase(i, len);                                    // headless → 제거
+                    g.erase(i, len);
                     if (slot.n_sent_text > i)
                         slot.n_sent_text = (slot.n_sent_text >= i+len) ? slot.n_sent_text-len : i;
                     continue;
                 }
                 i++;
+            }
+            // [신규] orphan opener: 열린 것들 제거 (파서가 인식 못해 content로 누수된 것)
+            // tool_calls 파싱이 끝난 후 최종 scrub에서 실행되어야 하므로
+            // send_final_response 직전에 별도 호출이 필요할 수 있음
+            if (bal > 0) {
+                // 끝까지 닫히지 않은 opener들을 뒤에서부터 제거
+                size_t pos = g.size();
+                while (bal > 0) {
+                    pos = g.rfind(op, pos - 1);
+                    if (pos == std::string::npos) break;
+                    // 해당 opener부터 끝까지가 orphan
+                    // 정확히는 해당 opener의 끝 위치부터 파일 끝까지
+                    size_t op_end = pos + op.size();
+                    g.erase(pos, g.size() - pos);
+                    if (slot.n_sent_text > pos)
+                        slot.n_sent_text = pos;
+                    bal--;
+                }
             }
         }
     }
@@ -3285,6 +3365,51 @@ private:
                     (int) slot.da_seq, (int) slot.da_bound,
                     slot.da_keep_count, slot.n_da_removed,
                     (int) slot.prompt.n_tokens());
+
+            // holes state at request end (ungated): paired with the line
+            // above, it lets a post-mortem see whether the request ran with
+            // kv-offload holes, how much of the keep set was holed at the
+            // last B switch, and the final n_kv_max bound - the three
+            // quantities an early-EOS post-mortem needs (2026-11-25).
+            if (slot.kv_holes_active && !slot.kv_hole_ranges.empty()) {
+                int64_t hspan = 0;
+                for (const auto & h : slot.kv_hole_ranges) {
+                    hspan += (int64_t) (h.second - h.first);
+                }
+                SLT_INF(slot, "da: request complete holes: %zu range(s) span=%lld, keep_holed=%zu, n_kv_max=%lld\n",
+                        slot.kv_hole_ranges.size(), (long long) hspan, slot.da_keep_holed, (long long) da_n_kv_max_last);
+            }
+
+            // EOS forensics (ungated, 2026-11-25 B-switch early-EOS batch):
+            // one line that discriminates the remaining suspects at request
+            // end. Dwell per mode separates a stable semantic band (same
+            // order of magnitude every incident) from scattered numerical
+            // behaviour; the antml open/close balance plus mid_call_eos pin
+            // down whether the EOS landed inside an unclosed tool call; tail
+            // is the last generated text (DA tags already erased) before the
+            // stop. Counts the antml think / tool-call open-close markers that
+            // qwen3.8 emits; the tool_call pair the L5 check below uses is
+            // dead for this model.
+            {
+                const std::string & g = slot.generated.text;
+                const size_t E = g.size();
+                const int n_antml_open  = dbg_count(g, "</think>", E);
+                const int n_antml_close = dbg_count(g, "</think>", E);
+                const int n_fn_open     = dbg_count(g, "<function=", E);
+                const int n_fn_close    = dbg_count(g, "</function>", E);
+                const bool mid_call_eos = (slot.stop == STOP_TYPE_EOS) &&
+                                          ((n_antml_open > n_antml_close) || (n_fn_open > n_fn_close));
+                SLT_INF(slot, "da: req-end eos-forensics: stop=%d mode=%s n_gen=%d dwell g/f/l=%lu/%lu/%lu trans=%lu antml o/c=%d/%d fn o/c=%d/%d mid_call_eos=%d tail='%s'\n",
+                        (int) slot.stop,
+                        slot.da_mode == DA_MODE_GLOBAL ? "GLOBAL" : (slot.da_mode == DA_MODE_FOCUS ? "FOCUS" : "LOCAL"),
+                        (int) slot.stats.n_gen,
+                        (unsigned long) slot.stats.da_tokens_global,
+                        (unsigned long) slot.stats.da_tokens_focus,
+                        (unsigned long) slot.stats.da_tokens_local,
+                        (unsigned long) slot.stats.da_n_transitions,
+                        n_antml_open, n_antml_close, n_fn_open, n_fn_close, (int) mid_call_eos,
+                        dbg_esc(g.substr(E > 300 ? E - 300 : 0), 320).c_str());
+            }
 
             // L5: leak detection at request end (before generated_text is
             // moved into the response) - unbalanced tool-call tags are the
@@ -3331,10 +3456,37 @@ private:
 #endif
         }
 
+        // da_wire (2026-11-25): capture the full generated text before the
+        // non-stream path moves slot.generated, so the final response can
+        // recover tool calls from the raw text when the streaming parser
+        // accumulated less input than the model emitted.
+        res->da_full_text = slot.generated.text;
+
         // in stream mode, content and tokens are already in last partial chunk
         if (slot.task->params.stream) {
-            res->content     = {};
-            res->tokens      = llama_tokens{};
+            // da_wire (2026-11-25): decisive parser-input marker, read
+            // BEFORE the branch reconciles n_sent_text. With a final
+            // tool_calls=0, INPUT-TRUNCATED points at the stream/substr
+            // delivery path, INPUT-COMPLETE at the parser itself (or a
+            // token-mapping desync inside the PEG context). Stream-only:
+            // non-stream never advances n_sent_text and would always read
+            // TRUNCATED.
+            SLT_INF(slot, "da_wire: n_sent=%zu full=%zu => %s\n",
+                    slot.n_sent_text, slot.generated.text.size(),
+                    slot.n_sent_text == slot.generated.text.size() ? "INPUT-COMPLETE" : "INPUT-TRUNCATED");
+            // da_wire (2026-11-25): a held tail (DA tag / tool-closing
+            // holdback) may never have reached the stream. Feed it to the
+            // final parse so a tool call can still complete in the final
+            // diffs; the log line marks that the unsent-tail path fired.
+            const size_t total = slot.generated.text.size();
+            const size_t from  = std::min(slot.n_sent_text, total);
+            if (from < total) {
+                SLT_WRN(slot, "da_wire: FLUSH unsent tail on final: %zu char(s) '%s'\n",
+                        total - from, dbg_esc(slot.generated.text.substr(from), 100).c_str());
+            }
+            res->content = slot.generated.substr(from, total - from);
+            res->tokens  = llama_tokens{};
+            slot.n_sent_text = total;
         } else {
             res->content     = std::move(slot.generated);
             res->tokens      = std::move(slot.generated_tokens);
@@ -6575,6 +6727,10 @@ private:
             return;
         }
 
+        if (llama_model_is_hybrid(model_tgt) || llama_model_is_recurrent(model_tgt)) {
+            SLT_WRN_DBG(slot, "da_rm: hybrid/recurrent model - mid-range seq_rm leaves the recurrent tail intact (attention/recurrent mismatch) - staying vanilla (%s)\n", when);
+            return;
+        }
         const int32_t n_prompt = slot.task->n_tokens();
 
         SLT_INF_DBG(slot, "da_rm: applying %zu range(s) (%s) - bound=%d, n_prompt=%d\n",
@@ -6695,6 +6851,22 @@ private:
     // the switch stays position-contiguous.
     void apply_da_b(server_slot & slot, const std::vector<std::pair<int32_t, int32_t>> & ranges, int32_t bound, const char * when) {
         if (ranges.empty()) {
+            return;
+        }
+
+        // hybrid (attention + recurrent, e.g. GDN) / recurrent models:
+        // llama_memory_recurrent::seq_cp ignores p0/p1 and shares the src's
+        // FULL recurrent tail with dst, while the attention KV is retagged to
+        // the kept ranges only - attention and recurrent then disagree on the
+        // history, an out-of-distribution combination that derails the output
+        // from the first generated token (2026-11-25 B-switch incidents).
+        // The logical-removal fallback (A) is no better: a mid-range seq_rm
+        // leaves the same full-history recurrent tail. Restoring a
+        // consistent recurrent state would need a full forward over the kept
+        // set per switch, which kills the cheap-switch property - so stay
+        // vanilla: no restriction, da_seq stays -1, mode GLOBAL.
+        if (llama_model_is_hybrid(model_tgt) || llama_model_is_recurrent(model_tgt)) {
+            SLT_WRN_DBG(slot, "da_b: hybrid/recurrent model - seq_cp shares the full recurrent tail (range ignored), attention/recurrent mismatch - staying vanilla (%s)\n", when);
             return;
         }
 
@@ -6832,6 +7004,58 @@ private:
             }
             if (cur < bound) {
                 keep.emplace_back(cur, bound);
+            }
+        }
+
+        // kv-offload holes are physically cut from the main sequence
+        // (seq_rm): seq_cp copies only tagged cells, so a keep range
+        // overlapping a hole would silently drop the holed cells from
+        // da_seq while da_keep_count still claims them - the FOCUS read
+        // set and the n_kv_max bound would both be overstated and the
+        // journal would not say which cells vanished. Clamp the keep
+        // ranges to the non-holed cells so the copy is explicit and the
+        // accounting exact. Holes always sit in [0, bound): the ledger
+        // expires ranges with hi > n_past and the boundary is >= n_past.
+        // (2026-11-25: every observed holes x B-switch pair had the first
+        // hole starting at 24183, 3 tokens inside the scaffold keep
+        // [0, 24186) - the holes-subset-of-gap structure plus this overlap.)
+        slot.da_keep_holed = 0;
+        if (slot.kv_holes_active && !slot.kv_hole_ranges.empty()) {
+            std::string holed_detail;
+            for (const auto & h : slot.kv_hole_ranges) {
+                const int32_t h_lo = std::max((int32_t) h.first, 0);
+                const int32_t h_hi = std::min((int32_t) h.second, bound);
+                if (h_hi <= h_lo) {
+                    continue;  // outside the keep space [0, bound)
+                }
+                for (const auto & k : keep) {
+                    const int32_t lo = std::max(k.first, h_lo);
+                    const int32_t hi = std::min(k.second, h_hi);
+                    if (hi > lo) {
+                        slot.da_keep_holed += (size_t) (hi - lo);
+                        if (holed_detail.empty()) {
+                            holed_detail = "[";
+                        }
+                        holed_detail += std::to_string(lo) + "," + std::to_string(hi) + ") ";
+                    }
+                }
+                da_subtract_range(keep, h_lo, h_hi);
+            }
+            if (slot.da_keep_holed > 0) {
+                if (!holed_detail.empty()) {
+                    holed_detail += "]";
+                }
+                SLT_WRN(slot, "da_b: holes intersect keep: %zu token(s) %s excluded from the da_seq copy (seq_cp copies tagged cells only) - FOCUS read set and n_kv_max shrink accordingly\n",
+                        slot.da_keep_holed, holed_detail.c_str());
+            } else {
+                SLT_INF(slot, "da_b: holes fully inside the removal gap (%zu range(s)) - da_seq keep unaffected\n",
+                        slot.kv_hole_ranges.size());
+            }
+            if (keep.empty()) {
+                SLT_WRN(slot, "da_b: all keep cells are holed - falling back to logical removal (%s)\n", when);
+                slot.da_keep_holed = 0;
+                apply_da_rm(slot, ranges, bound, when);
+                return;
             }
         }
 
@@ -9611,16 +9835,47 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                                 }
                                 return p + shift;
                             };
-                            for (auto & seg : evicted_segs) {
+                            for (size_t seg_i = 0; seg_i < evicted_segs.size(); seg_i++) {
+                                const auto & seg = evicted_segs[seg_i];
                                 const int32_t lo = da_char_to_token_nearest(offs, mod_pos(seg.range_lo));
                                 const int32_t hi = da_char_to_token_nearest(offs, mod_pos(seg.range_hi));
                                 if (lo < 0 || hi < 0 || hi <= lo) {
                                     SRV_WRN_DBG("kv-offload-holes: failed to map evicted segment %s to a token range - skipping its hole\n", seg.key.c_str());
                                     continue;
                                 }
-                                task.params.kv_hole_pending.push_back({ lo, hi });
+                                // Align the hole with the chunk token ranges (the design
+                                // contract: the hole boundary coincides with the chunk
+                                // boundary, da-layout.cpp). da_auto_chunk packs each
+                                // evicted piece as its own chunk(s), and
+                                // task.params.da_chunks is the ground truth the DA paths
+                                // (FOCUS keep, n_kv_max) consume. The char->token snap of
+                                // the evict bound can drift a few tokens from the
+                                // header-derived chunk edge (2026-11-25: the hole started
+                                // 3 tokens inside the scaffold and ended 3 tokens short
+                                // of the chunk end - the scaffold edge was physically
+                                // cut, and the chunk tail stayed resident in the FOCUS
+                                // read set).
+                                int32_t h_lo = lo, h_hi = hi;
+                                if (seg_i < layout.evict_chunk_span.size()) {
+                                    const auto & sp = layout.evict_chunk_span[seg_i];
+                                    if (sp.first >= 1 && sp.second >= sp.first &&
+                                            sp.second <= (int32_t) task.params.da_chunks.size()) {
+                                        h_lo = task.params.da_chunks[sp.first - 1].first;
+                                        h_hi = task.params.da_chunks[sp.second - 1].second;
+                                    }
+                                }
+                                if (h_lo < 0 || h_hi <= h_lo) {
+                                    SRV_WRN("kv-offload-holes: aligned hole for %s is empty - keeping the mapped range\n", seg.key.c_str());
+                                    h_lo = lo;
+                                    h_hi = hi;
+                                }
+                                if (h_lo != lo || h_hi != hi) {
+                                    SRV_INF("kv-offload-holes: hole %s aligned to chunk token range: mapped [%d, %d) -> [%d, %d)\n",
+                                            seg.key.c_str(), lo, hi, h_lo, h_hi);
+                                }
+                                task.params.kv_hole_pending.push_back({ h_lo, h_hi });
                                 SRV_INF_DBG("kv-offload-holes: pending hole %s -> tokens [%d, %d) (%d tokens)\n",
-                                        seg.key.c_str(), lo, hi, hi - lo);
+                                        seg.key.c_str(), h_lo, h_hi, h_hi - h_lo);
                                 // T1-b (R2): validate the hole coordinate mapping.
                                 // Detokenize the token span [lo,hi) (modified
                                 // space) and compare with the segment's original

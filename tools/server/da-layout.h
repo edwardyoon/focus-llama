@@ -39,6 +39,13 @@ struct da_auto_layout {
     std::pair<size_t, size_t> filler = { 0, 0 };  // char range of the DA instruction (removed in FOCUS mode)
     std::pair<size_t, size_t> sigma  = { 0, 0 };  // char range of the Σ anchor (kept in FOCUS mode)
     size_t n_source_msgs = 0;
+    // kv-offload (Option B): per evict bound (input order), the (first, last)
+    // chunk numbers (1-based, chunk N = chunks[N-1]) the evicted piece was
+    // packed into; {0, 0} = not packed. Empty when no evict bounds were
+    // passed. Lets the caller align each KV hole exactly with the chunk token
+    // ranges (the design contract: the hole boundary coincides with the chunk
+    // boundary).
+    std::vector<std::pair<int32_t, int32_t>> evict_chunk_span;
 };
 
 // kv-offload (Option B, --kv-offload-holes): an evicted piece is always its

@@ -560,6 +560,12 @@ static common_chat_tool empty_args_tool_no_schema{
     /* .parameters = */ "{}",
 };
 
+static common_chat_tool hyphen_name_tool{
+    /* .name = */ "mcp__focus-memory__recent_work",
+    /* .description = */ "Tool with a hyphen in its name (focus-memory MCP naming)",
+    /* .parameters = */ R"({"type": "object", "properties": {}})",
+};
+
 static common_chat_tool python_tool{
     /* .name = */ "python",
     /* .description = */ "an ipython interpreter",
@@ -2382,6 +2388,55 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
             .enable_thinking(true)
             .expect(message_assist_thoughts)
+            .run();
+
+        // Regression (2026-11-25): tool name containing a hyphen (focus-memory MCP
+        // naming). The 11:22 incident cut the stream at "mcp__focus" and the final
+        // parse reported tool_calls=0. Verify the PEG parser accepts the full block.
+        tst.test("Let me check the recent work.\n</think>\n<tool_call>\n<function=mcp__focus-memory__recent_work>\n</function>\n</tool_call>")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .enable_thinking(true)
+            .tools({ hyphen_name_tool })
+            .expect_reasoning("Let me check the recent work.")
+            .expect_tool_calls({
+                { "mcp__focus-memory__recent_work", "{}", {} },
+            })
+            .run();
+
+        // same block, partial (streaming) parse
+        tst.test("Let me check the recent work.\n</think>\n<tool_call>\n<function=mcp__focus-memory__recent_work>\n</function>\n</tool_call>")
+            .is_partial(true)
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .enable_thinking(true)
+            .tools({ hyphen_name_tool })
+            .expect_reasoning("Let me check the recent work.")
+            .expect_tool_calls({
+                { "mcp__focus-memory__recent_work", "{}", {} },
+            })
+            .run();
+
+        // 11:22 shape: content before the call and a stray think-close before the opener
+        tst.test("thinking one\n</think>\ncontent here\n</think>\n<tool_call>\n<function=mcp__focus-memory__recent_work>\n</function>\n</tool_call>")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .enable_thinking(true)
+            .tools({ hyphen_name_tool })
+            .expect_reasoning("thinking one")
+            .expect_content("content here")
+            .expect_tool_calls({
+                { "mcp__focus-memory__recent_work", "{}", {} },
+            })
+            .run();
+
+        // two thinking blocks around the content (the 11:22 tail had a second one)
+        tst.test("thinking one\n</think>\ncontent here\n</think>\nthinking two\n</think>\n<tool_call>\n<function=mcp__focus-memory__recent_work>\n</function>\n</tool_call>")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .enable_thinking(true)
+            .tools({ hyphen_name_tool })
+            .expect_reasoning("thinking one")
+            .expect_content("content here")
+            .expect_tool_calls({
+                { "mcp__focus-memory__recent_work", "{}", {} },
+            })
             .run();
 
         tst.test("I'm\nthinking\n</think>\n\nHello, world!\nWhat's up?")

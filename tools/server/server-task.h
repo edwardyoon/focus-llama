@@ -501,6 +501,7 @@ struct server_task_result_cmpl_final : server_task_result {
     bool has_new_line;
     std::string stopping_word;
     stop_type stop = STOP_TYPE_NONE;
+    std::string da_full_text;   // 서버가 실제 생성한 전체 텍스트 (파서 입력 손실 시 복구용)
 
     bool post_sampling_probs;
     std::vector<completion_token_output> probs_output;
