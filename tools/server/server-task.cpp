@@ -162,6 +162,16 @@ static std::vector<common_chat_tool_call> da_fallback_tool_calls(const std::stri
     while (true) {
         const size_t a = full.find(tc_o, pos);
         if (a == std::string::npos) break;
+        {
+            size_t fences = 0;
+            for (size_t k = 0; k + 2 < a; ) {
+                if (full.compare(k, 3, "```") == 0) { fences++; k += 3; } else { k++; }
+            }
+            if (fences % 2 == 1) {          // 코드 블록 안의 예시
+                pos = a + tc_o.size();
+                continue;
+            }
+        }
         const size_t b = full.find(tc_c, a);
         if (b == std::string::npos) break;                      // 미완결 call은 건너뜀
         const std::string blk = full.substr(a + tc_o.size(), b - a - tc_o.size());
@@ -186,7 +196,11 @@ static std::vector<common_chat_tool_call> da_fallback_tool_calls(const std::stri
             json jv = val;
             try {
                 json t = json::parse(val);
-                if (!t.is_string()) jv = std::move(t);          // 숫자/불리언/객체/배열만 타입 복원
+                if (t.is_object() || t.is_array()) {
+                    jv = std::move(t);                          // 구조체는 그대로 복원
+                } else if ((t.is_number() || t.is_boolean()) && t.dump() == val) {
+                    jv = std::move(t);                          // 원문과 왕복 일치할 때만
+                }                                               // null, 문자열, "007", "1e5"는 문자열 유지
             } catch (...) {}
             args[key] = std::move(jv);
             p = pc + pr_c.size();
@@ -221,7 +235,7 @@ common_chat_msg task_result_state::update_chat_msg(
     try {
         new_msg = is_partial ? chat_session.feed(added) : chat_session.finish(added);
     } catch (const std::exception & e) {
-        SRV_ERR("da_wire: chat_session.%s threw: %s (added=%zu '%s')\n",
+        SRV_ERR_DBG("da_wire: chat_session.%s threw: %s (added=%zu '%s')\n",
                 is_partial ? "feed" : "finish", e.what(), added.text.size(),
                 dbg_esc(added.text, 60).c_str());
         throw;
@@ -231,22 +245,22 @@ common_chat_msg task_result_state::update_chat_msg(
         const bool markup = new_msg.content.find("<function=") != std::string::npos ||
                             new_msg.content.find("\n<tool_call>") != std::string::npos;
         if (new_msg.empty() && !added.text.empty()) {
-            SRV_WRN("da_wire: parse EMPTY with added=%zu '%s'\n", added.text.size(), dbg_esc(added.text, 60).c_str());
+            SRV_WRN_DBG("da_wire: parse EMPTY with added=%zu '%s'\n", added.text.size(), dbg_esc(added.text, 60).c_str());
         }
         if (!starts || new_msg.tool_calls.size() < msg_prv_copy.tool_calls.size()) {
-            SRV_WRN("da_wire: parse REGRESS partial=%d prev_content=%zu new_content=%zu prev_tc=%zu new_tc=%zu\n",
+            SRV_WRN_DBG("da_wire: parse REGRESS partial=%d prev_content=%zu new_content=%zu prev_tc=%zu new_tc=%zu\n",
                     (int) is_partial, msg_prv_copy.content.size(), new_msg.content.size(),
                     msg_prv_copy.tool_calls.size(), new_msg.tool_calls.size());
         }
         if (markup) {   // tool markup leaking into content
-            SRV_WRN("da_wire: tool markup in CONTENT partial=%d content_tail='%s' tc=%zu\n",
+            SRV_WRN_DBG("da_wire: tool markup in CONTENT partial=%d content_tail='%s' tc=%zu\n",
                     (int) is_partial, dbg_esc(new_msg.content.substr(new_msg.content.size() > 80 ? new_msg.content.size() - 80 : 0), 100).c_str(),
                     new_msg.tool_calls.size());
         }
         if (!is_partial) {   // final: always record
             std::string names;
             for (auto & tc : new_msg.tool_calls) names += tc.name + "(" + std::to_string(tc.arguments.size()) + ") ";
-            SRV_INF("da_wire: final parse content=%zu reasoning=%zu tool_calls=%zu [%s] content_tail='%s'\n",
+            SRV_INF_DBG("da_wire: final parse content=%zu reasoning=%zu tool_calls=%zu [%s] content_tail='%s'\n",
                     new_msg.content.size(), new_msg.reasoning_content.size(), new_msg.tool_calls.size(), names.c_str(),
                     dbg_esc(new_msg.content.substr(new_msg.content.size() > 80 ? new_msg.content.size() - 80 : 0), 100).c_str());
         }
@@ -258,7 +272,7 @@ common_chat_msg task_result_state::update_chat_msg(
         try {
             all_diffs = common_chat_msg_diff::compute_diffs(msg_prv_copy, chat_msg);
         } catch (const std::exception & e) {
-            SRV_ERR("da_wire: compute_diffs threw: %s (prev_content=%zu new_content=%zu prev_tc=%zu new_tc=%zu)\n",
+            SRV_ERR_DBG("da_wire: compute_diffs threw: %s (prev_content=%zu new_content=%zu prev_tc=%zu new_tc=%zu)\n",
                     e.what(), msg_prv_copy.content.size(), chat_msg.content.size(),
                     msg_prv_copy.tool_calls.size(), chat_msg.tool_calls.size());
             throw;
@@ -560,23 +574,26 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat_stream() {
     if (!da_full_text.empty() && (stop == STOP_TYPE_WORD || stop == STOP_TYPE_EOS)) {
         auto tcs = da_fallback_tool_calls(da_full_text);
         if (tcs.size() > oaicompat_msg.tool_calls.size()) {
-            // Broadened (2026-11-25): also covers partial parses (parser
-            // produced 1 of 2 calls). The first parser_count calls were
-            // already streamed as partials, so append only the missing
-            // tail - re-sending indices below parser_count would double
-            // their arguments on the client.
-            SRV_WRN("da_wire: FALLBACK tool_calls=%zu (parser had %zu, content=%zu of full=%zu char(s))\n",
-                    tcs.size(), oaicompat_msg.tool_calls.size(),
-                    oaicompat_msg.content.size(), da_full_text.size());
-            for (size_t i = oaicompat_msg.tool_calls.size(); i < tcs.size(); i++) {
-                common_chat_msg_diff d;
-                d.tool_call_index       = i;
-                d.tool_call_delta.id    = tcs[i].id;
-                d.tool_call_delta.name  = tcs[i].name;
-                d.tool_call_delta.arguments = tcs[i].arguments;
-                fb_diffs.push_back(std::move(d));
+            const bool leaked = oaicompat_msg.content.find("<function")  != std::string::npos ||
+                                oaicompat_msg.content.find("<tool_call") != std::string::npos;
+            if (!leaked) {
+                // 본문 안의 예시일 수 있으므로 실행하지 않고 기록만 한다
+                SRV_WRN_DBG("da_wire: PARSER-MISS without markup leak - fallback NOT applied (parser=%zu fallback=%zu)\n",
+                        oaicompat_msg.tool_calls.size(), tcs.size());
+            } else {
+                SRV_WRN_DBG("da_wire: FALLBACK tool_calls=%zu (parser had %zu, content=%zu of full=%zu char(s))\n",
+                        tcs.size(), oaicompat_msg.tool_calls.size(),
+                        oaicompat_msg.content.size(), da_full_text.size());
+                for (size_t i = oaicompat_msg.tool_calls.size(); i < tcs.size(); i++) {
+                    common_chat_msg_diff d;
+                    d.tool_call_index           = i;
+                    d.tool_call_delta.id        = tcs[i].id;
+                    d.tool_call_delta.name      = tcs[i].name;
+                    d.tool_call_delta.arguments = tcs[i].arguments;
+                    fb_diffs.push_back(std::move(d));
+                }
+                fb_tool_calls = true;
             }
-            fb_tool_calls = true;
         }
     }
 
@@ -584,7 +601,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat_stream() {
     if (stop == STOP_TYPE_WORD || stop == STOP_TYPE_EOS) {
         finish_reason = (oaicompat_msg.tool_calls.empty() && !fb_tool_calls) ? "stop" : "tool_calls";
     }
-    SRV_INF("da_wire: stream final finish_reason=%s tool_calls=%zu diffs=%zu content=%zu\n",
+    SRV_INF_DBG("da_wire: stream final finish_reason=%s tool_calls=%zu diffs=%zu content=%zu\n",
             finish_reason.c_str(), oaicompat_msg.tool_calls.size(),
             oaicompat_msg_diffs.size(), oaicompat_msg.content.size());
 

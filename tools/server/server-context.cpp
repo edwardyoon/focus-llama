@@ -2977,7 +2977,7 @@ private:
                 const size_t hold = std::max({da_hold, tool_closing_hold(unsent), tool_opening_hold(unsent)});
 
                 if (hold > 0) {
-                    SLT_INF(slot, "da_wire: HOLD da=%zu tc=%zu tail='%s'\n", da_hold, tool_closing_hold(unsent),
+                    SLT_INF_DBG(slot, "da_wire: HOLD da=%zu tc=%zu tail='%s'\n", da_hold, tool_closing_hold(unsent),
                             dbg_esc(unsent.substr(unsent.size() > 40 ? unsent.size() - 40 : 0), 60).c_str());
                 }
                 if (da_eog && hold > 0) {
@@ -2995,7 +2995,7 @@ private:
                     if (is_da_prefix) {
                         slot.generated.text.resize(slot.generated.text.size() - hold);
                     } else {
-                        SLT_WRN(slot, "da_wire: keeping held tail on EOG: '%s'\n", dbg_esc(held, 80).c_str());
+                        SLT_WRN_DBG(slot, "da_wire: keeping held tail on EOG: '%s'\n", dbg_esc(held, 80).c_str());
                     }
                 }
                 const size_t send_end = slot.generated.text.size() - (da_eog ? 0 : hold);
@@ -3381,7 +3381,7 @@ private:
                 const int n_fn_close    = dbg_count(g, "</function>", E);
                 const bool mid_call_eos = (slot.stop == STOP_TYPE_EOS) &&
                                           ((n_antml_open > n_antml_close) || (n_fn_open > n_fn_close));
-                SLT_INF(slot, "da: req-end eos-forensics: stop=%d mode=%s n_gen=%d dwell g/f/l=%lu/%lu/%lu trans=%lu antml o/c=%d/%d fn o/c=%d/%d mid_call_eos=%d tail='%s'\n",
+                SLT_INF_DBG(slot, "da: req-end eos-forensics: stop=%d mode=%s n_gen=%d dwell g/f/l=%lu/%lu/%lu trans=%lu antml o/c=%d/%d fn o/c=%d/%d mid_call_eos=%d tail='%s'\n",
                         (int) slot.stop,
                         slot.da_mode == DA_MODE_GLOBAL ? "GLOBAL" : (slot.da_mode == DA_MODE_FOCUS ? "FOCUS" : "LOCAL"),
                         (int) slot.stats.n_gen,
@@ -3453,7 +3453,7 @@ private:
             // token-mapping desync inside the PEG context). Stream-only:
             // non-stream never advances n_sent_text and would always read
             // TRUNCATED.
-            SLT_INF(slot, "da_wire: n_sent=%zu full=%zu => %s\n",
+            SLT_INF_DBG(slot, "da_wire: n_sent=%zu full=%zu => %s\n",
                     slot.n_sent_text, slot.generated.text.size(),
                     slot.n_sent_text == slot.generated.text.size() ? "INPUT-COMPLETE" : "INPUT-TRUNCATED");
             // da_wire (2026-11-25): a held tail (DA tag / tool-closing
@@ -3463,7 +3463,7 @@ private:
             const size_t total = slot.generated.text.size();
             const size_t from  = std::min(slot.n_sent_text, total);
             if (from < total) {
-                SLT_WRN(slot, "da_wire: FLUSH unsent tail on final: %zu char(s) '%s'\n",
+                SLT_WRN_DBG(slot, "da_wire: FLUSH unsent tail on final: %zu char(s) '%s'\n",
                         total - from, dbg_esc(slot.generated.text.substr(from), 100).c_str());
             }
             res->content = slot.generated.substr(from, total - from);
@@ -6599,6 +6599,11 @@ private:
             : n_prompt;
     }
 
+    // hybrid/recurrent: DA restriction is unsafe (recurrent tail ignores seq_cp/seq_rm ranges)
+    bool da_hybrid_gate() const {
+        return llama_model_is_hybrid(model_tgt) || llama_model_is_recurrent(model_tgt);
+    }
+
     // Subtract [sub_lo, sub_hi) from a list of token ranges. For each range
     // that overlaps the subtraction range, the overlapping part is removed
     // (splitting the range into left and right parts when the subtraction
@@ -6710,7 +6715,7 @@ private:
         }
 
         if (llama_model_is_hybrid(model_tgt) || llama_model_is_recurrent(model_tgt)) {
-            SLT_WRN_DBG(slot, "da_rm: hybrid/recurrent model - mid-range seq_rm leaves the recurrent tail intact (attention/recurrent mismatch) - staying vanilla (%s)\n", when);
+            SLT_INF(slot, "da_rm: hybrid/recurrent model - mid-range seq_rm leaves the recurrent tail intact (attention/recurrent mismatch) - staying vanilla (%s)\n", when);
             return;
         }
         const int32_t n_prompt = slot.task->n_tokens();
@@ -6848,7 +6853,7 @@ private:
         // set per switch, which kills the cheap-switch property - so stay
         // vanilla: no restriction, da_seq stays -1, mode GLOBAL.
         if (llama_model_is_hybrid(model_tgt) || llama_model_is_recurrent(model_tgt)) {
-            SLT_WRN_DBG(slot, "da_b: hybrid/recurrent model - seq_cp shares the full recurrent tail (range ignored), attention/recurrent mismatch - staying vanilla (%s)\n", when);
+            SLT_INF(slot, "da_b: hybrid/recurrent model - seq_cp shares the full recurrent tail (range ignored), attention/recurrent mismatch - staying vanilla (%s)\n", when);
             return;
         }
 
@@ -7237,6 +7242,14 @@ private:
             if (tag.type == 1 && da_no_local) {
                 SLT_INF(slot, "da_tag: type=1 (<local>) IGNORED - mode unchanged n_gen=%d mode=%d\n",
                         (int) slot.stats.n_gen, (int) slot.da_mode);
+                continue;
+            }
+
+            // hybrid/recurrent: the tag is consumed (erased above) but no KV restriction
+            // and no mode transition - the mode must not claim FOCUS when nothing was removed
+            if (da_hybrid_gate()) {
+                SLT_INF(slot, "da_tag: type=%d ignored - hybrid/recurrent model, staying GLOBAL (n_gen=%d)\n",
+                        tag.type, (int) slot.stats.n_gen);
                 continue;
             }
 
