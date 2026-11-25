@@ -2876,11 +2876,22 @@ private:
         static const std::string cls[] = {"</tool_call>", "</function>", "</parameter>"};
         size_t hold = 0;
         for (size_t i = 0; i < 3; ++i) {
+            // (1) 열렸지만 닫히지 않음: opener부터 전부 보류
             const size_t po = s.rfind(ops[i]);
-            if (po == std::string::npos) continue;
-            const size_t pc = s.rfind(cls[i]);
-            if (pc != std::string::npos && pc > po) continue; // 이미 닫힘
-            hold = std::max(hold, s.size() - po);
+            if (po != std::string::npos) {
+                const size_t pc = s.rfind(cls[i]);
+                if (pc == std::string::npos || pc < po) {
+                    hold = std::max(hold, s.size() - po);
+                }
+            }
+            // (2) opener가 아직 덜 온 접두 ("<", "<tool", "<function" ...)도 보류?
+            const size_t kmax = std::min(s.size(), ops[i].size() - 1);
+            for (size_t k = kmax; k > 0; --k) {
+                if (s.compare(s.size() - k, k, ops[i], 0, k) == 0) {
+                    hold = std::max(hold, k);
+                    break;
+                }
+            }
         }
         return hold;
     }
